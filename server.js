@@ -8,12 +8,12 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ========== ENVIRONMENT VARIABLES ==========
-const SUPABASE_URL = 'https://eqzfivdckzrkkncahlyn.supabase.co';
-const SUPABASE_SERVICE_ROLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVxemZpdmRja3pya2tuY2FobHluIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE2MDU4NjUsImV4cCI6MjA3NzE4MTg2NX0.wtRdkqUfqTEDg7qvWV_H3-E0xl1eRBFbNJ29trmb0XU';
-const TRONGRID_API_KEY = '33759ca3-ffb8-41bc-9036-25a32601eae2';
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://eqzfivdckzrkkncahlyn.supabase.co';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVxemZpdmRja3pya2tuY2FobHluIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE2MDU4NjUsImV4cCI6MjA3NzE4MTg2NX0.wtRdkqUfqTEDg7qvWV_H3-E0xl1eRBFbNJ29trmb0XU';
+const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '33759ca3-ffb8-41bc-9036-25a32601eae2';
 
 // ========== MORALIS API CONFIGURATION ==========
-const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjM3MDA2MzI2LTUxNjctNDYxZi1iNWZiLWQ2MTY2YTEyZWM2YiIsIm9yZ0lkIjoiNDc5MDU0IiwidXNlcklkIjoiNDkyODUwIiwidHlwZUlkIjoiMjZhOTVjOGUtNjRjOS00ZDEwLThhNWYtY2FkNDVjNGI0MGE1IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjIxNjYzNTQsImV4cCI6NDkxNzkyNjM1NH0.3DIHSnwViPTGbveV7u_gkZxt8m2FOj9Pa8uDShZqL-Q';
+const MORALIS_API_KEY = process.env.MORALIS_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjM3MDA2MzI2LTUxNjctNDYxZi1iNWZiLWQ2MTY2YTEyZWM2YiIsIm9yZ0lkIjoiNDc5MDU0IiwidXNlcklkIjoiNDkyODUwIiwidHlwZUlkIjoiMjZhOTVjOGUtNjRjOS00ZDEwLThhNWYtY2FkNDVjNGI0MGE1IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjIxNjYzNTQsImV4cCI6NDkxNzkyNjM1NH0.3DIHSnwViPTGbveV7u_gkZxt8m2FOj9Pa8uDShZqL-Q';
 
 // ========== BSC RPC CONFIGURATION ==========
 const BSC_RPC_URLS = [
@@ -843,7 +843,7 @@ app.post('/generate-wallet', async (req, res) => {
   }
 });
 
-// Endpoint для получения адреса пополнения
+// Endpoint для получения адреса пополнения с QR кодом
 app.get('/deposit-address/:userId/:network', async (req, res) => {
   try {
     const { userId, network } = req.params;

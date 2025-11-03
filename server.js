@@ -3,27 +3,53 @@ const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
 const { ethers } = require('ethers');
 
+// ========== ENHANCED LOGGING - MUST BE AT THE VERY TOP ==========
+console.log('🚀 STARTING SERVER - ENHANCED LOGGING ENABLED');
+console.log('📅 Server start time:', new Date().toISOString());
+console.log('🔧 Node.js version:', process.version);
+console.log('🌐 Platform:', process.platform, process.arch);
+console.log('📊 Process ID:', process.pid);
+
+// Log environment variables (safe version)
+console.log('🔑 Environment check:');
+console.log('PORT:', process.env.PORT || '3000 (default)');
+console.log('NODE_ENV:', process.env.NODE_ENV || 'not set');
+console.log('SUPABASE_URL:', process.env.SUPABASE_URL ? '✅ SET' : '❌ MISSING');
+console.log('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? '✅ SET' : '❌ MISSING');
+console.log('TRONGRID_API_KEY:', process.env.TRONGRID_API_KEY ? '✅ SET' : '❌ MISSING');
+console.log('MORALIS_API_KEY:', process.env.MORALIS_API_KEY ? '✅ SET' : '❌ MISSING');
+
+// Enhanced error handling
+process.on('uncaughtException', (error) => {
+  console.error('💥 UNCAUGHT EXCEPTION:', error);
+  console.error('💥 Stack trace:', error.stack);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('💥 UNHANDLED REJECTION at:', promise);
+  console.error('💥 Reason:', reason);
+});
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ========== ENVIRONMENT VARIABLES ==========
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://eqzfivdckzrkkncahlyn.supabase.co';
-// Используем fallback значения для всех ключей
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVxemZpdmRja3pya2tuY2FobHluIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTYwNTg2NSwiZXhwIjoyMDc3MTgxODY1fQ.AuGqzDDMzWS1COhHdBMchHarYmd1gNC_9PfRfJWPTxc';
 const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '33759ca3-ffb8-41bc-9036-25a32601eae2';
 const MORALIS_API_KEY = process.env.MORALIS_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjM3MDA2MzI2LTUxNjctNDYxZi1iNWZiLWQ2MTY2YTEyZWM2YiIsIm9yZ0lkIjoiNDc5MDU0IiwidXNlcklkIjoiNDkyODUwIiwidHlwZUlkIjoiMjZhOTVjOGUtNjRjOS00ZDEwLThhNWYtY2FkNDVjNGI0MGE1IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjIxNjYzNTQsImV4cCI6NDkxNzkyNjM1NH0.3DIHSnwViPTGbveV7u_gkZxt8m2FOj9Pa8uDShZqL-Q';
 
-// Проверка обязательных переменных
-console.log('🔧 Checking environment variables...');
-console.log('SUPABASE_URL:', SUPABASE_URL ? '✅ SET' : '❌ MISSING');
-console.log('SUPABASE_SERVICE_ROLE_KEY:', SUPABASE_SERVICE_ROLE_KEY ? '✅ SET' : '❌ MISSING');
-console.log('TRONGRID_API_KEY:', TRONGRID_API_KEY ? '✅ SET' : '❌ MISSING');
-console.log('MORALIS_API_KEY:', MORALIS_API_KEY ? '✅ SET' : '❌ MISSING');
+console.log('🔄 Initializing Supabase client...');
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+console.log('✅ Supabase client initialized');
 
-if (!SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('❌ CRITICAL: SUPABASE_SERVICE_ROLE_KEY is required!');
-  process.exit(1);
-}
+console.log('🔄 Initializing TronWeb...');
+const tronWeb = new TronWeb({
+  fullHost: 'https://api.trongrid.io',
+  headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY }
+});
+console.log('✅ TronWeb initialized');
 
 // ========== BSC RPC CONFIGURATION ==========
 const BSC_RPC_URLS = [
@@ -66,16 +92,24 @@ const COMPANY_BSC = {
   }
 };
 
-console.log('🔄 Initializing Supabase client...');
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-console.log('✅ Supabase client initialized');
+// ========== ENHANCED REQUEST LOGGING MIDDLEWARE ==========
+app.use((req, res, next) => {
+  const start = Date.now();
+  const requestId = Math.random().toString(36).substring(7);
+  
+  console.log(`📥 [${requestId}] INCOMING: ${req.method} ${req.path}`, {
+    ip: req.ip,
+    userAgent: req.get('User-Agent')?.substring(0, 50) || 'unknown',
+    timestamp: new Date().toISOString()
+  });
 
-console.log('🔄 Initializing TronWeb...');
-const tronWeb = new TronWeb({
-  fullHost: 'https://api.trongrid.io',
-  headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY }
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    console.log(`📤 [${requestId}] RESPONSE: ${req.method} ${req.path} → ${res.statusCode} (${duration}ms)`);
+  });
+
+  next();
 });
-console.log('✅ TronWeb initialized');
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -102,7 +136,7 @@ const FUND_BNB_AMOUNT = 0.01;
 
 // Throttling / concurrency
 const BALANCE_CONCURRENCY = Number(process.env.BALANCE_CONCURRENCY || 2);
-const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 5 * 60 * 1000);
+const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 2 * 60 * 1000); // 2 minutes
 
 // ========== HELPERS ==========
 function sleep(ms) {
@@ -159,6 +193,7 @@ function runBalanceQueue() {
 async function moralisRequest(endpoint, retries = 3) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
+      console.log(`🔍 Moralis API attempt ${attempt + 1}: ${endpoint}`);
       const response = await fetch(`https://deep-index.moralis.io/api/v2${endpoint}`, {
         headers: {
           'X-API-Key': MORALIS_API_KEY,
@@ -178,6 +213,7 @@ async function moralisRequest(endpoint, retries = 3) {
       const data = await response.json();
       
       if (response.ok) {
+        console.log(`✅ Moralis API success: ${endpoint}`);
         return data;
       } else {
         console.log(`❌ Moralis API error: ${data.message || response.statusText}`);
@@ -194,10 +230,13 @@ async function moralisRequest(endpoint, retries = 3) {
 
 // ========== BSC FUNCTIONS ==========
 async function getBSCUSDTBalance(address) {
+  console.log(`🔍 Checking BSC USDT balance for: ${address}`);
   try {
     const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, bscProvider);
     const balance = await contract.balanceOf(address);
-    return Number(ethers.utils.formatUnits(balance, 18));
+    const formatted = Number(ethers.utils.formatUnits(balance, 18));
+    console.log(`✅ BSC USDT balance for ${address}: ${formatted} USDT`);
+    return formatted;
   } catch (error) {
     console.error('❌ BSC USDT balance error:', error.message);
     return 0;
@@ -233,6 +272,8 @@ async function getBSCTransactions(address) {
               network: 'BEP20',
               timestamp: new Date(tx.block_timestamp).getTime()
             });
+
+            console.log(`📥 Found BSC deposit: ${amount} USDT from ${tx.from_address}`);
           }
         } catch (e) { 
           console.warn('Skipping malformed BSC transaction:', e.message);
@@ -253,9 +294,12 @@ async function getBSCTransactions(address) {
 }
 
 async function getBSCBalance(address) {
+  console.log(`🔍 Checking BSC native balance for: ${address}`);
   try {
     const balance = await bscProvider.getBalance(address);
-    return Number(ethers.utils.formatEther(balance));
+    const formatted = Number(ethers.utils.formatEther(balance));
+    console.log(`✅ BSC native balance for ${address}: ${formatted} BNB`);
+    return formatted;
   } catch (error) {
     console.error('❌ BSC balance error:', error.message);
     try {
@@ -269,6 +313,7 @@ async function getBSCBalance(address) {
 }
 
 async function sendBSC(fromPrivateKey, toAddress, amount) {
+  console.log(`🔄 Sending ${amount} BNB to ${toAddress}`);
   try {
     if (!fromPrivateKey || fromPrivateKey.includes('NOT_SET')) {
       console.error('❌ BSC send error: Private key not set');
@@ -304,6 +349,7 @@ async function sendBSC(fromPrivateKey, toAddress, amount) {
 }
 
 async function transferBSCUSDT(fromPrivateKey, toAddress, amount) {
+  console.log(`🔄 Transferring ${amount} BSC USDT to ${toAddress}`);
   try {
     if (!fromPrivateKey || fromPrivateKey.includes('NOT_SET')) {
       console.error('❌ BSC USDT transfer error: Private key not set');
@@ -344,6 +390,7 @@ async function getUSDTBalance(address) {
     try {
       if (!address) return 0;
 
+      console.log(`🔍 Checking TRC20 USDT balance for: ${address}`);
       const tronWebForChecking = new TronWeb({
         fullHost: 'https://api.trongrid.io',
         headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY }
@@ -352,7 +399,9 @@ async function getUSDTBalance(address) {
       try {
         const contract = await tronWebForChecking.contract().at(USDT_CONTRACT);
         const result = await contract.balanceOf(address).call();
-        return Number(result) / 1_000_000;
+        const balance = Number(result) / 1_000_000;
+        console.log(`✅ TRC20 USDT balance for ${address}: ${balance} USDT`);
+        return balance;
       } catch (error) {
         console.warn('getUSDTBalance contract call failed, trying fallback:', error.message);
         return await getUSDTBalanceFallback(address);
@@ -366,6 +415,7 @@ async function getUSDTBalance(address) {
 
 async function getUSDTBalanceFallback(address) {
   try {
+    console.log(`🔍 Using fallback method for TRC20 balance: ${address}`);
     const ownerHex = tronWeb.address.toHex(address).replace(/^0x/, '');
     const contractHex = tronWeb.address.toHex(USDT_CONTRACT).replace(/^0x/, '');
 
@@ -394,7 +444,9 @@ async function getUSDTBalanceFallback(address) {
       const hexBalance = json.constant_result[0].replace(/^0x/, '');
       const clean = hexBalance.replace(/^0+/, '') || '0';
       const bn = BigInt('0x' + clean);
-      return Number(bn) / 1_000_000;
+      const balance = Number(bn) / 1_000_000;
+      console.log(`✅ TRC20 USDT balance (fallback) for ${address}: ${balance} USDT`);
+      return balance;
     }
     return 0;
   } catch (error) {
@@ -407,6 +459,7 @@ async function getUSDTTransactions(address) {
   try {
     if (!address) return [];
     
+    console.log(`🔍 Checking TRC20 transactions for: ${address}`);
     const response = await fetch(`https://api.trongrid.io/v1/accounts/${address}/transactions/trc20?limit=50&only_confirmed=true`, {
       headers: {
         'TRON-PRO-API-KEY': TRONGRID_API_KEY
@@ -437,12 +490,15 @@ async function getUSDTTransactions(address) {
           network: 'TRC20',
           timestamp: tx.block_timestamp
         });
+
+        console.log(`📥 Found TRC20 deposit: ${amount} USDT from ${from} to ${to}`);
       } catch (innerErr) {
         continue;
       }
     }
 
     transactions.sort((a, b) => b.timestamp - a.timestamp);
+    console.log(`✅ Found ${transactions.length} TRC20 transactions for ${address}`);
     return transactions;
   } catch (error) {
     console.error('❌ getUSDTTransactions error:', error.message);
@@ -451,6 +507,7 @@ async function getUSDTTransactions(address) {
 }
 
 async function getTRXBalance(address) {
+  console.log(`🔍 Checking TRX balance for: ${address}`);
   try {
     const response = await fetch(`https://api.trongrid.io/v1/accounts/${address}`, {
       headers: {
@@ -462,7 +519,9 @@ async function getTRXBalance(address) {
     
     if (json && json.data && json.data.length > 0) {
       const balance = json.data[0].balance || 0;
-      return balance / 1_000_000;
+      const formatted = balance / 1_000_000;
+      console.log(`✅ TRX balance for ${address}: ${formatted} TRX`);
+      return formatted;
     }
     return 0;
   } catch (error) {
@@ -472,6 +531,7 @@ async function getTRXBalance(address) {
 }
 
 async function sendTRX(fromPrivateKey, toAddress, amount) {
+  console.log(`🔄 Sending ${amount} TRX to ${toAddress}`);
   try {
     const pk = normalizePrivateKeyForTron(fromPrivateKey);
     if (!pk) {
@@ -510,6 +570,7 @@ async function sendTRX(fromPrivateKey, toAddress, amount) {
 }
 
 async function transferUSDT(fromPrivateKey, toAddress, amount) {
+  console.log(`🔄 Transferring ${amount} TRC20 USDT to ${toAddress}`);
   try {
     const pk = normalizePrivateKeyForTron(fromPrivateKey);
     if (!pk) {
@@ -571,15 +632,16 @@ async function autoCollectToMainWallet(wallet) {
       throw new Error(`Unsupported network: ${wallet.network}`);
     }
     
-    console.log(`📊 USDT Balance: ${usdtBalance} USDT`);
+    console.log(`📊 ${wallet.network} Wallet ${wallet.address}:`);
+    console.log(`   USDT Balance: ${usdtBalance} USDT`);
+    console.log(`   Native Balance: ${nativeBalance} ${wallet.network === 'TRC20' ? 'TRX' : 'BNB'}`);
+    
     const amountToTransfer = Math.max(0, usdtBalance - KEEP_AMOUNT);
 
     if (amountToTransfer <= 0) {
-      console.log(`❌ Nothing to collect: ${usdtBalance} USDT`);
+      console.log(`❌ Nothing to collect: ${usdtBalance} USDT (after keeping ${KEEP_AMOUNT} USDT)`);
       return { success: false, reason: 'low_balance' };
     }
-
-    console.log(`⛽ Native Balance: ${nativeBalance} ${wallet.network === 'TRC20' ? 'TRX' : 'BNB'}`);
 
     if (nativeBalance < minNativeForFee) {
       console.log(`🔄 Funding ${fundAmount} ${wallet.network === 'TRC20' ? 'TRX' : 'BNB'} from MASTER to ${wallet.address} for gas`);
@@ -613,6 +675,7 @@ async function autoCollectToMainWallet(wallet) {
           status: 'completed',
           created_at: new Date().toISOString()
         });
+        console.log(`📊 Collection transaction recorded in database`);
       } catch (e) {
         console.warn('Warning: failed to insert collect transaction record', e.message);
       }
@@ -624,6 +687,7 @@ async function autoCollectToMainWallet(wallet) {
     }
   } catch (error) {
     console.error('❌ Auto-collection fatal error:', error.message);
+    console.error('Stack trace:', error.stack);
     return { success: false, reason: 'error', error: error.stack };
   }
 }
@@ -688,6 +752,8 @@ async function processDeposit(wallet, amount, txid, network) {
     const newBalance = currentBalance + amount;
     const newTotalProfit = (Number(user.total_profit) || 0) + amount;
 
+    console.log(`📊 User ${wallet.user_id} balance update: ${currentBalance} → ${newBalance} USDT`);
+
     const { error: updateError } = await supabase
       .from('users')
       .update({
@@ -727,8 +793,16 @@ async function processDeposit(wallet, amount, txid, network) {
     console.log(`✅ DEPOSIT PROCESSED: ${amount} USDT for user ${wallet.user_id}`);
     console.log(`💰 New balance: ${newBalance} USDT`);
 
+    // Schedule auto-collect after deposit
     setTimeout(() => {
-      autoCollectToMainWallet(wallet).catch(err => {
+      console.log(`🔄 Scheduling auto-collect for wallet ${wallet.address}`);
+      autoCollectToMainWallet(wallet).then(result => {
+        if (result.success) {
+          console.log(`✅ Auto-collect completed: ${result.amount} USDT collected`);
+        } else {
+          console.log(`❌ Auto-collect failed: ${result.reason}`);
+        }
+      }).catch(err => {
         console.error('Auto-collect post-deposit failed:', err.message);
       });
     }, 10000);
@@ -737,6 +811,7 @@ async function processDeposit(wallet, amount, txid, network) {
 
   } catch (error) {
     console.error('❌ Error processing deposit:', error.message);
+    console.error('Stack trace:', error.stack);
     
     try {
       await supabase
@@ -750,68 +825,6 @@ async function processDeposit(wallet, amount, txid, network) {
     }
     
     throw error;
-  }
-}
-
-// ========== WITHDRAWAL FUNCTIONS ==========
-async function processWithdrawal(withdrawalId, adminPrivateKey, network) {
-  try {
-    const { data: withdrawal, error } = await supabase
-      .from('withdrawals')
-      .select('*')
-      .eq('id', withdrawalId)
-      .single();
-
-    if (error) throw error;
-    if (withdrawal.status !== 'pending') {
-      throw new Error('Withdrawal already processed');
-    }
-
-    // Обновляем статус на "processing"
-    await supabase
-      .from('withdrawals')
-      .update({ status: 'processing' })
-      .eq('id', withdrawalId);
-
-    let transferResult;
-    if (network === 'TRC20') {
-      transferResult = await transferUSDT(adminPrivateKey, withdrawal.wallet_address, withdrawal.amount);
-    } else if (network === 'BEP20') {
-      transferResult = await transferBSCUSDT(adminPrivateKey, withdrawal.wallet_address, withdrawal.amount);
-    }
-
-    if (transferResult) {
-      await supabase
-        .from('withdrawals')
-        .update({ 
-          status: 'completed',
-          completed_at: new Date().toISOString()
-        })
-        .eq('id', withdrawalId);
-
-      await supabase
-        .from('transactions')
-        .update({ status: 'completed' })
-        .eq('user_id', withdrawal.user_id)
-        .eq('type', 'withdrawal')
-        .eq('amount', -withdrawal.amount)
-        .order('created_at', { ascending: false })
-        .limit(1);
-
-      console.log(`✅ Withdrawal completed: ${withdrawal.amount} USDT to ${withdrawal.wallet_address}`);
-      return { success: true };
-    } else {
-      throw new Error('Transfer failed');
-    }
-  } catch (error) {
-    console.error('❌ Withdrawal processing error:', error.message);
-    
-    await supabase
-      .from('withdrawals')
-      .update({ status: 'failed' })
-      .eq('id', withdrawalId);
-
-    return { success: false, error: error.message };
   }
 }
 
@@ -864,11 +877,19 @@ app.post('/generate-wallet', async (req, res) => {
     }
 
     console.log(`✅ New ${network} wallet created: ${address}`);
-    setTimeout(() => checkUserDeposits(user_id, network), 5000);
+    
+    // Schedule deposit check for this wallet
+    setTimeout(() => {
+      console.log(`🔍 Scheduling initial deposit check for new wallet: ${address}`);
+      checkUserDeposits(user_id, network).catch(err => {
+        console.error(`Error in initial deposit check for ${address}:`, err.message);
+      });
+    }, 5000);
 
     res.json({ success: true, address, exists: false, network });
   } catch (error) {
     console.error('❌ Generate wallet error:', error.message);
+    console.error('Stack trace:', error.stack);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
@@ -878,6 +899,8 @@ app.get('/deposit-address/:userId/:network', async (req, res) => {
   try {
     const { userId, network } = req.params;
 
+    console.log(`🔍 Getting deposit address for user ${userId}, network ${network}`);
+
     const { data: wallet, error } = await supabase
       .from('user_wallets')
       .select('address')
@@ -886,140 +909,18 @@ app.get('/deposit-address/:userId/:network', async (req, res) => {
       .single();
 
     if (error || !wallet) {
+      console.log(`❌ Wallet not found for user ${userId}, network ${network}`);
       return res.status(404).json({ success: false, error: 'Wallet not found' });
     }
 
+    console.log(`✅ Found wallet for user ${userId}: ${wallet.address}`);
     res.json({ 
       success: true, 
       address: wallet.address
     });
   } catch (error) {
     console.error('❌ Get deposit address error:', error.message);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// Endpoint для создания заявки на вывод
-app.post('/create-withdrawal', async (req, res) => {
-  try {
-    const { user_id, amount, network, wallet_address } = req.body;
-
-    if (!user_id || !amount || !network || !wallet_address) {
-      return res.status(400).json({ success: false, error: 'Missing required fields' });
-    }
-
-    // Проверяем баланс пользователя
-    const { data: user, error: userError } = await supabase
-      .from('users')
-      .select('balance')
-      .eq('id', user_id)
-      .single();
-
-    if (userError) throw userError;
-
-    if (user.balance < amount) {
-      return res.status(400).json({ success: false, error: 'Insufficient balance' });
-    }
-
-    // Создаем заявку на вывод
-    const { data: withdrawal, error } = await supabase
-      .from('withdrawals')
-      .insert({
-        user_id,
-        amount,
-        network: network.toUpperCase(),
-        wallet_address,
-        status: 'pending',
-        created_at: new Date().toISOString()
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    // Обновляем баланс пользователя
-    const { error: updateError } = await supabase
-      .from('users')
-      .update({ 
-        balance: user.balance - amount 
-      })
-      .eq('id', user_id);
-
-    if (updateError) throw updateError;
-
-    // Создаем запись в транзакциях
-    await supabase
-      .from('transactions')
-      .insert({
-        user_id,
-        type: 'withdrawal',
-        amount: -amount,
-        description: `Запрос на вывод ${amount} USDT (${network.toUpperCase()})`,
-        status: 'pending',
-        created_at: new Date().toISOString()
-      });
-
-    res.json({ 
-      success: true, 
-      withdrawal_id: withdrawal.id,
-      message: 'Withdrawal request created successfully'
-    });
-
-  } catch (error) {
-    console.error('❌ Create withdrawal error:', error.message);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// Endpoint для получения списка заявок на вывод (для админа)
-app.get('/admin/withdrawals', async (req, res) => {
-  try {
-    const { status = 'pending' } = req.query;
-
-    const { data: withdrawals, error } = await supabase
-      .from('withdrawals')
-      .select(`
-        *,
-        users:user_id (
-          email,
-          username
-        )
-      `)
-      .eq('status', status)
-      .order('created_at', { ascending: false });
-
-    if (error) throw error;
-
-    res.json({ success: true, withdrawals });
-  } catch (error) {
-    console.error('❌ Get withdrawals error:', error.message);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// Endpoint для обработки вывода (для админа)
-app.post('/admin/process-withdrawal', async (req, res) => {
-  try {
-    const { withdrawal_id, network } = req.body;
-    
-    let adminPrivateKey;
-    if (network === 'TRC20') {
-      adminPrivateKey = process.env.MAIN_PRIVATE_KEY || COMPANY.MAIN.privateKey;
-    } else if (network === 'BEP20') {
-      adminPrivateKey = process.env.MAIN_BSC_PRIVATE_KEY || COMPANY_BSC.MAIN.privateKey;
-    } else {
-      return res.status(400).json({ success: false, error: 'Unsupported network' });
-    }
-
-    const result = await processWithdrawal(withdrawal_id, adminPrivateKey, network);
-
-    if (result.success) {
-      res.json({ success: true, message: 'Withdrawal processed successfully' });
-    } else {
-      res.status(500).json({ success: false, error: result.error });
-    }
-  } catch (error) {
-    console.error('❌ Process withdrawal error:', error.message);
+    console.error('Stack trace:', error.stack);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
@@ -1029,7 +930,7 @@ app.get('/check-deposits', async (req, res) => { await handleCheckDeposits(req, 
 
 async function handleCheckDeposits(req = {}, res = {}) {
   try {
-    console.log('🔄 Checking deposits for all users and networks...');
+    console.log('🔄 ===== MANUAL DEPOSIT CHECK STARTED =====');
     const { data: wallets, error } = await supabase.from('user_wallets').select('*').limit(200);
     if (error) throw error;
 
@@ -1041,6 +942,8 @@ async function handleCheckDeposits(req = {}, res = {}) {
 
     for (const wallet of wallets || []) {
       try {
+        console.log(`🔍 Processing wallet ${wallet.address} (${wallet.network}) for user ${wallet.user_id}`);
+        
         if (wallet.network === 'BEP20') {
           await sleep(500);
         } else {
@@ -1055,17 +958,22 @@ async function handleCheckDeposits(req = {}, res = {}) {
           transactions = await getBSCTransactions(wallet.address);
         }
 
+        console.log(`📊 Found ${transactions.length} transactions for wallet ${wallet.address}`);
+
         for (const tx of transactions) {
           const recipient = wallet.network === 'TRC20' ? tx.to : tx.to.toLowerCase();
           const walletAddress = wallet.network === 'TRC20' ? wallet.address : wallet.address.toLowerCase();
           
           if (recipient === walletAddress && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
+            console.log(`💰 Potential deposit found: ${tx.amount} USDT to ${walletAddress}, txid: ${tx.transaction_id}`);
             try {
               const result = await processDeposit(wallet, tx.amount, tx.transaction_id, wallet.network);
               if (result.success) {
                 depositsFound++;
+                console.log(`✅ Deposit processed successfully: ${tx.amount} USDT for user ${wallet.user_id}`);
               } else if (result.reason === 'already_processed' || result.reason === 'concurrent_processing') {
                 duplicatesSkipped++;
+                console.log(`ℹ️ Deposit already processed: ${tx.transaction_id}`);
               }
             } catch (err) {
               console.error(`❌ Error processing deposit ${tx.transaction_id}:`, err.message);
@@ -1075,17 +983,21 @@ async function handleCheckDeposits(req = {}, res = {}) {
 
         await supabase.from('user_wallets').update({ last_checked: new Date().toISOString() }).eq('id', wallet.id);
         processedCount++;
+        console.log(`✅ Completed processing wallet ${wallet.address}`);
       } catch (err) {
         console.error(`❌ Error processing wallet ${wallet.address}:`, err.message);
       }
     }
 
-    const message = `✅ Processed ${processedCount} wallets, found ${depositsFound} new deposits, skipped ${duplicatesSkipped} duplicates`;
+    const message = `✅ Deposit check completed: Processed ${processedCount} wallets, found ${depositsFound} new deposits, skipped ${duplicatesSkipped} duplicates`;
+    console.log(`🔄 ===== MANUAL DEPOSIT CHECK COMPLETED =====`);
     console.log(message);
+    
     if (res && typeof res.json === 'function') res.json({ success: true, message });
     return { success: true, message };
   } catch (error) {
     console.error('❌ Deposit check error:', error.message);
+    console.error('Stack trace:', error.stack);
     if (res && typeof res.status === 'function') res.status(500).json({ success: false, error: error.message });
     return { success: false, error: error.message };
   }
@@ -1097,32 +1009,46 @@ app.get('/collect-funds', async (req, res) => { await handleCollectFunds(req, re
 
 async function handleCollectFunds(req = {}, res = {}) {
   try {
-    console.log('💰 Manual funds collection started (THROTTLED)...');
+    console.log('💰 ===== MANUAL FUNDS COLLECTION STARTED =====');
     const { data: wallets, error } = await supabase.from('user_wallets').select('*').limit(200);
     if (error) throw error;
 
+    console.log(`🔍 Starting collection for ${wallets?.length || 0} wallets`);
+    
     let collectedCount = 0;
     let totalCollected = 0;
+    let failedCount = 0;
+    
     for (const wallet of wallets || []) {
       try {
-        await sleep(2000);
+        console.log(`🔍 Processing collection for wallet ${wallet.address} (${wallet.network})`);
+        await sleep(2000); // Rate limiting
+        
         const result = await autoCollectToMainWallet(wallet);
         if (result && result.success) {
           collectedCount++;
           totalCollected += result.amount;
+          console.log(`✅ Successfully collected ${result.amount} USDT from ${wallet.address}`);
           await sleep(1000);
+        } else {
+          failedCount++;
+          console.log(`❌ Failed to collect from ${wallet.address}: ${result?.reason || 'Unknown error'}`);
         }
       } catch (err) {
+        failedCount++;
         console.error(`❌ Error collecting from ${wallet.address}:`, err.message);
       }
     }
 
-    const message = `✅ Collected ${totalCollected.toFixed(6)} USDT from ${collectedCount} wallets`;
+    const message = `✅ Collection completed: Collected ${totalCollected.toFixed(6)} USDT from ${collectedCount} wallets, ${failedCount} failed`;
+    console.log(`💰 ===== MANUAL FUNDS COLLECTION COMPLETED =====`);
     console.log(message);
+    
     if (res && typeof res.json === 'function') res.json({ success: true, message });
     return { success: true, message };
   } catch (error) {
     console.error('❌ Funds collection error:', error.message);
+    console.error('Stack trace:', error.stack);
     if (res && typeof res.status === 'function') res.status(500).json({ success: false, error: error.message });
     return { success: false, error: error.message };
   }
@@ -1133,6 +1059,7 @@ async function ensureUserExists(userId) {
   try {
     const { data } = await supabase.from('users').select('id').eq('id', userId).single();
     if (!data) {
+      console.log(`👤 Creating new user: ${userId}`);
       await supabase.from('users').insert({
         id: userId,
         email: `user-${userId}@temp.com`,
@@ -1144,6 +1071,8 @@ async function ensureUserExists(userId) {
         created_at: new Date().toISOString()
       });
       console.log(`✅ User created: ${userId}`);
+    } else {
+      console.log(`✅ User already exists: ${userId}`);
     }
   } catch (error) {
     console.error('❌ ensureUserExists error:', error.message);
@@ -1159,7 +1088,10 @@ async function checkUserDeposits(userId, network) {
       .eq('network', network)
       .single();
     
-    if (!wallet) return;
+    if (!wallet) {
+      console.log(`❌ Wallet not found for user ${userId}, network ${network}`);
+      return;
+    }
     
     console.log(`🔍 Checking ${network} deposits for user ${userId}, wallet: ${wallet.address}`);
     
@@ -1174,6 +1106,8 @@ async function checkUserDeposits(userId, network) {
     } else if (network === 'BEP20') {
       transactions = await getBSCTransactions(wallet.address);
     }
+    
+    console.log(`📊 Found ${transactions.length} transactions for user ${userId}`);
     
     for (const tx of transactions) {
       const recipient = network === 'TRC20' ? tx.to : tx.to.toLowerCase();
@@ -1197,9 +1131,51 @@ async function checkUserDeposits(userId, network) {
   }
 }
 
+// ========== TEST ENDPOINTS ==========
+app.get('/test-logs', (req, res) => {
+  console.log('🧪 TEST LOG: This should appear in Railway logs');
+  console.error('🔴 TEST ERROR LOG: This should appear as error');
+  console.warn('🟡 TEST WARN LOG: This should appear as warning');
+  
+  const testData = {
+    message: 'Test log entry',
+    timestamp: new Date().toISOString(),
+    randomId: Math.random().toString(36).substring(7),
+    userAgent: req.get('User-Agent'),
+    ip: req.ip
+  };
+  
+  console.log('📊 TEST STRUCTURED LOG:', JSON.stringify(testData, null, 2));
+  
+  res.json({
+    success: true,
+    message: 'Test logs generated - check Railway logs',
+    testId: testData.randomId,
+    timestamp: testData.timestamp
+  });
+});
+
+app.get('/health', (req, res) => {
+  const healthCheck = {
+    status: '✅ HEALTHY',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    env: {
+      NODE_ENV: process.env.NODE_ENV,
+      PORT: process.env.PORT,
+      SUPABASE_URL: process.env.SUPABASE_URL ? 'SET' : 'MISSING'
+    }
+  };
+  
+  console.log('🏥 HEALTH CHECK:', JSON.stringify(healthCheck, null, 2));
+  
+  res.json(healthCheck);
+});
+
 // ========== HEALTH CHECK ==========
 app.get('/', (req, res) => {
-  res.json({
+  const status = {
     status: '✅ WORKING',
     message: 'Cocoon AI - Deposit & Withdrawal System',
     timestamp: new Date().toISOString(),
@@ -1207,26 +1183,43 @@ app.get('/', (req, res) => {
     features: [
       'Multi-Network Wallet Generation',
       'Deposit Processing',
-      'Withdrawal System',
       'Auto Collection',
-      'Admin Panel for Withdrawals'
-    ]
-  });
+      'Enhanced Logging'
+    ],
+    stats: {
+      checkInterval: `${CHECK_INTERVAL_MS / 1000} seconds`,
+      minDeposit: `${MIN_DEPOSIT} USDT`,
+      keepAmount: `${KEEP_AMOUNT} USDT`
+    }
+  };
+  
+  console.log('🏠 Root endpoint called - returning status');
+  res.json(status);
 });
 
-// ========== Scheduler ==========
+// ========== HEARTBEAT LOGGING ==========
+console.log('💓 Starting heartbeat logger...');
+setInterval(() => {
+  console.log('💓 SERVER HEARTBEAT - ' + new Date().toISOString());
+}, 30000); // Every 30 seconds
+
+// ========== SCHEDULED DEPOSIT CHECKS ==========
+console.log('⏰ Starting scheduled deposit checks...');
 setInterval(async () => {
   try {
-    console.log('🕒 AUTO-CHECK: Scanning for deposits...');
+    console.log('🕒 ===== SCHEDULED DEPOSIT CHECK STARTED =====');
     await handleCheckDeposits();
+    console.log('🕒 ===== SCHEDULED DEPOSIT CHECK COMPLETED =====');
   } catch (err) {
-    console.error('❌ Auto-check internal error:', err.message);
+    console.error('❌ Scheduled deposit check error:', err.message);
   }
 }, CHECK_INTERVAL_MS);
 
 // ========== START SERVER ==========
+console.log('🎯 ALL INITIALIZATION COMPLETE - STARTING SERVER...');
+
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 SERVER RUNNING on port ${PORT}`);
+  console.log(`🚀 SERVER SUCCESSFULLY STARTED on port ${PORT}`);
   console.log(`✅ SUPABASE: CONNECTED`);
   console.log(`✅ TRONGRID: API KEY SET`);
   console.log(`✅ MORALIS API: AVAILABLE`);
@@ -1236,4 +1229,5 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`💰 BEP20 MAIN: ${COMPANY_BSC.MAIN.address}`);
   console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
   console.log('===================================');
+  console.log('🎉 APPLICATION READY - LOGS SHOULD BE VISIBLE NOW');
 });

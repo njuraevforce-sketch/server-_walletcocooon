@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 
 // ========== ENVIRONMENT VARIABLES ==========
 const SUPABASE_URL = 'https://bpsmizhrzgfbjqfpqkcz.supabase.co';
-const SUPABASE_SERVICE_ROLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVxemZpdmRja3pya2tuY2FobHluIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTYwNTg2NSwiZXhwIjoyMDc3MTgxODY1fQ.AuGqzDDMzWS1COhHdBMchHarYmd1gNC_9PfRfJWPTxc';
+const SUPABASE_SERVICE_ROLE_KEY = 'eyJhbGciOi...';
 const TRONGRID_API_KEY = '19e2411a-3c3e-479d-8c85-2abc716af397';
 
 // ========== MORALIS API CONFIGURATION ==========

@@ -7,12 +7,12 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ========== ENVIRONMENT VARIABLES ==========
-const SUPABASE_URL = 'https://bpsmizhrzgfbjqfpqkcz.supabase.co';
-const SUPABASE_SERVICE_ROLE_KEY = 'eyJhbGciOi...';
-const TRONGRID_API_KEY = '19e2411a-3c3e-479d-8c85-2abc716af397';
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://eqzfivdckzrkkncahlyn.supabase.co';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOi...';
+const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '33759ca3-ffb8-41bc-9036-25a32601eae2';
 
 // ========== MORALIS API CONFIGURATION ==========
-const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjYyMDk5YzZjLTA0NTItNDE5NC04YzNmLTJhNmUzOGIyNTI1ZCIsIm9yZ0lkIjoiNDc5MDU0IiwidXNlcklkIjoiNDkyODUwIiwidHlwZUlkIjoiMjZhOTVjOGUtNjRjOS00ZDEwLThhNWYtY2FkNDVjNGI0MGE1IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjIwMzU0OTEsImV4cCI6NDkxNzc5NTQ5MX0.ffb3o2ATWPpyrHBOH3ZI4VFLomENFaAesfHofMnyVUE';
+const MORALIS_API_KEY = process.env.MORALIS_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjM3MDA2MzI2LTUxNjctNDYxZi1iNWZiLWQ2MTY2YTEyZWM2YiIsIm9yZ0lkIjoiNDc5MDU0IiwidXNlcklkIjoiNDkyODUwIiwidHlwZUlkIjoiMjZhOTVjOGUtNjRjOS00ZDEwLThhNWYtY2FkNDVjNGI0MGE1IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjIxNjYzNTQsImV4cCI6NDkxNzkyNjM1NH0.3DIHSnwViPTGbveV7u_gkZxt8m2FOj9Pa8uDShZqL-Q';
 
 // ========== BSC RPC CONFIGURATION ==========
 const BSC_RPC_URLS = [
@@ -85,7 +85,9 @@ const MIN_BNB_FOR_FEE = 0.005;
 const FUND_TRX_AMOUNT = 10;
 const FUND_BNB_AMOUNT = 0.01;
 
-const CHECK_INTERVAL_MS = 2 * 60 * 1000; // 2 минуты как в старом сайте
+// Throttling / concurrency
+const BALANCE_CONCURRENCY = Number(process.env.BALANCE_CONCURRENCY || 2);
+const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 2 * 60 * 1000);
 
 // ========== HELPERS ==========
 function sleep(ms) {
@@ -108,6 +110,34 @@ function toBase58IfHex(addr) {
   }
   if (addr.startsWith('T') && addr.length === 34) return addr;
   return addr;
+}
+
+// Simple queue for throttling balance calls
+let currentBalanceRequests = 0;
+const pendingBalanceQueue = [];
+function enqueueBalanceJob(fn) {
+  return new Promise((resolve, reject) => {
+    pendingBalanceQueue.push({ fn, resolve, reject });
+    runBalanceQueue();
+  });
+}
+
+function runBalanceQueue() {
+  while (currentBalanceRequests < BALANCE_CONCURRENCY && pendingBalanceQueue.length) {
+    const job = pendingBalanceQueue.shift();
+    currentBalanceRequests++;
+    job.fn()
+      .then(res => {
+        currentBalanceRequests--;
+        job.resolve(res);
+        setTimeout(runBalanceQueue, 150);
+      })
+      .catch(err => {
+        currentBalanceRequests--;
+        job.reject(err);
+        setTimeout(runBalanceQueue, 150);
+      });
+  }
 }
 
 // ========== MORALIS API FUNCTIONS ==========
@@ -285,26 +315,28 @@ async function transferBSCUSDT(fromPrivateKey, toAddress, amount) {
 
 // ========== TRON FUNCTIONS ==========
 async function getUSDTBalance(address) {
-  try {
-    if (!address) return 0;
-
-    const tronWebForChecking = new TronWeb({
-      fullHost: 'https://api.trongrid.io',
-      headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY }
-    });
-
+  return enqueueBalanceJob(async () => {
     try {
-      const contract = await tronWebForChecking.contract().at(USDT_CONTRACT);
-      const result = await contract.balanceOf(address).call();
-      return Number(result) / 1_000_000;
-    } catch (error) {
-      console.warn('getUSDTBalance contract call failed, trying fallback:', error.message);
-      return await getUSDTBalanceFallback(address);
+      if (!address) return 0;
+
+      const tronWebForChecking = new TronWeb({
+        fullHost: 'https://api.trongrid.io',
+        headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY }
+      });
+
+      try {
+        const contract = await tronWebForChecking.contract().at(USDT_CONTRACT);
+        const result = await contract.balanceOf(address).call();
+        return Number(result) / 1_000_000;
+      } catch (error) {
+        console.warn('getUSDTBalance contract call failed, trying fallback:', error.message);
+        return await getUSDTBalanceFallback(address);
+      }
+    } catch (err) {
+      console.error('❌ getUSDTBalance fatal error:', err.message);
+      return 0;
     }
-  } catch (err) {
-    console.error('❌ getUSDTBalance fatal error:', err.message);
-    return 0;
-  }
+  });
 }
 
 async function getUSDTBalanceFallback(address) {
@@ -836,6 +868,43 @@ async function handleCheckDeposits(req = {}, res = {}) {
     return { success: true, message };
   } catch (error) {
     console.error('❌ Deposit check error:', error.message);
+    if (res && typeof res.status === 'function') res.status(500).json({ success: false, error: error.message });
+    return { success: false, error: error.message };
+  }
+}
+
+// collect funds endpoints
+app.post('/collect-funds', async (req, res) => { await handleCollectFunds(req, res); });
+app.get('/collect-funds', async (req, res) => { await handleCollectFunds(req, res); });
+
+async function handleCollectFunds(req = {}, res = {}) {
+  try {
+    console.log('💰 Manual funds collection started (THROTTLED)...');
+    const { data: wallets, error } = await supabase.from('user_wallets').select('*').limit(200);
+    if (error) throw error;
+
+    let collectedCount = 0;
+    let totalCollected = 0;
+    for (const wallet of wallets || []) {
+      try {
+        await sleep(2000);
+        const result = await autoCollectToMainWallet(wallet);
+        if (result && result.success) {
+          collectedCount++;
+          totalCollected += result.amount;
+          await sleep(1000);
+        }
+      } catch (err) {
+        console.error(`❌ Error collecting from ${wallet.address}:`, err.message);
+      }
+    }
+
+    const message = `✅ Collected ${totalCollected.toFixed(6)} USDT from ${collectedCount} wallets`;
+    console.log(message);
+    if (res && typeof res.json === 'function') res.json({ success: true, message });
+    return { success: true, message };
+  } catch (error) {
+    console.error('❌ Funds collection error:', error.message);
     if (res && typeof res.status === 'function') res.status(500).json({ success: false, error: error.message });
     return { success: false, error: error.message };
   }

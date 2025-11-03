@@ -8,9 +8,22 @@ const PORT = process.env.PORT || 3000;
 
 // ========== ENVIRONMENT VARIABLES ==========
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://eqzfivdckzrkkncahlyn.supabase.co';
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY;
-const MORALIS_API_KEY = process.env.MORALIS_API_KEY;
+// Используем fallback значения для всех ключей
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVxemZpdmRja3pya2tuY2FobHluIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTYwNTg2NSwiZXhwIjoyMDc3MTgxODY1fQ.AuGqzDDMzWS1COhHdBMchHarYmd1gNC_9PfRfJWPTxc';
+const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '33759ca3-ffb8-41bc-9036-25a32601eae2';
+const MORALIS_API_KEY = process.env.MORALIS_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjM3MDA2MzI2LTUxNjctNDYxZi1iNWZiLWQ2MTY2YTEyZWM2YiIsIm9yZ0lkIjoiNDc5MDU0IiwidXNlcklkIjoiNDkyODUwIiwidHlwZUlkIjoiMjZhOTVjOGUtNjRjOS00ZDEwLThhNWYtY2FkNDVjNGI0MGE1IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjIxNjYzNTQsImV4cCI6NDkxNzkyNjM1NH0.3DIHSnwViPTGbveV7u_gkZxt8m2FOj9Pa8uDShZqL-Q';
+
+// Проверка обязательных переменных
+console.log('🔧 Checking environment variables...');
+console.log('SUPABASE_URL:', SUPABASE_URL ? '✅ SET' : '❌ MISSING');
+console.log('SUPABASE_SERVICE_ROLE_KEY:', SUPABASE_SERVICE_ROLE_KEY ? '✅ SET' : '❌ MISSING');
+console.log('TRONGRID_API_KEY:', TRONGRID_API_KEY ? '✅ SET' : '❌ MISSING');
+console.log('MORALIS_API_KEY:', MORALIS_API_KEY ? '✅ SET' : '❌ MISSING');
+
+if (!SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('❌ CRITICAL: SUPABASE_SERVICE_ROLE_KEY is required!');
+  process.exit(1);
+}
 
 // ========== BSC RPC CONFIGURATION ==========
 const BSC_RPC_URLS = [
@@ -33,11 +46,11 @@ let bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
 const COMPANY = {
   MASTER: {
     address: 'TKn5J3ZnTxE9fmgMhVjXognH4VUjx4Tid2',
-    privateKey: process.env.MASTER_PRIVATE_KEY
+    privateKey: process.env.MASTER_PRIVATE_KEY || 'MASTER_PRIVATE_KEY_NOT_SET'
   },
   MAIN: {
     address: 'TNVpDk1JZSxmC9XniB1tSPaRdAvvKMMavC',
-    privateKey: process.env.MAIN_PRIVATE_KEY
+    privateKey: process.env.MAIN_PRIVATE_KEY || 'MAIN_PRIVATE_KEY_NOT_SET'
   }
 };
 
@@ -45,20 +58,24 @@ const COMPANY = {
 const COMPANY_BSC = {
   MASTER: {
     address: '0x60F3159e6b935759d6b4994473eeeD1e3ad27408',
-    privateKey: process.env.MASTER_BSC_PRIVATE_KEY
+    privateKey: process.env.MASTER_BSC_PRIVATE_KEY || 'MASTER_BSC_PRIVATE_KEY_NOT_SET'
   },
   MAIN: {
     address: '0x01F28A131bdda7255EcBE800C3ebACBa2c7076c7',
-    privateKey: process.env.MAIN_BSC_PRIVATE_KEY
+    privateKey: process.env.MAIN_BSC_PRIVATE_KEY || 'MAIN_BSC_PRIVATE_KEY_NOT_SET'
   }
 };
 
+console.log('🔄 Initializing Supabase client...');
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+console.log('✅ Supabase client initialized');
 
+console.log('🔄 Initializing TronWeb...');
 const tronWeb = new TronWeb({
   fullHost: 'https://api.trongrid.io',
   headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY }
 });
+console.log('✅ TronWeb initialized');
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -93,7 +110,7 @@ function sleep(ms) {
 }
 
 function normalizePrivateKeyForTron(pk) {
-  if (!pk) return null;
+  if (!pk || pk.includes('NOT_SET')) return null;
   return pk.startsWith('0x') ? pk.slice(2) : pk;
 }
 
@@ -253,6 +270,11 @@ async function getBSCBalance(address) {
 
 async function sendBSC(fromPrivateKey, toAddress, amount) {
   try {
+    if (!fromPrivateKey || fromPrivateKey.includes('NOT_SET')) {
+      console.error('❌ BSC send error: Private key not set');
+      return false;
+    }
+
     const wallet = new ethers.Wallet(fromPrivateKey, bscProvider);
     const tx = await wallet.sendTransaction({
       to: toAddress,
@@ -283,6 +305,11 @@ async function sendBSC(fromPrivateKey, toAddress, amount) {
 
 async function transferBSCUSDT(fromPrivateKey, toAddress, amount) {
   try {
+    if (!fromPrivateKey || fromPrivateKey.includes('NOT_SET')) {
+      console.error('❌ BSC USDT transfer error: Private key not set');
+      return false;
+    }
+
     const wallet = new ethers.Wallet(fromPrivateKey, bscProvider);
     const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, wallet);
     
@@ -447,7 +474,10 @@ async function getTRXBalance(address) {
 async function sendTRX(fromPrivateKey, toAddress, amount) {
   try {
     const pk = normalizePrivateKeyForTron(fromPrivateKey);
-    if (!pk) return false;
+    if (!pk) {
+      console.error('❌ TRX send error: Private key not set or invalid');
+      return false;
+    }
 
     const tronWebForSigning = new TronWeb({
       fullHost: 'https://api.trongrid.io',
@@ -482,7 +512,10 @@ async function sendTRX(fromPrivateKey, toAddress, amount) {
 async function transferUSDT(fromPrivateKey, toAddress, amount) {
   try {
     const pk = normalizePrivateKeyForTron(fromPrivateKey);
-    if (!pk) return false;
+    if (!pk) {
+      console.error('❌ USDT transfer error: Private key not set or invalid');
+      return false;
+    }
 
     const tronWebForSigning = new TronWeb({
       fullHost: 'https://api.trongrid.io',
@@ -971,9 +1004,9 @@ app.post('/admin/process-withdrawal', async (req, res) => {
     
     let adminPrivateKey;
     if (network === 'TRC20') {
-      adminPrivateKey = process.env.MAIN_PRIVATE_KEY;
+      adminPrivateKey = process.env.MAIN_PRIVATE_KEY || COMPANY.MAIN.privateKey;
     } else if (network === 'BEP20') {
-      adminPrivateKey = process.env.MAIN_BSC_PRIVATE_KEY;
+      adminPrivateKey = process.env.MAIN_BSC_PRIVATE_KEY || COMPANY_BSC.MAIN.privateKey;
     } else {
       return res.status(400).json({ success: false, error: 'Unsupported network' });
     }

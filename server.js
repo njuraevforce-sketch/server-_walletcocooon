@@ -717,7 +717,7 @@ async function processDeposit(wallet, amount, txid, network) {
 
     await ensureUserExists(wallet.user_id);
 
-    // Insert new deposit with wallet_address
+    // Insert new deposit with wallet_address - используем 'pending'
     const { data: newDeposit, error: depositError } = await supabase
       .from('deposits')
       .insert({
@@ -725,8 +725,8 @@ async function processDeposit(wallet, amount, txid, network) {
         amount,
         txid: txid,
         network,
-        wallet_address: wallet.address, // important: provide wallet address
-        status: 'processing',
+        wallet_address: wallet.address,
+        status: 'pending', // ← ИСПРАВЛЕНО: используем разрешенный статус
         created_at: new Date().toISOString()
       })
       .select()
@@ -771,9 +771,10 @@ async function processDeposit(wallet, amount, txid, network) {
       throw new Error(`Balance update failed: ${updateError.message}`);
     }
 
+    // Обновляем статус на 'completed'
     await supabase
       .from('deposits')
-      .update({ status: 'confirmed' })
+      .update({ status: 'completed' }) // ← ИСПРАВЛЕНО: используем разрешенный статус
       .eq('id', newDeposit.id);
 
     await supabase.from('transactions').insert({
@@ -822,7 +823,7 @@ async function processDeposit(wallet, amount, txid, network) {
         .delete()
         .eq('txid', txid)
         .eq('network', network)
-        .eq('status', 'processing');
+        .eq('status', 'pending'); // ← ИСПРАВЛЕНО: используем разрешенный статус
     } catch (cleanupError) {
       console.error('Cleanup error:', cleanupError);
     }

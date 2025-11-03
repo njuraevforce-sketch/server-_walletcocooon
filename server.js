@@ -695,8 +695,9 @@ async function autoCollectToMainWallet(wallet) {
 // ========== UNIVERSAL DEPOSIT PROCESSING ==========
 async function processDeposit(wallet, amount, txid, network) {
   try {
-    console.log(`💰 PROCESSING DEPOSIT: ${amount} USDT for user ${wallet.user_id}, txid: ${txid}, network: ${network}`);
+    console.log(`💰 PROCESSING DEPOSIT: ${amount} USDT for user ${wallet.user_id}, txid: ${txid}, network: ${network}, wallet: ${wallet.address}`);
 
+    // Check if deposit already exists
     const { data: existingDeposit, error: checkError } = await supabase
       .from('deposits')
       .select('id, status, amount')
@@ -716,13 +717,15 @@ async function processDeposit(wallet, amount, txid, network) {
 
     await ensureUserExists(wallet.user_id);
 
+    // Insert new deposit with wallet_address
     const { data: newDeposit, error: depositError } = await supabase
       .from('deposits')
       .insert({
         user_id: wallet.user_id,
         amount,
-        txid,
+        txid: txid,
         network,
+        wallet_address: wallet.address, // important: provide wallet address
         status: 'processing',
         created_at: new Date().toISOString()
       })

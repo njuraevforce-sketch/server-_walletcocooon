@@ -28,7 +28,7 @@ function getNextBscRpc() {
 
 let bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
 
-// COMPANY wallets - используем приватные ключи из переменных окружения
+// COMPANY wallets
 const COMPANY = {
   MASTER: {
     address: 'TKn5J3ZnTxE9fmgMhVjXognH4VUjx4Tid2',
@@ -292,15 +292,6 @@ async function processDeposit(wallet, amount, txid, network) {
       created_at: new Date().toISOString()
     });
 
-    // Повышаем VIP уровень если нужно
-    if (newBalance >= 20 && user.vip_level === 0) {
-      await supabase
-        .from('users')
-        .update({ vip_level: 1 })
-        .eq('id', wallet.user_id);
-      console.log(`⭐ VIP Level upgraded to 1 for user ${wallet.user_id}`);
-    }
-
     console.log(`✅ DEPOSIT PROCESSED: ${amount} USDT for user ${wallet.user_id}`);
     console.log(`💰 New balance: ${newBalance} USDT`);
 
@@ -412,14 +403,6 @@ app.get('/deposit-address/:userId/:network', async (req, res) => {
     console.error('❌ Get deposit address error:', error.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
-});
-
-// Endpoint для конфигурации (для фронтенда)
-app.get('/config', (req, res) => {
-  res.json({
-    supabaseUrl: process.env.SUPABASE_URL,
-    // Другие публичные настройки если нужны
-  });
 });
 
 // ========== DEPOSIT CHECKING ==========
@@ -560,8 +543,7 @@ app.get('/', (req, res) => {
     message: 'Cocoon AI - Deposit System',
     timestamp: new Date().toISOString(),
     networks: ['TRC20', 'BEP20'],
-    environment: process.env.RAILWAY_ENVIRONMENT_NAME || 'development',
-    publicDomain: process.env.RAILWAY_PUBLIC_DOMAIN || 'localhost'
+    environment: process.env.RAILWAY_ENVIRONMENT_NAME || 'development'
   });
 });
 
@@ -578,12 +560,9 @@ setInterval(async () => {
 // ========== START SERVER ==========
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SERVER RUNNING on port ${PORT}`);
-  console.log(`✅ SUPABASE: ${SUPABASE_URL ? 'CONNECTED' : 'MISSING'}`);
+  console.log(`✅ SUPABASE: CONNECTED`);
   console.log(`✅ TRONGRID: ${TRONGRID_API_KEY ? 'SET' : 'MISSING'}`);
   console.log(`✅ MORALIS API: ${MORALIS_API_KEY ? 'AVAILABLE' : 'MISSING'}`);
-  console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
-  console.log(`💰 BEP20 MAIN: ${COMPANY_BSC.MAIN.address}`);
   console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
-  console.log(`🌐 PUBLIC DOMAIN: ${process.env.RAILWAY_PUBLIC_DOMAIN || 'Not set'}`);
   console.log('===================================');
 });

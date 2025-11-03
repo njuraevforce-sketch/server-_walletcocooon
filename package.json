@@ -1,17 +1,23 @@
 {
   "name": "bitfarm-wallet-system",
   "version": "1.0.0",
-  "description": "Automatic Tron wallet system for Bitfarm",
+  "description": "Wallet system for BitFarm with USDT deposits and withdrawals",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
     "@supabase/supabase-js": "^2.38.0",
-    "tronweb": "^4.1.0"
+    "tronweb": "^5.0.0",
+    "ethers": "^5.7.2",
+    "qrcode": "^1.5.3"
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "keywords": ["usdt", "wallet", "crypto", "tron", "bsc"],
+  "author": "Cocoon AI",
+  "license": "MIT"
 }

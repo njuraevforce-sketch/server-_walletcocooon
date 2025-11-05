@@ -246,63 +246,12 @@ async function getBSCUSDTBalance(address) {
   }
 }
 
-// НОВАЯ ФУНКЦИЯ: Проверка транзакций через QuickNode
-async function getBSCTransactionsQuickNode(address) {
-  try {
-    if (!address) return [];
-
-    console.log(`🔍 [QUICKNODE] Checking BSC transactions for: ${address}`);
-    
-    const quicknodeProvider = new ethers.providers.JsonRpcProvider(QUICKNODE_BSC_URL);
-    const contract = new ethers.Contract(USDT_BSC_CONTRACT, [
-      "event Transfer(address indexed from, address indexed to, uint256 value)"
-    ], quicknodeProvider);
-
-    const currentBlock = await quicknodeProvider.getBlockNumber();
-    const fromBlock = currentBlock - 10000; // Проверяем последние ~1 день
-
-    const filter = contract.filters.Transfer(null, address);
-    const logs = await contract.queryFilter(filter, fromBlock, currentBlock);
-
-    console.log(`✅ [QUICKNODE] Found ${logs.length} transfer events for ${address}`);
-    
-    const transactions = [];
-    for (const log of logs) {
-      try {
-        const amount = Number(ethers.utils.formatUnits(log.args.value, 18));
-        
-        transactions.push({
-          transaction_id: log.transactionHash,
-          to: log.args.to,
-          from: log.args.from,
-          amount: amount,
-          token: 'USDT',
-          confirmed: true,
-          network: 'BEP20',
-          timestamp: (await quicknodeProvider.getBlock(log.blockNumber)).timestamp * 1000
-        });
-
-        console.log(`📥 [QUICKNODE] Found BSC deposit: ${amount} USDT from ${log.args.from}`);
-      } catch (e) { 
-        console.warn('[QUICKNODE] Skipping malformed BSC transaction:', e.message);
-        continue; 
-      }
-    }
-    
-    transactions.sort((a, b) => b.timestamp - a.timestamp);
-    return transactions;
-  } catch (error) {
-    console.error('❌ [QUICKNODE] BSC transactions error:', error.message);
-    return [];
-  }
-}
-
-// СТАРАЯ ФУНКЦИЯ: Проверка транзакций через Moralis (оставляем для сравнения)
+// ОБНОВЛЕННАЯ ФУНКЦИЯ: Только Moralis для BSC транзакций (из-за ограничений QuickNode)
 async function getBSCTransactions(address) {
   try {
     if (!address) return [];
 
-    console.log(`🔍 [MORALIS] Checking BSC transactions for: ${address}`);
+    console.log(`🔍 [MORALIS ONLY] Checking BSC transactions for: ${address}`);
     
     const data = await moralisRequest(`/${address}/erc20/transfers?chain=bsc&limit=50`);
     
@@ -346,45 +295,6 @@ async function getBSCTransactions(address) {
     console.error('❌ [MORALIS] BSC transactions error:', error.message);
     return [];
   }
-}
-
-// ОБНОВЛЕННАЯ ФУНКЦИЯ: Сравнение обоих методов
-async function getBSCTransactionsComparison(address) {
-  console.log(`🔄 COMPARISON: Testing both providers for ${address}`);
-  
-  const startTime = Date.now();
-  
-  // Запускаем оба метода параллельно
-  const [moralisResult, quicknodeResult] = await Promise.allSettled([
-    getBSCTransactions(address),
-    getBSCTransactionsQuickNode(address)
-  ]);
-
-  const endTime = Date.now();
-  const duration = endTime - startTime;
-
-  const moralisTransactions = moralisResult.status === 'fulfilled' ? moralisResult.value : [];
-  const quicknodeTransactions = quicknodeResult.status === 'fulfilled' ? quicknodeResult.value : [];
-
-  console.log(`📊 COMPARISON RESULTS for ${address}:`);
-  console.log(`   ⏱️  Duration: ${duration}ms`);
-  console.log(`   🔵 Moralis: ${moralisTransactions.length} transactions`);
-  console.log(`   🟢 QuickNode: ${quicknodeTransactions.length} transactions`);
-  
-  // Сравниваем хеши транзакций
-  const moralisTxIds = new Set(moralisTransactions.map(tx => tx.transaction_id));
-  const quicknodeTxIds = new Set(quicknodeTransactions.map(tx => tx.transaction_id));
-  
-  const commonTx = [...moralisTxIds].filter(tx => quicknodeTxIds.has(tx));
-  const onlyMoralisTx = [...moralisTxIds].filter(tx => !quicknodeTxIds.has(tx));
-  const onlyQuicknodeTx = [...quicknodeTxIds].filter(tx => !moralisTxIds.has(tx));
-  
-  console.log(`   🔄 Common transactions: ${commonTx.length}`);
-  console.log(`   🔵 Only in Moralis: ${onlyMoralisTx.length}`);
-  console.log(`   🟢 Only in QuickNode: ${onlyQuicknodeTx.length}`);
-
-  // Возвращаем результат от Moralis (как основной пока)
-  return moralisTransactions;
 }
 
 async function getBSCBalance(address) {
@@ -1053,8 +963,8 @@ async function handleCheckDeposits(req = {}, res = {}) {
         if (wallet.network === 'TRC20') {
           transactions = await getUSDTTransactions(wallet.address);
         } else if (wallet.network === 'BEP20') {
-          // ИСПОЛЬЗУЕМ СРАВНЕНИЕ ОБОИХ МЕТОДОВ ДЛЯ BEP20
-          transactions = await getBSCTransactionsComparison(wallet.address);
+          // ИСПРАВЛЕНО: Используем только Moralis для BSC транзакций (QuickNode имеет ограничения)
+          transactions = await getBSCTransactions(wallet.address);
         }
 
         console.log(`📊 Found ${transactions.length} transactions for wallet ${wallet.address}`);
@@ -1203,8 +1113,8 @@ async function checkUserDeposits(userId, network) {
     if (network === 'TRC20') {
       transactions = await getUSDTTransactions(wallet.address);
     } else if (network === 'BEP20') {
-      // ИСПОЛЬЗУЕМ СРАВНЕНИЕ ОБОИХ МЕТОДОВ ДЛЯ BEP20
-      transactions = await getBSCTransactionsComparison(wallet.address);
+      // ИСПРАВЛЕНО: Используем только Moralis для BSC транзакций (QuickNode имеет ограничения)
+      transactions = await getBSCTransactions(wallet.address);
     }
     
     console.log(`📊 Found ${transactions.length} transactions for user ${userId}`);
@@ -1286,7 +1196,7 @@ app.get('/', (req, res) => {
       'Deposit Processing',
       'Auto Collection',
       'Enhanced Logging',
-      'QuickNode + Moralis Comparison'
+      'Moralis for BSC Transactions (QuickNode limited)'
     ],
     stats: {
       checkInterval: `${CHECK_INTERVAL_MS / 1000} seconds`,
@@ -1325,7 +1235,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ SUPABASE: CONNECTED`);
   console.log(`✅ TRONGRID: API KEY SET`);
   console.log(`✅ MORALIS API: AVAILABLE`);
-  console.log(`✅ QUICKNODE: CONFIGURED`);
+  console.log(`✅ QUICKNODE: CONFIGURED (для балансов и транзакций)`);
   console.log(`💰 TRC20 MASTER: ${COMPANY.MASTER.address}`);
   console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
   console.log(`💰 BEP20 MASTER: ${COMPANY_BSC.MASTER.address}`);
@@ -1333,5 +1243,5 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
   console.log('===================================');
   console.log('🎉 APPLICATION READY - LOGS SHOULD BE VISIBLE NOW');
-  console.log('🔍 QuickNode vs Moralis comparison ENABLED for BSC transactions');
+  console.log('⚠️  QUICKNODE: Используется только для балансов (транзакции через Moralis из-за ограничений)');
 });

@@ -4,7 +4,7 @@ const TronWeb = require('tronweb');
 const { ethers } = require('ethers');
 
 // ========== ENHANCED LOGGING - MUST BE AT THE VERY TOP ==========
-console.log('🚀 STARTING SERVER - QUICKNODE ONLY VERSION');
+console.log('🚀 STARTING SERVER - OPTIMIZED QUICKNODE VERSION');
 console.log('📅 Server start time:', new Date().toISOString());
 console.log('🔧 Node.js version:', process.version);
 console.log('🌐 Platform:', process.platform, process.arch);
@@ -138,6 +138,7 @@ const FUND_BNB_AMOUNT = 0.01;
 // Throttling / concurrency
 const BALANCE_CONCURRENCY = Number(process.env.BALANCE_CONCURRENCY || 2);
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 2 * 60 * 1000); // 2 minutes
+const BSC_CHECK_INTERVAL_MS = 15000; // 15 секунд для BSC
 
 // ========== HELPERS ==========
 function sleep(ms) {
@@ -190,7 +191,7 @@ function runBalanceQueue() {
   }
 }
 
-// ========== BSC FUNCTIONS WITH QUICKNODE ONLY ==========
+// ========== BSC FUNCTIONS WITH OPTIMIZED QUICKNODE ==========
 async function getBSCUSDTBalance(address) {
   console.log(`🔍 Checking BSC USDT balance for: ${address}`);
   try {
@@ -205,7 +206,7 @@ async function getBSCUSDTBalance(address) {
   }
 }
 
-// НОВАЯ ФУНКЦИЯ: Получение транзакций BSC через QuickNode с пагинацией
+// ОПТИМИЗИРОВАННАЯ ФУНКЦИЯ: Проверка только последних 5 блоков каждые 15 секунд
 async function getBSCTransactions(address) {
   try {
     if (!address) return [];
@@ -219,8 +220,8 @@ async function getBSCTransactions(address) {
 
     const currentBlock = await quicknodeProvider.getBlockNumber();
     
-    // Используем ограничение в 1000 блоков для избежания ошибки 413
-    const fromBlock = currentBlock - 1000;
+    // ПРОВЕРЯЕМ ТОЛЬКО ПОСЛЕДНИЕ 5 БЛОКОВ (ограничение QuickNode)
+    const fromBlock = Math.max(0, currentBlock - 5);
     
     console.log(`📦 Checking blocks ${fromBlock} to ${currentBlock} (range: ${currentBlock - fromBlock} blocks)`);
 
@@ -266,34 +267,7 @@ async function getBSCTransactions(address) {
       return transactions;
     } catch (queryError) {
       console.error('❌ [QUICKNODE] Query filter error:', queryError.message);
-      
-      // Fallback: проверяем только последние 5 блоков если произошла ошибка
-      console.log('🔄 Trying fallback method with 5 blocks...');
-      try {
-        const fallbackFromBlock = currentBlock - 5;
-        const fallbackLogs = await contract.queryFilter(contract.filters.Transfer(null, address), fallbackFromBlock, currentBlock);
-        
-        const fallbackTransactions = [];
-        for (const log of fallbackLogs) {
-          const amount = Number(ethers.utils.formatUnits(log.args.value, 18));
-          fallbackTransactions.push({
-            transaction_id: log.transactionHash,
-            to: log.args.to,
-            from: log.args.from,
-            amount: amount,
-            token: 'USDT',
-            confirmed: true,
-            network: 'BEP20',
-            timestamp: Date.now()
-          });
-        }
-        
-        console.log(`✅ [QUICKNODE FALLBACK] Found ${fallbackTransactions.length} transactions`);
-        return fallbackTransactions;
-      } catch (fallbackError) {
-        console.error('❌ [QUICKNODE] Fallback also failed:', fallbackError.message);
-        return [];
-      }
+      return [];
     }
   } catch (error) {
     console.error('❌ [QUICKNODE] BSC transactions error:', error.message);
@@ -574,7 +548,7 @@ async function sendTRX(fromPrivateKey, toAddress, amount) {
   } catch (error) {
     console.error('❌ TRX send error:', error.message);
     return false;
-  }
+    }
 }
 
 async function transferUSDT(fromPrivateKey, toAddress, amount) {
@@ -700,7 +674,7 @@ async function autoCollectToMainWallet(wallet) {
   }
 }
 
-// ========== UNIVERSAL DEPOSIT PROCESSING ==========
+// ========== УЛУЧШЕННАЯ ОБРАБОТКА ДЕПОЗИТОВ С БЫСТРЫМ НАЧИСЛЕНИЕМ ==========
 async function processDeposit(wallet, amount, txid, network) {
   try {
     console.log(`💰 PROCESSING DEPOSIT: ${amount} USDT for user ${wallet.user_id}, txid: ${txid}, network: ${network}, wallet: ${wallet.address}`);
@@ -725,7 +699,18 @@ async function processDeposit(wallet, amount, txid, network) {
 
     await ensureUserExists(wallet.user_id);
 
-    // Insert new deposit with wallet_address
+    // Используем функцию базы данных для быстрого начисления баланса
+    const { error: balanceError } = await supabase.rpc('increment_user_balance', {
+      user_id: wallet.user_id,
+      amount: amount
+    });
+
+    if (balanceError) {
+      console.error('❌ Balance increment error:', balanceError);
+      throw new Error(`Balance increment failed: ${balanceError.message}`);
+    }
+
+    // Вставляем депозит
     const { data: newDeposit, error: depositError } = await supabase
       .from('deposits')
       .insert({
@@ -734,7 +719,7 @@ async function processDeposit(wallet, amount, txid, network) {
         txid: txid,
         network,
         wallet_address: wallet.address,
-        status: 'pending',
+        status: 'completed',
         created_at: new Date().toISOString()
       })
       .select()
@@ -748,43 +733,7 @@ async function processDeposit(wallet, amount, txid, network) {
       throw new Error(`Deposit insert failed: ${depositError.message}`);
     }
 
-    const { data: user, error: userError } = await supabase
-      .from('users')
-      .select('balance, total_profit, vip_level')
-      .eq('id', wallet.user_id)
-      .single();
-
-    if (userError) {
-      await supabase.from('deposits').delete().eq('id', newDeposit.id);
-      throw new Error(`user fetch error: ${userError.message}`);
-    }
-
-    const currentBalance = Number(user.balance) || 0;
-    const newBalance = currentBalance + amount;
-    const newTotalProfit = (Number(user.total_profit) || 0) + amount;
-
-    console.log(`📊 User ${wallet.user_id} balance update: ${currentBalance} → ${newBalance} USDT`);
-
-    const { error: updateError } = await supabase
-      .from('users')
-      .update({
-        balance: newBalance,
-        total_profit: newTotalProfit,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', wallet.user_id);
-
-    if (updateError) {
-      await supabase.from('deposits').delete().eq('id', newDeposit.id);
-      throw new Error(`Balance update failed: ${updateError.message}`);
-    }
-
-    // Обновляем статус на 'completed'
-    await supabase
-      .from('deposits')
-      .update({ status: 'completed' })
-      .eq('id', newDeposit.id);
-
+    // Добавляем запись в транзакции
     await supabase.from('transactions').insert({
       user_id: wallet.user_id,
       type: 'deposit',
@@ -794,7 +743,14 @@ async function processDeposit(wallet, amount, txid, network) {
       created_at: new Date().toISOString()
     });
 
-    if (newBalance >= 20 && user.vip_level === 0) {
+    // Проверяем VIP уровень
+    const { data: user } = await supabase
+      .from('users')
+      .select('vip_level, balance')
+      .eq('id', wallet.user_id)
+      .single();
+
+    if (user && user.balance >= 20 && user.vip_level === 0) {
       await supabase
         .from('users')
         .update({ vip_level: 1 })
@@ -803,7 +759,6 @@ async function processDeposit(wallet, amount, txid, network) {
     }
 
     console.log(`✅ DEPOSIT PROCESSED: ${amount} USDT for user ${wallet.user_id}`);
-    console.log(`💰 New balance: ${newBalance} USDT`);
 
     // Schedule auto-collect after deposit
     setTimeout(() => {
@@ -957,9 +912,9 @@ async function handleCheckDeposits(req = {}, res = {}) {
         console.log(`🔍 Processing wallet ${wallet.address} (${wallet.network}) for user ${wallet.user_id}`);
         
         if (wallet.network === 'BEP20') {
-          await sleep(1000); // Увеличили задержку для BSC
+          await sleep(1000);
         } else {
-          await sleep(1500); // Увеличили задержку для TRC20
+          await sleep(1500);
         }
         
         let transactions = [];
@@ -967,7 +922,6 @@ async function handleCheckDeposits(req = {}, res = {}) {
         if (wallet.network === 'TRC20') {
           transactions = await getUSDTTransactions(wallet.address);
         } else if (wallet.network === 'BEP20') {
-          // ИСПОЛЬЗУЕМ ТОЛЬКО QUICKNODE ДЛЯ BSC
           transactions = await getBSCTransactions(wallet.address);
         }
 
@@ -1117,7 +1071,6 @@ async function checkUserDeposits(userId, network) {
     if (network === 'TRC20') {
       transactions = await getUSDTTransactions(wallet.address);
     } else if (network === 'BEP20') {
-      // ИСПОЛЬЗУЕМ ТОЛЬКО QUICKNODE ДЛЯ BSC
       transactions = await getBSCTransactions(wallet.address);
     }
     
@@ -1200,10 +1153,11 @@ app.get('/', (req, res) => {
       'Deposit Processing',
       'Auto Collection',
       'Enhanced Logging',
-      'QuickNode Only for BSC'
+      'Optimized QuickNode for BSC'
     ],
     stats: {
       checkInterval: `${CHECK_INTERVAL_MS / 1000} seconds`,
+      bscCheckInterval: `${BSC_CHECK_INTERVAL_MS / 1000} seconds`,
       minDeposit: `${MIN_DEPOSIT} USDT`,
       keepAmount: `${KEEP_AMOUNT} USDT`
     }
@@ -1221,15 +1175,66 @@ setInterval(() => {
 
 // ========== SCHEDULED DEPOSIT CHECKS ==========
 console.log('⏰ Starting scheduled deposit checks...');
+
+// TRC20 проверка каждые 2 минуты
 setInterval(async () => {
   try {
-    console.log('🕒 ===== SCHEDULED DEPOSIT CHECK STARTED =====');
-    await handleCheckDeposits();
-    console.log('🕒 ===== SCHEDULED DEPOSIT CHECK COMPLETED =====');
+    console.log('🕒 ===== SCHEDULED TRC20 DEPOSIT CHECK STARTED =====');
+    const { data: wallets } = await supabase
+      .from('user_wallets')
+      .select('*')
+      .eq('network', 'TRC20')
+      .limit(200);
+    
+    for (const wallet of wallets || []) {
+      try {
+        await sleep(1500);
+        const transactions = await getUSDTTransactions(wallet.address);
+        
+        for (const tx of transactions) {
+          if (tx.to === wallet.address && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
+            await processDeposit(wallet, tx.amount, tx.transaction_id, 'TRC20');
+          }
+        }
+      } catch (err) {
+        console.error(`❌ Error processing TRC20 wallet ${wallet.address}:`, err.message);
+      }
+    }
+    console.log('🕒 ===== SCHEDULED TRC20 DEPOSIT CHECK COMPLETED =====');
   } catch (err) {
-    console.error('❌ Scheduled deposit check error:', err.message);
+    console.error('❌ Scheduled TRC20 deposit check error:', err.message);
   }
 }, CHECK_INTERVAL_MS);
+
+// BSC проверка каждые 15 секунд (только последние 5 блоков)
+setInterval(async () => {
+  try {
+    console.log('⏱️ ===== SCHEDULED BSC DEPOSIT CHECK STARTED =====');
+    const { data: wallets } = await supabase
+      .from('user_wallets')
+      .select('*')
+      .eq('network', 'BEP20')
+      .limit(200);
+    
+    for (const wallet of wallets || []) {
+      try {
+        await sleep(1000);
+        const transactions = await getBSCTransactions(wallet.address);
+        
+        for (const tx of transactions) {
+          if (tx.to.toLowerCase() === wallet.address.toLowerCase() && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
+            await processDeposit(wallet, tx.amount, tx.transaction_id, 'BEP20');
+          }
+        }
+      } catch (err) {
+        console.error(`❌ Error processing BSC wallet ${wallet.address}:`, err.message);
+      }
+    }
+    console.log('⏱️ ===== SCHEDULED BSC DEPOSIT CHECK COMPLETED =====');
+  } catch (err) {
+    console.error('❌ Scheduled BSC deposit check error:', err.message);
+  }
+}, BSC_CHECK_INTERVAL_MS);
 
 // ========== START SERVER ==========
 console.log('🎯 ALL INITIALIZATION COMPLETE - STARTING SERVER...');
@@ -1238,13 +1243,14 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SERVER SUCCESSFULLY STARTED on port ${PORT}`);
   console.log(`✅ SUPABASE: CONNECTED`);
   console.log(`✅ TRONGRID: API KEY SET`);
-  console.log(`✅ QUICKNODE: CONFIGURED FOR BSC`);
+  console.log(`✅ QUICKNODE: OPTIMIZED FOR BSC`);
   console.log(`💰 TRC20 MASTER: ${COMPANY.MASTER.address}`);
   console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
   console.log(`💰 BEP20 MASTER: ${COMPANY_BSC.MASTER.address}`);
   console.log(`💰 BEP20 MAIN: ${COMPANY_BSC.MAIN.address}`);
-  console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
+  console.log(`⏰ TRC20 AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
+  console.log(`⏱️ BSC AUTO-CHECK: EVERY ${Math.round(BSC_CHECK_INTERVAL_MS / 1000)}s`);
   console.log('===================================');
-  console.log('🎉 APPLICATION READY - QUICKNODE ONLY VERSION');
-  console.log('🔧 BSC Transactions: Using QuickNode with 1000 block range');
+  console.log('🎉 APPLICATION READY - OPTIMIZED QUICKNODE VERSION');
+  console.log('🔧 BSC Transactions: Checking 5 blocks every 15 seconds');
 });

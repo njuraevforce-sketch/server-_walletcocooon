@@ -18,6 +18,7 @@ console.log('SUPABASE_URL:', process.env.SUPABASE_URL ? '✅ SET' : '❌ MISSING
 console.log('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? '✅ SET' : '❌ MISSING');
 console.log('TRONGRID_API_KEY:', process.env.TRONGRID_API_KEY ? '✅ SET' : '❌ MISSING');
 console.log('MORALIS_API_KEY:', process.env.MORALIS_API_KEY ? '✅ SET' : '❌ MISSING');
+console.log('QUICKNODE_BSC_URL:', process.env.QUICKNODE_BSC_URL ? '✅ SET' : '❌ MISSING');
 
 // Enhanced error handling
 process.on('uncaughtException', (error) => {
@@ -40,6 +41,9 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJh
 const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '33759ca3-ffb8-41bc-9036-25a32601eae2';
 const MORALIS_API_KEY = process.env.MORALIS_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjM3MDA2MzI2LTUxNjctNDYxZi1iNWZiLWQ2MTY2YTEyZWM2YiIsIm9yZ0lkIjoiNDc5MDU0IiwidXNlcklkIjoiNDkyODUwIiwidHlwZUlkIjoiMjZhOTVjOGUtNjRjOS00ZDEwLThhNWYtY2FkNDVjNGI0MGE1IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjIxNjYzNTQsImV4cCI6NDkxNzkyNjM1NH0.3DIHSnwViPTGbveV7u_gkZxt8m2FOj9Pa8uDShZqL-Q';
 
+// ========== QUICKNODE BSC CONFIGURATION ==========
+const QUICKNODE_BSC_URL = process.env.QUICKNODE_BSC_URL || 'https://thrilling-falling-morning.bsc.quiknode.pro/e634acd5c5a0b08f71e357def772863df6a69cf6/';
+
 console.log('🔄 Initializing Supabase client...');
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 console.log('✅ Supabase client initialized');
@@ -51,21 +55,28 @@ const tronWeb = new TronWeb({
 });
 console.log('✅ TronWeb initialized');
 
-// ========== BSC RPC CONFIGURATION ==========
+// ========== BSC RPC CONFIGURATION WITH QUICKNODE ==========
 const BSC_RPC_URLS = [
-  'https://bsc-dataseed.binance.org/',
-  'https://bsc-dataseed1.defibit.io/',
-  'https://bsc-dataseed1.ninicoin.io/',
-  'https://bsc-dataseed2.ninicoin.io/',
+  QUICKNODE_BSC_URL, // Primary - QuickNode
+  'https://bsc-dataseed.binance.org/', // Fallback 1
+  'https://bsc-dataseed1.defibit.io/', // Fallback 2
+  'https://bsc-dataseed1.ninicoin.io/', // Fallback 3
 ];
+
+console.log('🔌 BSC RPC URLs configured:');
+BSC_RPC_URLS.forEach((url, index) => {
+  console.log(`   ${index === 0 ? '🟢 PRIMARY' : '🔵 FALLBACK'} ${index + 1}: ${url.substring(0, 50)}...`);
+});
 
 let currentRpcIndex = 0;
 function getNextBscRpc() {
   const rpc = BSC_RPC_URLS[currentRpcIndex];
+  console.log(`🔌 Using BSC RPC: ${rpc.substring(0, 50)}... (index: ${currentRpcIndex})`);
   currentRpcIndex = (currentRpcIndex + 1) % BSC_RPC_URLS.length;
   return rpc;
 }
 
+// Initialize with QuickNode as primary
 let bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
 
 // COMPANY wallets - TRC20
@@ -228,19 +239,26 @@ async function moralisRequest(endpoint, retries = 3) {
   return { result: [] };
 }
 
-// ========== BSC FUNCTIONS ==========
+// ========== BSC FUNCTIONS WITH QUICKNODE ==========
 async function getBSCUSDTBalance(address) {
   console.log(`🔍 Checking BSC USDT balance for: ${address}`);
-  try {
-    const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, bscProvider);
-    const balance = await contract.balanceOf(address);
-    const formatted = Number(ethers.utils.formatUnits(balance, 18));
-    console.log(`✅ BSC USDT balance for ${address}: ${formatted} USDT`);
-    return formatted;
-  } catch (error) {
-    console.error('❌ BSC USDT balance error:', error.message);
-    return 0;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, bscProvider);
+      const balance = await contract.balanceOf(address);
+      const formatted = Number(ethers.utils.formatUnits(balance, 18));
+      console.log(`✅ BSC USDT balance for ${address}: ${formatted} USDT`);
+      return formatted;
+    } catch (error) {
+      console.error(`❌ BSC USDT balance attempt ${attempt + 1} error:`, error.message);
+      if (attempt < 2) {
+        // Switch to next RPC on error
+        bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
+        await sleep(1000);
+      }
+    }
   }
+  return 0;
 }
 
 async function getBSCTransactions(address) {
@@ -295,44 +313,32 @@ async function getBSCTransactions(address) {
 
 async function getBSCBalance(address) {
   console.log(`🔍 Checking BSC native balance for: ${address}`);
-  try {
-    const balance = await bscProvider.getBalance(address);
-    const formatted = Number(ethers.utils.formatEther(balance));
-    console.log(`✅ BSC native balance for ${address}: ${formatted} BNB`);
-    return formatted;
-  } catch (error) {
-    console.error('❌ BSC balance error:', error.message);
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
       const balance = await bscProvider.getBalance(address);
-      return Number(ethers.utils.formatEther(balance));
-    } catch (retryError) {
-      return 0;
+      const formatted = Number(ethers.utils.formatEther(balance));
+      console.log(`✅ BSC native balance for ${address}: ${formatted} BNB`);
+      return formatted;
+    } catch (error) {
+      console.error(`❌ BSC balance attempt ${attempt + 1} error:`, error.message);
+      if (attempt < 2) {
+        bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
+        await sleep(1000);
+      }
     }
   }
+  return 0;
 }
 
 async function sendBSC(fromPrivateKey, toAddress, amount) {
   console.log(`🔄 Sending ${amount} BNB to ${toAddress}`);
-  try {
-    if (!fromPrivateKey || fromPrivateKey.includes('NOT_SET')) {
-      console.error('❌ BSC send error: Private key not set');
-      return false;
-    }
-
-    const wallet = new ethers.Wallet(fromPrivateKey, bscProvider);
-    const tx = await wallet.sendTransaction({
-      to: toAddress,
-      value: ethers.utils.parseEther(amount.toString())
-    });
-    
-    await tx.wait();
-    console.log(`✅ BSC sent: ${amount} BNB to ${toAddress}, txid: ${tx.hash}`);
-    return true;
-  } catch (error) {
-    console.error('❌ BSC send error:', error.message);
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
+      if (!fromPrivateKey || fromPrivateKey.includes('NOT_SET')) {
+        console.error('❌ BSC send error: Private key not set');
+        return false;
+      }
+
       const wallet = new ethers.Wallet(fromPrivateKey, bscProvider);
       const tx = await wallet.sendTransaction({
         to: toAddress,
@@ -340,35 +346,28 @@ async function sendBSC(fromPrivateKey, toAddress, amount) {
       });
       
       await tx.wait();
-      console.log(`✅ BSC sent (retry): ${amount} BNB to ${toAddress}, txid: ${tx.hash}`);
+      console.log(`✅ BSC sent: ${amount} BNB to ${toAddress}, txid: ${tx.hash}`);
       return true;
-    } catch (retryError) {
-      return false;
+    } catch (error) {
+      console.error(`❌ BSC send attempt ${attempt + 1} error:`, error.message);
+      if (attempt < 2) {
+        bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
+        await sleep(1000);
+      }
     }
   }
+  return false;
 }
 
 async function transferBSCUSDT(fromPrivateKey, toAddress, amount) {
   console.log(`🔄 Transferring ${amount} BSC USDT to ${toAddress}`);
-  try {
-    if (!fromPrivateKey || fromPrivateKey.includes('NOT_SET')) {
-      console.error('❌ BSC USDT transfer error: Private key not set');
-      return false;
-    }
-
-    const wallet = new ethers.Wallet(fromPrivateKey, bscProvider);
-    const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, wallet);
-    
-    const amountInWei = ethers.utils.parseUnits(amount.toString(), 18);
-    const tx = await contract.transfer(toAddress, amountInWei);
-    
-    await tx.wait();
-    console.log(`✅ BSC USDT transfer: ${amount} USDT to ${toAddress}, txid: ${tx.hash}`);
-    return true;
-  } catch (error) {
-    console.error('❌ BSC USDT transfer error:', error.message);
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
+      if (!fromPrivateKey || fromPrivateKey.includes('NOT_SET')) {
+        console.error('❌ BSC USDT transfer error: Private key not set');
+        return false;
+      }
+
       const wallet = new ethers.Wallet(fromPrivateKey, bscProvider);
       const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, wallet);
       
@@ -376,12 +375,17 @@ async function transferBSCUSDT(fromPrivateKey, toAddress, amount) {
       const tx = await contract.transfer(toAddress, amountInWei);
       
       await tx.wait();
-      console.log(`✅ BSC USDT transfer (retry): ${amount} USDT to ${toAddress}, txid: ${tx.hash}`);
+      console.log(`✅ BSC USDT transfer: ${amount} USDT to ${toAddress}, txid: ${tx.hash}`);
       return true;
-    } catch (retryError) {
-      return false;
+    } catch (error) {
+      console.error(`❌ BSC USDT transfer attempt ${attempt + 1} error:`, error.message);
+      if (attempt < 2) {
+        bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
+        await sleep(1000);
+      }
     }
   }
+  return false;
 }
 
 // ========== TRON FUNCTIONS ==========
@@ -1168,7 +1172,8 @@ app.get('/health', (req, res) => {
     env: {
       NODE_ENV: process.env.NODE_ENV,
       PORT: process.env.PORT,
-      SUPABASE_URL: process.env.SUPABASE_URL ? 'SET' : 'MISSING'
+      SUPABASE_URL: process.env.SUPABASE_URL ? 'SET' : 'MISSING',
+      QUICKNODE_BSC_URL: process.env.QUICKNODE_BSC_URL ? 'SET' : 'MISSING'
     }
   };
   
@@ -1188,12 +1193,14 @@ app.get('/', (req, res) => {
       'Multi-Network Wallet Generation',
       'Deposit Processing',
       'Auto Collection',
-      'Enhanced Logging'
+      'Enhanced Logging',
+      'QuickNode BSC Integration'
     ],
     stats: {
       checkInterval: `${CHECK_INTERVAL_MS / 1000} seconds`,
       minDeposit: `${MIN_DEPOSIT} USDT`,
-      keepAmount: `${KEEP_AMOUNT} USDT`
+      keepAmount: `${KEEP_AMOUNT} USDT`,
+      bscProvider: 'QuickNode (Primary)'
     }
   };
   
@@ -1227,6 +1234,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ SUPABASE: CONNECTED`);
   console.log(`✅ TRONGRID: API KEY SET`);
   console.log(`✅ MORALIS API: AVAILABLE`);
+  console.log(`🔌 BSC PROVIDER: QUICKNODE`);
   console.log(`💰 TRC20 MASTER: ${COMPANY.MASTER.address}`);
   console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
   console.log(`💰 BEP20 MASTER: ${COMPANY_BSC.MASTER.address}`);

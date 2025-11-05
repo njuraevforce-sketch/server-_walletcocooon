@@ -17,8 +17,7 @@ console.log('NODE_ENV:', process.env.NODE_ENV || 'not set');
 console.log('SUPABASE_URL:', process.env.SUPABASE_URL ? '✅ SET' : '❌ MISSING');
 console.log('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? '✅ SET' : '❌ MISSING');
 console.log('TRONGRID_API_KEY:', process.env.TRONGRID_API_KEY ? '✅ SET' : '❌ MISSING');
-console.log('MORALIS_API_KEY:', process.env.MORALIS_API_KEY ? '✅ SET' : '❌ MISSING');
-console.log('QUICKNODE_BSC_URL:', process.env.QUICKNODE_BSC_URL ? '✅ SET' : '❌ MISSING');
+console.log('GETBLOCK_API_KEY:', process.env.GETBLOCK_API_KEY ? '✅ SET' : '❌ MISSING');
 
 // Enhanced error handling
 process.on('uncaughtException', (error) => {
@@ -39,10 +38,10 @@ const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://eqzfivdckzrkkncahlyn.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVxemZpdmRja3pya2tuY2FobHluIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTYwNTg2NSwiZXhwIjoyMDc3MTgxODY1fQ.AuGqzDDMzWS1COhHdBMchHarYmd1gNC_9PfRfJWPTxc';
 const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '33759ca3-ffb8-41bc-9036-25a32601eae2';
-const MORALIS_API_KEY = process.env.MORALIS_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjM3MDA2MzI2LTUxNjctNDYxZi1iNWZiLWQ2MTY2YTEyZWM2YiIsIm9yZ0lkIjoiNDc5MDU0IiwidXNlcklkIjoiNDkyODUwIiwidHlwZUlkIjoiMjZhOTVjOGUtNjRjOS00ZDEwLThhNWYtY2FkNDVjNGI0MGE1IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjIxNjYzNTQsImV4cCI6NDkxNzkyNjM1NH0.3DIHSnwViPTGbveV7u_gkZxt8m2FOj9Pa8uDShZqL-Q';
+const GETBLOCK_API_KEY = process.env.GETBLOCK_API_KEY || 'b124f13a33774dbbb13fa002dd4c831f';
 
-// ========== QUICKNODE BSC CONFIGURATION ==========
-const QUICKNODE_BSC_URL = process.env.QUICKNODE_BSC_URL || 'https://thrilling-falling-morning.bsc.quiknode.pro/e634acd5c5a0b08f71e357def772863df6a69cf6/';
+// ========== GETBLOCK BSC CONFIGURATION ==========
+const GETBLOCK_BSC_URL = `https://go.getblock.io/${GETBLOCK_API_KEY}`;
 
 console.log('🔄 Initializing Supabase client...');
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -55,9 +54,9 @@ const tronWeb = new TronWeb({
 });
 console.log('✅ TronWeb initialized');
 
-// ========== BSC RPC CONFIGURATION WITH QUICKNODE ==========
+// ========== BSC RPC CONFIGURATION WITH GETBLOCK ==========
 const BSC_RPC_URLS = [
-  QUICKNODE_BSC_URL, // Primary - QuickNode
+  GETBLOCK_BSC_URL, // Primary - GetBlock
   'https://bsc-dataseed.binance.org/', // Fallback 1
   'https://bsc-dataseed1.defibit.io/', // Fallback 2
   'https://bsc-dataseed1.ninicoin.io/', // Fallback 3
@@ -76,7 +75,7 @@ function getNextBscRpc() {
   return rpc;
 }
 
-// Initialize with QuickNode as primary
+// Initialize with GetBlock as primary
 let bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
 
 // COMPANY wallets - TRC20
@@ -147,7 +146,7 @@ const FUND_BNB_AMOUNT = 0.01;
 
 // Throttling / concurrency
 const BALANCE_CONCURRENCY = Number(process.env.BALANCE_CONCURRENCY || 2);
-const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 2 * 60 * 1000); // 2 minutes
+const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 1 * 60 * 1000); // 1 минута
 
 // ========== HELPERS ==========
 function sleep(ms) {
@@ -200,22 +199,28 @@ function runBalanceQueue() {
   }
 }
 
-// ========== MORALIS API FUNCTIONS ==========
-async function moralisRequest(endpoint, retries = 3) {
+// ========== GETBLOCK API FUNCTIONS (ЗАМЕНА MORALIS) ==========
+async function getBlockRequest(method, params, retries = 3) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      console.log(`🔍 Moralis API attempt ${attempt + 1}: ${endpoint}`);
-      const response = await fetch(`https://deep-index.moralis.io/api/v2${endpoint}`, {
+      console.log(`🔍 GetBlock API attempt ${attempt + 1}: ${method}`);
+      const response = await fetch(GETBLOCK_BSC_URL, {
+        method: 'POST',
         headers: {
-          'X-API-Key': MORALIS_API_KEY,
-          'Accept': 'application/json'
-        }
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: method,
+          params: params,
+          id: 1
+        })
       });
 
       if (response.status === 429) {
         if (attempt < retries) {
           const backoff = 2000 * Math.pow(2, attempt);
-          console.warn(`⚠️ Moralis rate limit, waiting ${backoff}ms...`);
+          console.warn(`⚠️ GetBlock rate limit, waiting ${backoff}ms...`);
           await sleep(backoff);
           continue;
         }
@@ -223,15 +228,15 @@ async function moralisRequest(endpoint, retries = 3) {
 
       const data = await response.json();
       
-      if (response.ok) {
-        console.log(`✅ Moralis API success: ${endpoint}`);
+      if (data.result) {
+        console.log(`✅ GetBlock API success: ${method}`);
         return data;
       } else {
-        console.log(`❌ Moralis API error: ${data.message || response.statusText}`);
+        console.log(`❌ GetBlock API error: ${data.error?.message || 'Unknown error'}`);
         return { result: [] };
       }
     } catch (error) {
-      console.error(`❌ Moralis request attempt ${attempt + 1} failed:`, error.message);
+      console.error(`❌ GetBlock request attempt ${attempt + 1} failed:`, error.message);
       if (attempt === retries) throw error;
       await sleep(1000 * (attempt + 1));
     }
@@ -239,7 +244,7 @@ async function moralisRequest(endpoint, retries = 3) {
   return { result: [] };
 }
 
-// ========== BSC FUNCTIONS WITH QUICKNODE ==========
+// ========== BSC FUNCTIONS WITH GETBLOCK ==========
 async function getBSCUSDTBalance(address) {
   console.log(`🔍 Checking BSC USDT balance for: ${address}`);
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -265,34 +270,43 @@ async function getBSCTransactions(address) {
   try {
     if (!address) return [];
 
-    console.log(`🔍 Checking BSC transactions via Moralis API: ${address}`);
+    console.log(`🔍 Checking BSC transactions via GetBlock API: ${address}`);
     
-    const data = await moralisRequest(`/${address}/erc20/transfers?chain=bsc&limit=50`);
+    // Используем eth_getLogs для поиска USDT трансферов (аналогично Moralis)
+    const data = await getBlockRequest('eth_getLogs', [{
+      fromBlock: 'latest',
+      toBlock: 'latest', 
+      address: USDT_BSC_CONTRACT,
+      topics: [
+        '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef', // Transfer event
+        null,
+        '0x' + address.toLowerCase().replace('0x', '').padStart(64, '0') // Получатель
+      ]
+    }]);
     
     if (data.result && Array.isArray(data.result)) {
-      console.log(`✅ Moralis API: Found ${data.result.length} token transfers for ${address}`);
+      console.log(`✅ GetBlock API: Found ${data.result.length} transfer events for ${address}`);
       
       const transactions = [];
-      for (const tx of data.result) {
+      for (const log of data.result) {
         try {
-          if (tx.address && tx.address.toLowerCase() === USDT_BSC_CONTRACT.toLowerCase() &&
-              tx.to_address && tx.to_address.toLowerCase() === address.toLowerCase()) {
-            
-            const amount = Number(tx.value) / Math.pow(10, tx.decimals || 18);
-            
-            transactions.push({
-              transaction_id: tx.transaction_hash,
-              to: tx.to_address,
-              from: tx.from_address,
-              amount: amount,
-              token: 'USDT',
-              confirmed: true,
-              network: 'BEP20',
-              timestamp: new Date(tx.block_timestamp).getTime()
-            });
+          // Парсим данные из лога
+          const from = '0x' + log.topics[1].slice(26);
+          const valueHex = log.data;
+          const value = parseInt(valueHex, 16) / 1e18; // USDT имеет 18 decimals
+          
+          transactions.push({
+            transaction_id: log.transactionHash,
+            to: address,
+            from: from,
+            amount: value,
+            token: 'USDT',
+            confirmed: true,
+            network: 'BEP20',
+            timestamp: Date.now() // Используем текущее время
+          });
 
-            console.log(`📥 Found BSC deposit: ${amount} USDT from ${tx.from_address}`);
-          }
+          console.log(`📥 Found BSC deposit via GetBlock: ${value} USDT from ${from}`);
         } catch (e) { 
           console.warn('Skipping malformed BSC transaction:', e.message);
           continue; 
@@ -302,7 +316,7 @@ async function getBSCTransactions(address) {
       transactions.sort((a, b) => b.timestamp - a.timestamp);
       return transactions;
     } else {
-      console.log(`ℹ️ Moralis API: No transactions found for ${address}`);
+      console.log(`ℹ️ GetBlock API: No transactions found for ${address}`);
       return [];
     }
   } catch (error) {
@@ -388,7 +402,7 @@ async function transferBSCUSDT(fromPrivateKey, toAddress, amount) {
   return false;
 }
 
-// ========== TRON FUNCTIONS ==========
+// ========== TRON FUNCTIONS (БЕЗ ИЗМЕНЕНИЙ) ==========
 async function getUSDTBalance(address) {
   return enqueueBalanceJob(async () => {
     try {
@@ -606,7 +620,7 @@ async function transferUSDT(fromPrivateKey, toAddress, amount) {
   }
 }
 
-// ========== UNIVERSAL AUTO-COLLECT ==========
+// ========== UNIVERSAL AUTO-COLLECT (БЕЗ ИЗМЕНЕНИЙ) ==========
 async function autoCollectToMainWallet(wallet) {
   try {
     console.log(`💰 AUTO-COLLECT started for: ${wallet.address} (${wallet.network})`);
@@ -696,7 +710,7 @@ async function autoCollectToMainWallet(wallet) {
   }
 }
 
-// ========== UNIVERSAL DEPOSIT PROCESSING ==========
+// ========== UNIVERSAL DEPOSIT PROCESSING (БЕЗ ИЗМЕНЕНИЙ) ==========
 async function processDeposit(wallet, amount, txid, network) {
   try {
     console.log(`💰 PROCESSING DEPOSIT: ${amount} USDT for user ${wallet.user_id}, txid: ${txid}, network: ${network}, wallet: ${wallet.address}`);
@@ -836,7 +850,7 @@ async function processDeposit(wallet, amount, txid, network) {
   }
 }
 
-// ========== API Endpoints ==========
+// ========== API Endpoints (БЕЗ ИЗМЕНЕНИЙ) ==========
 app.post('/generate-wallet', async (req, res) => {
   try {
     const { user_id, network = 'TRC20' } = req.body;
@@ -939,7 +953,7 @@ app.get('/check-deposits', async (req, res) => { await handleCheckDeposits(req, 
 async function handleCheckDeposits(req = {}, res = {}) {
   try {
     console.log('🔄 ===== MANUAL DEPOSIT CHECK STARTED =====');
-    const { data: wallets, error } = await supabase.from('user_wallets').select('*').limit(200);
+    const { data: wallets, error } = await supabase.from('user_wallets').select('*').limit(60); // 60 кошельков
     if (error) throw error;
 
     console.log(`🔍 Checking ${wallets?.length || 0} wallets across all networks`);
@@ -1018,7 +1032,7 @@ app.get('/collect-funds', async (req, res) => { await handleCollectFunds(req, re
 async function handleCollectFunds(req = {}, res = {}) {
   try {
     console.log('💰 ===== MANUAL FUNDS COLLECTION STARTED =====');
-    const { data: wallets, error } = await supabase.from('user_wallets').select('*').limit(200);
+    const { data: wallets, error } = await supabase.from('user_wallets').select('*').limit(60); // 60 кошельков
     if (error) throw error;
 
     console.log(`🔍 Starting collection for ${wallets?.length || 0} wallets`);
@@ -1173,7 +1187,7 @@ app.get('/health', (req, res) => {
       NODE_ENV: process.env.NODE_ENV,
       PORT: process.env.PORT,
       SUPABASE_URL: process.env.SUPABASE_URL ? 'SET' : 'MISSING',
-      QUICKNODE_BSC_URL: process.env.QUICKNODE_BSC_URL ? 'SET' : 'MISSING'
+      GETBLOCK_API_KEY: process.env.GETBLOCK_API_KEY ? 'SET' : 'MISSING'
     }
   };
   
@@ -1194,13 +1208,14 @@ app.get('/', (req, res) => {
       'Deposit Processing',
       'Auto Collection',
       'Enhanced Logging',
-      'QuickNode BSC Integration'
+      'GetBlock BSC Integration'
     ],
     stats: {
       checkInterval: `${CHECK_INTERVAL_MS / 1000} seconds`,
       minDeposit: `${MIN_DEPOSIT} USDT`,
       keepAmount: `${KEEP_AMOUNT} USDT`,
-      bscProvider: 'QuickNode (Primary)'
+      bscProvider: 'GetBlock (Primary)',
+      maxWallets: '60 кошельков'
     }
   };
   
@@ -1215,7 +1230,7 @@ setInterval(() => {
 }, 30000); // Every 30 seconds
 
 // ========== SCHEDULED DEPOSIT CHECKS ==========
-console.log('⏰ Starting scheduled deposit checks...');
+console.log('⏰ Starting scheduled deposit checks every 1 minute for 60 wallets...');
 setInterval(async () => {
   try {
     console.log('🕒 ===== SCHEDULED DEPOSIT CHECK STARTED =====');
@@ -1233,13 +1248,14 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SERVER SUCCESSFULLY STARTED on port ${PORT}`);
   console.log(`✅ SUPABASE: CONNECTED`);
   console.log(`✅ TRONGRID: API KEY SET`);
-  console.log(`✅ MORALIS API: AVAILABLE`);
-  console.log(`🔌 BSC PROVIDER: QUICKNODE`);
+  console.log(`✅ GETBLOCK API: AVAILABLE`);
+  console.log(`🔌 BSC PROVIDER: GETBLOCK`);
   console.log(`💰 TRC20 MASTER: ${COMPANY.MASTER.address}`);
   console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
   console.log(`💰 BEP20 MASTER: ${COMPANY_BSC.MASTER.address}`);
   console.log(`💰 BEP20 MAIN: ${COMPANY_BSC.MAIN.address}`);
   console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
+  console.log(`👛 MAX WALLETS: 60`);
   console.log('===================================');
   console.log('🎉 APPLICATION READY - LOGS SHOULD BE VISIBLE NOW');
 });

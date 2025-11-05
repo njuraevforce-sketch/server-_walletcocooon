@@ -18,6 +18,7 @@ console.log('SUPABASE_URL:', process.env.SUPABASE_URL ? '✅ SET' : '❌ MISSING
 console.log('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? '✅ SET' : '❌ MISSING');
 console.log('TRONGRID_API_KEY:', process.env.TRONGRID_API_KEY ? '✅ SET' : '❌ MISSING');
 console.log('MORALIS_API_KEY:', process.env.MORALIS_API_KEY ? '✅ SET' : '❌ MISSING');
+console.log('QUICKNODE_BSC_URL:', process.env.QUICKNODE_BSC_URL ? '✅ SET' : '❌ MISSING');
 
 // Enhanced error handling
 process.on('uncaughtException', (error) => {
@@ -39,6 +40,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL || 'https://eqzfivdckzrkkncahlyn.s
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVxemZpdmRja3pya2tuY2FobHluIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTYwNTg2NSwiZXhwIjoyMDc3MTgxODY1fQ.AuGqzDDMzWS1COhHdBMchHarYmd1gNC_9PfRfJWPTxc';
 const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '33759ca3-ffb8-41bc-9036-25a32601eae2';
 const MORALIS_API_KEY = process.env.MORALIS_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjM3MDA2MzI2LTUxNjctNDYxZi1iNWZiLWQ2MTY2YTEyZWM2YiIsIm9yZ0lkIjoiNDc5MDU0IiwidXNlcklkIjoiNDkyODUwIiwidHlwZUlkIjoiMjZhOTVjOGUtNjRjOS00ZDEwLThhNWYtY2FkNDVjNGI0MGE1IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjIxNjYzNTQsImV4cCI6NDkxNzkyNjM1NH0.3DIHSnwViPTGbveV7u_gkZxt8m2FOj9Pa8uDShZqL-Q';
+const QUICKNODE_BSC_URL = process.env.QUICKNODE_BSC_URL || 'https://thrilling-falling-morning.bsc.quiknode.pro/e634acd5c5a0b08f71e357def772863df6a69cf6/';
 
 console.log('🔄 Initializing Supabase client...');
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -53,6 +55,7 @@ console.log('✅ TronWeb initialized');
 
 // ========== BSC RPC CONFIGURATION ==========
 const BSC_RPC_URLS = [
+  QUICKNODE_BSC_URL,  // QuickNode как основной
   'https://bsc-dataseed.binance.org/',
   'https://bsc-dataseed1.defibit.io/',
   'https://bsc-dataseed1.ninicoin.io/',
@@ -243,16 +246,68 @@ async function getBSCUSDTBalance(address) {
   }
 }
 
+// НОВАЯ ФУНКЦИЯ: Проверка транзакций через QuickNode
+async function getBSCTransactionsQuickNode(address) {
+  try {
+    if (!address) return [];
+
+    console.log(`🔍 [QUICKNODE] Checking BSC transactions for: ${address}`);
+    
+    const quicknodeProvider = new ethers.providers.JsonRpcProvider(QUICKNODE_BSC_URL);
+    const contract = new ethers.Contract(USDT_BSC_CONTRACT, [
+      "event Transfer(address indexed from, address indexed to, uint256 value)"
+    ], quicknodeProvider);
+
+    const currentBlock = await quicknodeProvider.getBlockNumber();
+    const fromBlock = currentBlock - 10000; // Проверяем последние ~1 день
+
+    const filter = contract.filters.Transfer(null, address);
+    const logs = await contract.queryFilter(filter, fromBlock, currentBlock);
+
+    console.log(`✅ [QUICKNODE] Found ${logs.length} transfer events for ${address}`);
+    
+    const transactions = [];
+    for (const log of logs) {
+      try {
+        const amount = Number(ethers.utils.formatUnits(log.args.value, 18));
+        
+        transactions.push({
+          transaction_id: log.transactionHash,
+          to: log.args.to,
+          from: log.args.from,
+          amount: amount,
+          token: 'USDT',
+          confirmed: true,
+          network: 'BEP20',
+          timestamp: (await quicknodeProvider.getBlock(log.blockNumber)).timestamp * 1000
+        });
+
+        console.log(`📥 [QUICKNODE] Found BSC deposit: ${amount} USDT from ${log.args.from}`);
+      } catch (e) { 
+        console.warn('[QUICKNODE] Skipping malformed BSC transaction:', e.message);
+        continue; 
+      }
+    }
+    
+    transactions.sort((a, b) => b.timestamp - a.timestamp);
+    return transactions;
+  } catch (error) {
+    console.error('❌ [QUICKNODE] BSC transactions error:', error.message);
+    return [];
+  }
+}
+
+// СТАРАЯ ФУНКЦИЯ: Проверка транзакций через Moralis (оставляем для сравнения)
 async function getBSCTransactions(address) {
   try {
     if (!address) return [];
 
-    console.log(`🔍 Checking BSC transactions via Moralis API: ${address}`);
+    console.log(`🔍 [MORALIS] Checking BSC transactions for: ${address}`);
     
     const data = await moralisRequest(`/${address}/erc20/transfers?chain=bsc&limit=50`);
     
     if (data.result && Array.isArray(data.result)) {
-      console.log(`✅ Moralis API: Found ${data.result.length} token transfers for ${address}`);
+      console.log(`✅ [MORALIS] Found ${data.result.length} token transfers for ${address}`);
       
       const transactions = [];
       for (const tx of data.result) {
@@ -273,10 +328,10 @@ async function getBSCTransactions(address) {
               timestamp: new Date(tx.block_timestamp).getTime()
             });
 
-            console.log(`📥 Found BSC deposit: ${amount} USDT from ${tx.from_address}`);
+            console.log(`📥 [MORALIS] Found BSC deposit: ${amount} USDT from ${tx.from_address}`);
           }
         } catch (e) { 
-          console.warn('Skipping malformed BSC transaction:', e.message);
+          console.warn('[MORALIS] Skipping malformed BSC transaction:', e.message);
           continue; 
         }
       }
@@ -284,13 +339,52 @@ async function getBSCTransactions(address) {
       transactions.sort((a, b) => b.timestamp - a.timestamp);
       return transactions;
     } else {
-      console.log(`ℹ️ Moralis API: No transactions found for ${address}`);
+      console.log(`ℹ️ [MORALIS] No transactions found for ${address}`);
       return [];
     }
   } catch (error) {
-    console.error('❌ BSC transactions error:', error.message);
+    console.error('❌ [MORALIS] BSC transactions error:', error.message);
     return [];
   }
+}
+
+// ОБНОВЛЕННАЯ ФУНКЦИЯ: Сравнение обоих методов
+async function getBSCTransactionsComparison(address) {
+  console.log(`🔄 COMPARISON: Testing both providers for ${address}`);
+  
+  const startTime = Date.now();
+  
+  // Запускаем оба метода параллельно
+  const [moralisResult, quicknodeResult] = await Promise.allSettled([
+    getBSCTransactions(address),
+    getBSCTransactionsQuickNode(address)
+  ]);
+
+  const endTime = Date.now();
+  const duration = endTime - startTime;
+
+  const moralisTransactions = moralisResult.status === 'fulfilled' ? moralisResult.value : [];
+  const quicknodeTransactions = quicknodeResult.status === 'fulfilled' ? quicknodeResult.value : [];
+
+  console.log(`📊 COMPARISON RESULTS for ${address}:`);
+  console.log(`   ⏱️  Duration: ${duration}ms`);
+  console.log(`   🔵 Moralis: ${moralisTransactions.length} transactions`);
+  console.log(`   🟢 QuickNode: ${quicknodeTransactions.length} transactions`);
+  
+  // Сравниваем хеши транзакций
+  const moralisTxIds = new Set(moralisTransactions.map(tx => tx.transaction_id));
+  const quicknodeTxIds = new Set(quicknodeTransactions.map(tx => tx.transaction_id));
+  
+  const commonTx = [...moralisTxIds].filter(tx => quicknodeTxIds.has(tx));
+  const onlyMoralisTx = [...moralisTxIds].filter(tx => !quicknodeTxIds.has(tx));
+  const onlyQuicknodeTx = [...quicknodeTxIds].filter(tx => !moralisTxIds.has(tx));
+  
+  console.log(`   🔄 Common transactions: ${commonTx.length}`);
+  console.log(`   🔵 Only in Moralis: ${onlyMoralisTx.length}`);
+  console.log(`   🟢 Only in QuickNode: ${onlyQuicknodeTx.length}`);
+
+  // Возвращаем результат от Moralis (как основной пока)
+  return moralisTransactions;
 }
 
 async function getBSCBalance(address) {
@@ -959,7 +1053,8 @@ async function handleCheckDeposits(req = {}, res = {}) {
         if (wallet.network === 'TRC20') {
           transactions = await getUSDTTransactions(wallet.address);
         } else if (wallet.network === 'BEP20') {
-          transactions = await getBSCTransactions(wallet.address);
+          // ИСПОЛЬЗУЕМ СРАВНЕНИЕ ОБОИХ МЕТОДОВ ДЛЯ BEP20
+          transactions = await getBSCTransactionsComparison(wallet.address);
         }
 
         console.log(`📊 Found ${transactions.length} transactions for wallet ${wallet.address}`);
@@ -1108,7 +1203,8 @@ async function checkUserDeposits(userId, network) {
     if (network === 'TRC20') {
       transactions = await getUSDTTransactions(wallet.address);
     } else if (network === 'BEP20') {
-      transactions = await getBSCTransactions(wallet.address);
+      // ИСПОЛЬЗУЕМ СРАВНЕНИЕ ОБОИХ МЕТОДОВ ДЛЯ BEP20
+      transactions = await getBSCTransactionsComparison(wallet.address);
     }
     
     console.log(`📊 Found ${transactions.length} transactions for user ${userId}`);
@@ -1168,7 +1264,8 @@ app.get('/health', (req, res) => {
     env: {
       NODE_ENV: process.env.NODE_ENV,
       PORT: process.env.PORT,
-      SUPABASE_URL: process.env.SUPABASE_URL ? 'SET' : 'MISSING'
+      SUPABASE_URL: process.env.SUPABASE_URL ? 'SET' : 'MISSING',
+      QUICKNODE_BSC_URL: process.env.QUICKNODE_BSC_URL ? 'SET' : 'MISSING'
     }
   };
   
@@ -1188,7 +1285,8 @@ app.get('/', (req, res) => {
       'Multi-Network Wallet Generation',
       'Deposit Processing',
       'Auto Collection',
-      'Enhanced Logging'
+      'Enhanced Logging',
+      'QuickNode + Moralis Comparison'
     ],
     stats: {
       checkInterval: `${CHECK_INTERVAL_MS / 1000} seconds`,
@@ -1227,6 +1325,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ SUPABASE: CONNECTED`);
   console.log(`✅ TRONGRID: API KEY SET`);
   console.log(`✅ MORALIS API: AVAILABLE`);
+  console.log(`✅ QUICKNODE: CONFIGURED`);
   console.log(`💰 TRC20 MASTER: ${COMPANY.MASTER.address}`);
   console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
   console.log(`💰 BEP20 MASTER: ${COMPANY_BSC.MASTER.address}`);
@@ -1234,4 +1333,5 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
   console.log('===================================');
   console.log('🎉 APPLICATION READY - LOGS SHOULD BE VISIBLE NOW');
+  console.log('🔍 QuickNode vs Moralis comparison ENABLED for BSC transactions');
 });

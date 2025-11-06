@@ -147,7 +147,7 @@ const FUND_BNB_AMOUNT = 0.01;
 
 // Throttling / concurrency
 const BALANCE_CONCURRENCY = Number(process.env.BALANCE_CONCURRENCY || 2);
-const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 2 * 60 * 1000); // 2 minutes
+const CHECK_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 
 // ========== HELPERS ==========
 function sleep(ms) {
@@ -309,25 +309,6 @@ async function getBSCTransactions(address) {
     console.error('❌ BSC transactions error:', error.message);
     return [];
   }
-}
-
-async function getBSCBalance(address) {
-  console.log(`🔍 Checking BSC native balance for: ${address}`);
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const balance = await bscProvider.getBalance(address);
-      const formatted = Number(ethers.utils.formatEther(balance));
-      console.log(`✅ BSC native balance for ${address}: ${formatted} BNB`);
-      return formatted;
-    } catch (error) {
-      console.error(`❌ BSC balance attempt ${attempt + 1} error:`, error.message);
-      if (attempt < 2) {
-        bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
-        await sleep(1000);
-      }
-    }
-  }
-  return 0;
 }
 
 async function sendBSC(fromPrivateKey, toAddress, amount) {
@@ -625,7 +606,7 @@ async function autoCollectToMainWallet(wallet) {
       sendNativeFunction = sendTRX;
     } else if (wallet.network === 'BEP20') {
       usdtBalance = await getBSCUSDTBalance(wallet.address);
-      nativeBalance = await getBSCBalance(wallet.address);
+      nativeBalance = 0; // Убрана проверка баланса BNB
       minNativeForFee = MIN_BNB_FOR_FEE;
       fundAmount = FUND_BNB_AMOUNT;
       companyMain = COMPANY_BSC.MAIN;
@@ -656,7 +637,7 @@ async function autoCollectToMainWallet(wallet) {
       }
       
       await sleep(15000);
-      const newNativeBalance = wallet.network === 'TRC20' ? await getTRXBalance(wallet.address) : await getBSCBalance(wallet.address);
+      const newNativeBalance = wallet.network === 'TRC20' ? await getTRXBalance(wallet.address) : 0;
       console.log(`🔄 New native balance after funding: ${newNativeBalance} ${wallet.network === 'TRC20' ? 'TRX' : 'BNB'}`);
       if (newNativeBalance < minNativeForFee) {
         console.log('❌ Native currency still insufficient after funding');
@@ -952,11 +933,7 @@ async function handleCheckDeposits(req = {}, res = {}) {
       try {
         console.log(`🔍 Processing wallet ${wallet.address} (${wallet.network}) for user ${wallet.user_id}`);
         
-        if (wallet.network === 'BEP20') {
-          await sleep(500);
-        } else {
-          await sleep(1000);
-        }
+        await sleep(500); // Одинаковая задержка для всех сетей
         
         let transactions = [];
 
@@ -1103,9 +1080,7 @@ async function checkUserDeposits(userId, network) {
     
     console.log(`🔍 Checking ${network} deposits for user ${userId}, wallet: ${wallet.address}`);
     
-    if (network === 'BEP20') {
-      await sleep(500);
-    }
+    await sleep(500); // Одинаковая задержка для всех сетей
     
     let transactions = [];
 

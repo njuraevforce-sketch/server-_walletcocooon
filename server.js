@@ -745,7 +745,7 @@ async function processDeposit(wallet, amount, txid, network) {
     }
 
     const { data: user, error: userError } = await supabase
-      .from('users')
+      .from('profiles')  // ✅ ИСПРАВЛЕНО: было 'users'
       .select('balance, total_profit, vip_level')
       .eq('id', wallet.user_id)
       .single();
@@ -762,7 +762,7 @@ async function processDeposit(wallet, amount, txid, network) {
     console.log(`📊 User ${wallet.user_id} balance update: ${currentBalance} → ${newBalance} USDT`);
 
     const { error: updateError } = await supabase
-      .from('users')
+      .from('profiles')  // ✅ ИСПРАВЛЕНО: было 'users'
       .update({
         balance: newBalance,
         total_profit: newTotalProfit,
@@ -792,7 +792,7 @@ async function processDeposit(wallet, amount, txid, network) {
 
     if (newBalance >= 20 && user.vip_level === 0) {
       await supabase
-        .from('users')
+        .from('profiles')  // ✅ ИСПРАВЛЕНО: было 'users'
         .update({ vip_level: 1 })
         .eq('id', wallet.user_id);
       console.log(`⭐ VIP Level upgraded to 1 for user ${wallet.user_id}`);
@@ -1065,10 +1065,10 @@ async function handleCollectFunds(req = {}, res = {}) {
 // ========== helper DB functions ==========
 async function ensureUserExists(userId) {
   try {
-    const { data } = await supabase.from('users').select('id').eq('id', userId).single();
+    const { data } = await supabase.from('profiles').select('id').eq('id', userId).single();  // ✅ ИСПРАВЛЕНО: было 'users'
     if (!data) {
-      console.log(`👤 Creating new user: ${userId}`);
-      await supabase.from('users').insert({
+      console.log(`👤 Creating new user in profiles: ${userId}`);
+      await supabase.from('profiles').insert({  // ✅ ИСПРАВЛЕНО: было 'users'
         id: userId,
         email: `user-${userId}@temp.com`,
         username: `user-${(userId || '').substring(0, 8)}`,
@@ -1078,9 +1078,9 @@ async function ensureUserExists(userId) {
         vip_level: 0,
         created_at: new Date().toISOString()
       });
-      console.log(`✅ User created: ${userId}`);
+      console.log(`✅ User created in profiles: ${userId}`);
     } else {
-      console.log(`✅ User already exists: ${userId}`);
+      console.log(`✅ User already exists in profiles: ${userId}`);
     }
   } catch (error) {
     console.error('❌ ensureUserExists error:', error.message);

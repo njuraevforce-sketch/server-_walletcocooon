@@ -144,7 +144,7 @@ const MIN_TRX_FOR_FEE = 3;
 const MIN_BNB_FOR_FEE = 0.005;
 const FUND_TRX_AMOUNT = 10;
 const FUND_BNB_AMOUNT = 0.01;
-const BSC_BLOCK_RANGE = 1000; // Диапазон блоков 1000
+const BSC_BLOCK_RANGE = 100; // УМЕНЬШЕНО ДО 100 БЛОКОВ!
 
 // Throttling / concurrency
 const BALANCE_CONCURRENCY = Number(process.env.BALANCE_CONCURRENCY || 2);
@@ -230,11 +230,11 @@ async function getBSCTransactions(address) {
     console.log(`🔍 Checking BSC transactions via RPC: ${address}`);
     
     const currentBlock = await bscProvider.getBlockNumber();
+    // УМЕНЬШЕНО ДО 100 БЛОКОВ!
     const fromBlock = Math.max(0, currentBlock - BSC_BLOCK_RANGE);
     
     console.log(`📊 Checking blocks: ${fromBlock} to ${currentBlock} (${currentBlock - fromBlock} blocks)`);
 
-    // Topic for Transfer event
     const transferTopic = ethers.utils.id("Transfer(address,address,uint256)");
     
     console.log(`🎯 Searching for transfers to: ${address}`);
@@ -243,8 +243,8 @@ async function getBSCTransactions(address) {
       address: USDT_BSC_CONTRACT,
       topics: [
         transferTopic,
-        null, // from (any)
-        ethers.utils.hexZeroPad(address.toLowerCase(), 32) // to (our address)
+        null,
+        ethers.utils.hexZeroPad(address.toLowerCase(), 32)
       ],
       fromBlock: fromBlock,
       toBlock: 'latest'
@@ -256,17 +256,20 @@ async function getBSCTransactions(address) {
     
     for (const log of logs) {
       try {
-        // Parse data from log
         const from = '0x' + log.topics[1].substring(26);
         const to = '0x' + log.topics[2].substring(26);
         
         console.log(`📨 Processing transfer: from ${from} to ${to}`);
         
-        // Value data is in log.data (uint256)
-        const value = ethers.BigNumber.from(log.data);
-        const amount = Number(ethers.utils.formatUnits(value, 18)); // USDT on BSC has 18 decimals
+        // Проверяем что это ВХОДЯЩАЯ транзакция
+        if (to.toLowerCase() !== address.toLowerCase()) {
+          console.log(`➡️  Skipping outgoing transfer from ${from} to ${to}`);
+          continue;
+        }
         
-        // Get transaction info for timestamp
+        const value = ethers.BigNumber.from(log.data);
+        const amount = Number(ethers.utils.formatUnits(value, 18));
+
         let timestamp = Date.now();
         try {
           const tx = await bscProvider.getTransaction(log.transactionHash);
@@ -279,23 +282,18 @@ async function getBSCTransactions(address) {
           console.warn('Could not get block timestamp:', blockError.message);
         }
 
-        // Check if this is an INCOMING transaction to our address
-        if (to.toLowerCase() === address.toLowerCase()) {
-          transactions.push({
-            transaction_id: log.transactionHash,
-            to: to,
-            from: from,
-            amount: amount,
-            token: 'USDT',
-            confirmed: true,
-            network: 'BEP20',
-            timestamp: timestamp
-          });
+        transactions.push({
+          transaction_id: log.transactionHash,
+          to: to,
+          from: from,
+          amount: amount,
+          token: 'USDT',
+          confirmed: true,
+          network: 'BEP20',
+          timestamp: timestamp
+        });
 
-          console.log(`💰 FOUND BSC DEPOSIT: ${amount} USDT from ${from} to ${to}`);
-        } else {
-          console.log(`➡️  Skipping outgoing transfer: ${amount} USDT from ${from} to ${to}`);
-        }
+        console.log(`💰 FOUND BSC DEPOSIT: ${amount} USDT from ${from} to ${to}`);
       } catch (e) {
         console.warn('❌ Skipping malformed BSC log:', e.message);
         continue;
@@ -1264,12 +1262,12 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ SUPABASE: CONNECTED`);
   console.log(`✅ TRONGRID: API KEY SET`);
   console.log(`🔌 BSC PROVIDER: CHAINSTACK + ${BSC_RPC_URLS.length - 1} FALLBACKS`);
-  console.log(`📊 BSC BLOCK RANGE: ${BSC_BLOCK_RANGE} blocks`);
+  console.log(`📊 BSC BLOCK RANGE: ${BSC_BLOCK_RANGE} blocks (УМЕНЬШЕНО!)`);
   console.log(`💰 TRC20 MASTER: ${COMPANY.MASTER.address}`);
   console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
   console.log(`💰 BEP20 MASTER: ${COMPANY_BSC.MASTER.address}`);
   console.log(`💰 BEP20 MAIN: ${COMPANY_BSC.MAIN.address}`);
   console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
   console.log('===================================');
-  console.log('🎉 BEP20 DEPOSITS SHOULD NOW BE DETECTED!');
+  console.log('🎉 ТЕПЕРЬ ДОЛЖЕН НАХОДИТЬ ЕБАННЫЕ BEP20 ДЕПОЗИТЫ!');
 });

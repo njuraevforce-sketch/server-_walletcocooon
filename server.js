@@ -144,7 +144,7 @@ const MIN_TRX_FOR_FEE = 3;
 const MIN_BNB_FOR_FEE = 0.005;
 const FUND_TRX_AMOUNT = 10;
 const FUND_BNB_AMOUNT = 0.01;
-const BSC_BLOCK_RANGE = 1000; // Уменьшенный диапазон блоков для избежания лимитов
+const BSC_BLOCK_RANGE = 1000; // Диапазон блоков 1000
 
 // Throttling / concurrency
 const BALANCE_CONCURRENCY = Number(process.env.BALANCE_CONCURRENCY || 2);
@@ -230,13 +230,14 @@ async function getBSCTransactions(address) {
     console.log(`🔍 Checking BSC transactions via RPC: ${address}`);
     
     const currentBlock = await bscProvider.getBlockNumber();
-    // УМЕНЬШАЕМ диапазон до 1000 блоков чтобы избежать лимитов
     const fromBlock = Math.max(0, currentBlock - BSC_BLOCK_RANGE);
     
     console.log(`📊 Checking blocks: ${fromBlock} to ${currentBlock} (${currentBlock - fromBlock} blocks)`);
 
     // Topic for Transfer event
     const transferTopic = ethers.utils.id("Transfer(address,address,uint256)");
+    
+    console.log(`🎯 Searching for transfers to: ${address}`);
     
     const logs = await bscProvider.getLogs({
       address: USDT_BSC_CONTRACT,
@@ -249,7 +250,7 @@ async function getBSCTransactions(address) {
       toBlock: 'latest'
     });
 
-    console.log(`✅ RPC: Found ${logs.length} transfer events for ${address}`);
+    console.log(`✅ RPC: Found ${logs.length} raw transfer events for ${address}`);
 
     const transactions = [];
     
@@ -258,6 +259,8 @@ async function getBSCTransactions(address) {
         // Parse data from log
         const from = '0x' + log.topics[1].substring(26);
         const to = '0x' + log.topics[2].substring(26);
+        
+        console.log(`📨 Processing transfer: from ${from} to ${to}`);
         
         // Value data is in log.data (uint256)
         const value = ethers.BigNumber.from(log.data);
@@ -270,29 +273,37 @@ async function getBSCTransactions(address) {
           if (tx && tx.blockNumber) {
             const block = await bscProvider.getBlock(tx.blockNumber);
             timestamp = block.timestamp * 1000;
+            console.log(`⏰ Block ${tx.blockNumber}, timestamp: ${timestamp}`);
           }
         } catch (blockError) {
-          console.warn('Could not get block timestamp, using current time:', blockError.message);
+          console.warn('Could not get block timestamp:', blockError.message);
         }
 
-        transactions.push({
-          transaction_id: log.transactionHash,
-          to: to,
-          from: from,
-          amount: amount,
-          token: 'USDT',
-          confirmed: true,
-          network: 'BEP20',
-          timestamp: timestamp
-        });
+        // Check if this is an INCOMING transaction to our address
+        if (to.toLowerCase() === address.toLowerCase()) {
+          transactions.push({
+            transaction_id: log.transactionHash,
+            to: to,
+            from: from,
+            amount: amount,
+            token: 'USDT',
+            confirmed: true,
+            network: 'BEP20',
+            timestamp: timestamp
+          });
 
-        console.log(`📥 Found BSC deposit: ${amount} USDT from ${from}`);
+          console.log(`💰 FOUND BSC DEPOSIT: ${amount} USDT from ${from} to ${to}`);
+        } else {
+          console.log(`➡️  Skipping outgoing transfer: ${amount} USDT from ${from} to ${to}`);
+        }
       } catch (e) {
-        console.warn('Skipping malformed BSC log:', e.message);
+        console.warn('❌ Skipping malformed BSC log:', e.message);
         continue;
       }
     }
 
+    console.log(`📈 Total BSC deposits found: ${transactions.length}`);
+    
     // Sort by timestamp (newest first)
     transactions.sort((a, b) => b.timestamp - a.timestamp);
     return transactions;
@@ -968,8 +979,13 @@ async function handleCheckDeposits(req = {}, res = {}) {
           const recipient = wallet.network === 'TRC20' ? tx.to : tx.to.toLowerCase();
           const walletAddress = wallet.network === 'TRC20' ? wallet.address : wallet.address.toLowerCase();
           
-          if (recipient === walletAddress && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
-            console.log(`💰 Potential deposit found: ${tx.amount} USDT to ${walletAddress}, txid: ${tx.transaction_id}`);
+          // Улучшенная проверка для BEP20
+          const isRecipientMatch = wallet.network === 'TRC20' 
+            ? recipient === walletAddress
+            : recipient.toLowerCase() === walletAddress.toLowerCase();
+
+          if (isRecipientMatch && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
+            console.log(`🎯 CONFIRMED ${wallet.network} DEPOSIT: ${tx.amount} USDT to ${walletAddress}, txid: ${tx.transaction_id}`);
             try {
               const result = await processDeposit(wallet, tx.amount, tx.transaction_id, wallet.network);
               if (result.success) {
@@ -1130,7 +1146,12 @@ async function checkUserDeposits(userId, network) {
       const recipient = network === 'TRC20' ? tx.to : tx.to.toLowerCase();
       const walletAddress = network === 'TRC20' ? wallet.address : wallet.address.toLowerCase();
       
-      if (recipient === walletAddress && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
+      // Улучшенная проверка для BEP20
+      const isRecipientMatch = network === 'TRC20' 
+        ? recipient === walletAddress
+        : recipient.toLowerCase() === walletAddress.toLowerCase();
+
+      if (isRecipientMatch && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
         try {
           const result = await processDeposit(wallet, tx.amount, tx.transaction_id, network);
           if (result.success) {
@@ -1250,5 +1271,5 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`💰 BEP20 MAIN: ${COMPANY_BSC.MAIN.address}`);
   console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
   console.log('===================================');
-  console.log('🎉 APPLICATION READY - NO MORE MORALIS ERRORS!');
+  console.log('🎉 BEP20 DEPOSITS SHOULD NOW BE DETECTED!');
 });

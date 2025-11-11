@@ -144,7 +144,7 @@ const MIN_TRX_FOR_FEE = 3;
 const MIN_BNB_FOR_FEE = 0.005;
 const FUND_TRX_AMOUNT = 10;
 const FUND_BNB_AMOUNT = 0.01;
-const BSC_BLOCK_RANGE = 300; // УМЕНЬШЕНО ДО 100 БЛОКОВ!
+const BSC_BLOCK_RANGE = 200; // УМЕНЬШЕНО ДО 100 БЛОКОВ!
 
 // Throttling / concurrency
 const BALANCE_CONCURRENCY = Number(process.env.BALANCE_CONCURRENCY || 2);

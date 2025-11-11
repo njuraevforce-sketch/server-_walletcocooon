@@ -55,6 +55,11 @@ const BSC_RPC_URLS = [
   'https://bsc-dataseed.binance.org/', // Fallback 1
   'https://bsc-dataseed1.defibit.io/', // Fallback 2
   'https://bsc-dataseed1.ninicoin.io/', // Fallback 3
+  'https://bsc-dataseed2.defibit.io/', // Fallback 4
+  'https://bsc-dataseed3.defibit.io/', // Fallback 5
+  'https://bsc-dataseed4.defibit.io/', // Fallback 6
+  'https://bsc.rpc.blxrbdn.com', // Fallback 7
+  'https://bsc-mainnet.public.blastapi.io' // Fallback 8
 ];
 
 console.log('🔌 BSC RPC URLs configured:');
@@ -139,6 +144,7 @@ const MIN_TRX_FOR_FEE = 3;
 const MIN_BNB_FOR_FEE = 0.005;
 const FUND_TRX_AMOUNT = 10;
 const FUND_BNB_AMOUNT = 0.01;
+const BSC_BLOCK_RANGE = 1000; // Уменьшенный диапазон блоков для избежания лимитов
 
 // Throttling / concurrency
 const BALANCE_CONCURRENCY = Number(process.env.BALANCE_CONCURRENCY || 2);
@@ -221,11 +227,14 @@ async function getBSCTransactions(address) {
   try {
     if (!address) return [];
 
-    console.log(`🔍 Checking BSC transactions via Chainstack RPC: ${address}`);
+    console.log(`🔍 Checking BSC transactions via RPC: ${address}`);
     
     const currentBlock = await bscProvider.getBlockNumber();
-    const fromBlock = Math.max(0, currentBlock - 5000); // Check last 5000 blocks
+    // УМЕНЬШАЕМ диапазон до 1000 блоков чтобы избежать лимитов
+    const fromBlock = Math.max(0, currentBlock - BSC_BLOCK_RANGE);
     
+    console.log(`📊 Checking blocks: ${fromBlock} to ${currentBlock} (${currentBlock - fromBlock} blocks)`);
+
     // Topic for Transfer event
     const transferTopic = ethers.utils.id("Transfer(address,address,uint256)");
     
@@ -240,7 +249,7 @@ async function getBSCTransactions(address) {
       toBlock: 'latest'
     });
 
-    console.log(`✅ Chainstack RPC: Found ${logs.length} transfer events for ${address}`);
+    console.log(`✅ RPC: Found ${logs.length} transfer events for ${address}`);
 
     const transactions = [];
     
@@ -277,7 +286,7 @@ async function getBSCTransactions(address) {
           timestamp: timestamp
         });
 
-        console.log(`📥 Found BSC deposit: ${amount} USDT from ${from} to ${to}`);
+        console.log(`📥 Found BSC deposit: ${amount} USDT from ${from}`);
       } catch (e) {
         console.warn('Skipping malformed BSC log:', e.message);
         continue;
@@ -1199,7 +1208,8 @@ app.get('/', (req, res) => {
       checkInterval: `${CHECK_INTERVAL_MS / 1000} seconds`,
       minDeposit: `${MIN_DEPOSIT} USDT`,
       keepAmount: `${KEEP_AMOUNT} USDT`,
-      bscProvider: 'Chainstack (Primary)'
+      bscProvider: 'Chainstack (Primary)',
+      blockRange: `${BSC_BLOCK_RANGE} blocks`
     }
   };
   
@@ -1232,12 +1242,13 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SERVER SUCCESSFULLY STARTED on port ${PORT}`);
   console.log(`✅ SUPABASE: CONNECTED`);
   console.log(`✅ TRONGRID: API KEY SET`);
-  console.log(`🔌 BSC PROVIDER: CHAINSTACK`);
+  console.log(`🔌 BSC PROVIDER: CHAINSTACK + ${BSC_RPC_URLS.length - 1} FALLBACKS`);
+  console.log(`📊 BSC BLOCK RANGE: ${BSC_BLOCK_RANGE} blocks`);
   console.log(`💰 TRC20 MASTER: ${COMPANY.MASTER.address}`);
   console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
   console.log(`💰 BEP20 MASTER: ${COMPANY_BSC.MASTER.address}`);
   console.log(`💰 BEP20 MAIN: ${COMPANY_BSC.MAIN.address}`);
   console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
   console.log('===================================');
-  console.log('🎉 APPLICATION READY - LOGS SHOULD BE VISIBLE NOW');
+  console.log('🎉 APPLICATION READY - NO MORE MORALIS ERRORS!');
 });

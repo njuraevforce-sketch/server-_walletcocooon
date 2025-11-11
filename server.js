@@ -17,8 +17,6 @@ console.log('NODE_ENV:', process.env.NODE_ENV || 'not set');
 console.log('SUPABASE_URL:', process.env.SUPABASE_URL ? '✅ SET' : '❌ MISSING');
 console.log('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? '✅ SET' : '❌ MISSING');
 console.log('TRONGRID_API_KEY:', process.env.TRONGRID_API_KEY ? '✅ SET' : '❌ MISSING');
-console.log('MORALIS_API_KEY:', process.env.MORALIS_API_KEY ? '✅ SET' : '❌ MISSING');
-console.log('QUICKNODE_BSC_URL:', process.env.QUICKNODE_BSC_URL ? '✅ SET' : '❌ MISSING');
 
 // Enhanced error handling
 process.on('uncaughtException', (error) => {
@@ -39,10 +37,6 @@ const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://eqzfivdckzrkkncahlyn.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVxemZpdmRja3pya2tuY2FobHluIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTYwNTg2NSwiZXhwIjoyMDc3MTgxODY1fQ.AuGqzDDMzWS1COhHdBMchHarYmd1gNC_9PfRfJWPTxc';
 const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '33759ca3-ffb8-41bc-9036-25a32601eae2';
-const MORALIS_API_KEY = process.env.MORALIS_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjM3MDA2MzI2LTUxNjctNDYxZi1iNWZiLWQ2MTY2YTEyZWM2YiIsIm9yZ0lkIjoiNDc5MDU0IiwidXNlcklkIjoiNDkyODUwIiwidHlwZUlkIjoiMjZhOTVjOGUtNjRjOS00ZDEwLThhNWYtY2FkNDVjNGI0MGE1IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjIxNjYzNTQsImV4cCI6NDkxNzkyNjM1NH0.3DIHSnwViPTGbveV7u_gkZxt8m2FOj9Pa8uDShZqL-Q';
-
-// ========== QUICKNODE BSC CONFIGURATION ==========
-const QUICKNODE_BSC_URL = process.env.QUICKNODE_BSC_URL || 'https://thrilling-falling-morning.bsc.quiknode.pro/e634acd5c5a0b08f71e357def772863df6a69cf6/';
 
 console.log('🔄 Initializing Supabase client...');
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -55,9 +49,9 @@ const tronWeb = new TronWeb({
 });
 console.log('✅ TronWeb initialized');
 
-// ========== BSC RPC CONFIGURATION WITH QUICKNODE ==========
+// ========== BSC RPC CONFIGURATION WITH CHAINSTACK ==========
 const BSC_RPC_URLS = [
-  QUICKNODE_BSC_URL, // Primary - QuickNode
+  'https://bsc-mainnet.core.chainstack.com/5de4f946fec6345ad71e18bf5f6386a5', // Primary - Chainstack
   'https://bsc-dataseed.binance.org/', // Fallback 1
   'https://bsc-dataseed1.defibit.io/', // Fallback 2
   'https://bsc-dataseed1.ninicoin.io/', // Fallback 3
@@ -76,7 +70,7 @@ function getNextBscRpc() {
   return rpc;
 }
 
-// Initialize with QuickNode as primary
+// Initialize with Chainstack as primary
 let bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
 
 // COMPANY wallets - TRC20
@@ -135,7 +129,8 @@ const USDT_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
 const USDT_BSC_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
 const USDT_ABI = [
   "function balanceOf(address) view returns (uint256)",
-  "function transfer(address to, uint256 amount) returns (bool)"
+  "function transfer(address to, uint256 amount) returns (bool)",
+  "event Transfer(address indexed from, address indexed to, uint256 value)"
 ];
 
 const MIN_DEPOSIT = 10;
@@ -200,46 +195,7 @@ function runBalanceQueue() {
   }
 }
 
-// ========== MORALIS API FUNCTIONS ==========
-async function moralisRequest(endpoint, retries = 3) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      console.log(`🔍 Moralis API attempt ${attempt + 1}: ${endpoint}`);
-      const response = await fetch(`https://deep-index.moralis.io/api/v2${endpoint}`, {
-        headers: {
-          'X-API-Key': MORALIS_API_KEY,
-          'Accept': 'application/json'
-        }
-      });
-
-      if (response.status === 429) {
-        if (attempt < retries) {
-          const backoff = 2000 * Math.pow(2, attempt);
-          console.warn(`⚠️ Moralis rate limit, waiting ${backoff}ms...`);
-          await sleep(backoff);
-          continue;
-        }
-      }
-
-      const data = await response.json();
-      
-      if (response.ok) {
-        console.log(`✅ Moralis API success: ${endpoint}`);
-        return data;
-      } else {
-        console.log(`❌ Moralis API error: ${data.message || response.statusText}`);
-        return { result: [] };
-      }
-    } catch (error) {
-      console.error(`❌ Moralis request attempt ${attempt + 1} failed:`, error.message);
-      if (attempt === retries) throw error;
-      await sleep(1000 * (attempt + 1));
-    }
-  }
-  return { result: [] };
-}
-
-// ========== BSC FUNCTIONS WITH QUICKNODE ==========
+// ========== BSC FUNCTIONS WITH CHAINSTACK ==========
 async function getBSCUSDTBalance(address) {
   console.log(`🔍 Checking BSC USDT balance for: ${address}`);
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -265,48 +221,79 @@ async function getBSCTransactions(address) {
   try {
     if (!address) return [];
 
-    console.log(`🔍 Checking BSC transactions via Moralis API: ${address}`);
+    console.log(`🔍 Checking BSC transactions via Chainstack RPC: ${address}`);
     
-    const data = await moralisRequest(`/${address}/erc20/transfers?chain=bsc&limit=50`);
+    const currentBlock = await bscProvider.getBlockNumber();
+    const fromBlock = Math.max(0, currentBlock - 5000); // Check last 5000 blocks
     
-    if (data.result && Array.isArray(data.result)) {
-      console.log(`✅ Moralis API: Found ${data.result.length} token transfers for ${address}`);
-      
-      const transactions = [];
-      for (const tx of data.result) {
-        try {
-          if (tx.address && tx.address.toLowerCase() === USDT_BSC_CONTRACT.toLowerCase() &&
-              tx.to_address && tx.to_address.toLowerCase() === address.toLowerCase()) {
-            
-            const amount = Number(tx.value) / Math.pow(10, tx.decimals || 18);
-            
-            transactions.push({
-              transaction_id: tx.transaction_hash,
-              to: tx.to_address,
-              from: tx.from_address,
-              amount: amount,
-              token: 'USDT',
-              confirmed: true,
-              network: 'BEP20',
-              timestamp: new Date(tx.block_timestamp).getTime()
-            });
+    // Topic for Transfer event
+    const transferTopic = ethers.utils.id("Transfer(address,address,uint256)");
+    
+    const logs = await bscProvider.getLogs({
+      address: USDT_BSC_CONTRACT,
+      topics: [
+        transferTopic,
+        null, // from (any)
+        ethers.utils.hexZeroPad(address.toLowerCase(), 32) // to (our address)
+      ],
+      fromBlock: fromBlock,
+      toBlock: 'latest'
+    });
 
-            console.log(`📥 Found BSC deposit: ${amount} USDT from ${tx.from_address}`);
+    console.log(`✅ Chainstack RPC: Found ${logs.length} transfer events for ${address}`);
+
+    const transactions = [];
+    
+    for (const log of logs) {
+      try {
+        // Parse data from log
+        const from = '0x' + log.topics[1].substring(26);
+        const to = '0x' + log.topics[2].substring(26);
+        
+        // Value data is in log.data (uint256)
+        const value = ethers.BigNumber.from(log.data);
+        const amount = Number(ethers.utils.formatUnits(value, 18)); // USDT on BSC has 18 decimals
+        
+        // Get transaction info for timestamp
+        let timestamp = Date.now();
+        try {
+          const tx = await bscProvider.getTransaction(log.transactionHash);
+          if (tx && tx.blockNumber) {
+            const block = await bscProvider.getBlock(tx.blockNumber);
+            timestamp = block.timestamp * 1000;
           }
-        } catch (e) { 
-          console.warn('Skipping malformed BSC transaction:', e.message);
-          continue; 
+        } catch (blockError) {
+          console.warn('Could not get block timestamp, using current time:', blockError.message);
         }
+
+        transactions.push({
+          transaction_id: log.transactionHash,
+          to: to,
+          from: from,
+          amount: amount,
+          token: 'USDT',
+          confirmed: true,
+          network: 'BEP20',
+          timestamp: timestamp
+        });
+
+        console.log(`📥 Found BSC deposit: ${amount} USDT from ${from} to ${to}`);
+      } catch (e) {
+        console.warn('Skipping malformed BSC log:', e.message);
+        continue;
       }
-      
-      transactions.sort((a, b) => b.timestamp - a.timestamp);
-      return transactions;
-    } else {
-      console.log(`ℹ️ Moralis API: No transactions found for ${address}`);
-      return [];
     }
+
+    // Sort by timestamp (newest first)
+    transactions.sort((a, b) => b.timestamp - a.timestamp);
+    return transactions;
+    
   } catch (error) {
     console.error('❌ BSC transactions error:', error.message);
+    
+    // Try to switch to next RPC on error
+    bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
+    
     return [];
   }
 }
@@ -1185,8 +1172,7 @@ app.get('/health', (req, res) => {
     env: {
       NODE_ENV: process.env.NODE_ENV,
       PORT: process.env.PORT,
-      SUPABASE_URL: process.env.SUPABASE_URL ? 'SET' : 'MISSING',
-      QUICKNODE_BSC_URL: process.env.QUICKNODE_BSC_URL ? 'SET' : 'MISSING'
+      SUPABASE_URL: process.env.SUPABASE_URL ? 'SET' : 'MISSING'
     }
   };
   
@@ -1207,13 +1193,13 @@ app.get('/', (req, res) => {
       'Deposit Processing',
       'Auto Collection',
       'Enhanced Logging',
-      'QuickNode BSC Integration'
+      'Chainstack BSC Integration'
     ],
     stats: {
       checkInterval: `${CHECK_INTERVAL_MS / 1000} seconds`,
       minDeposit: `${MIN_DEPOSIT} USDT`,
       keepAmount: `${KEEP_AMOUNT} USDT`,
-      bscProvider: 'QuickNode (Primary)'
+      bscProvider: 'Chainstack (Primary)'
     }
   };
   
@@ -1246,8 +1232,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SERVER SUCCESSFULLY STARTED on port ${PORT}`);
   console.log(`✅ SUPABASE: CONNECTED`);
   console.log(`✅ TRONGRID: API KEY SET`);
-  console.log(`✅ MORALIS API: AVAILABLE`);
-  console.log(`🔌 BSC PROVIDER: QUICKNODE`);
+  console.log(`🔌 BSC PROVIDER: CHAINSTACK`);
   console.log(`💰 TRC20 MASTER: ${COMPANY.MASTER.address}`);
   console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
   console.log(`💰 BEP20 MASTER: ${COMPANY_BSC.MASTER.address}`);

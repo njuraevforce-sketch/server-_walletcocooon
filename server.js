@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
@@ -18,7 +19,16 @@ console.log('SUPABASE_URL:', process.env.SUPABASE_URL ? '✅ SET' : '❌ MISSING
 console.log('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? '✅ SET' : '❌ MISSING');
 console.log('TRONGRID_API_KEY:', process.env.TRONGRID_API_KEY ? '✅ SET' : '❌ MISSING');
 
-// Enhanced error handling
+// Global fetch fallback for Node <18
+if (typeof fetch === 'undefined') {
+  try {
+    global.fetch = require('node-fetch');
+    console.log('🔁 polyfill fetch applied (node-fetch).');
+  } catch (e) {
+    console.warn('⚠️ fetch is not available and node-fetch not installed — TRON fallback calls may fail on Node <18');
+  }
+}
+
 process.on('uncaughtException', (error) => {
   console.error('💥 UNCAUGHT EXCEPTION:', error);
   console.error('💥 Stack trace:', error.stack);
@@ -35,7 +45,7 @@ const PORT = process.env.PORT || 3000;
 
 // ========== ENVIRONMENT VARIABLES ==========
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://eqzfivdckzrkkncahlyn.supabase.co';
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVxemZpdmRja3pya2tuY2FobHluIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTYwNTg2NSwiZXhwIjoyMDc3MTgxODY1fQ.AuGqzDDMzWS1COhHdBMchHarYmd1gNC_9PfRfJWPTxc';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGci...'; // keep secret in prod
 const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '33759ca3-ffb8-41bc-9036-25a32601eae2';
 
 console.log('🔄 Initializing Supabase client...');
@@ -49,33 +59,33 @@ const tronWeb = new TronWeb({
 });
 console.log('✅ TronWeb initialized');
 
-// ========== BSC RPC CONFIGURATION WITH CHAINSTACK ==========
-const BSC_RPC_URLS = [
-  'https://bsc-mainnet.core.chainstack.com/5de4f946fec6345ad71e18bf5f6386a5', // Primary - Chainstack
-  'https://bsc-dataseed.binance.org/', // Fallback 1
-  'https://bsc-dataseed1.defibit.io/', // Fallback 2
-  'https://bsc-dataseed1.ninicoin.io/', // Fallback 3
-  'https://bsc-dataseed2.defibit.io/', // Fallback 4
-  'https://bsc-dataseed3.defibit.io/', // Fallback 5
-  'https://bsc-dataseed4.defibit.io/', // Fallback 6
-  'https://bsc.rpc.blxrbdn.com', // Fallback 7
-  'https://bsc-mainnet.public.blastapi.io' // Fallback 8
+// ========== BSC RPC CONFIGURATION (ROTATION) ==========
+const BSC_RPC_URLS = (process.env.BSC_RPC_URLS && process.env.BSC_RPC_URLS.split(',')) || [
+  'https://bsc-mainnet.core.chainstack.com/5de4f946fec6345ad71e18bf5f6386a5',
+  'https://bsc-dataseed.binance.org/',
+  'https://bsc-dataseed1.defibit.io/',
+  'https://bsc-dataseed1.ninicoin.io/',
+  'https://bsc-dataseed2.defibit.io/',
+  'https://bsc-dataseed3.defibit.io/',
+  'https://bsc-dataseed4.defibit.io/',
+  'https://bsc.rpc.blxrbdn.com',
+  'https://bsc-mainnet.public.blastapi.io'
 ];
 
 console.log('🔌 BSC RPC URLs configured:');
 BSC_RPC_URLS.forEach((url, index) => {
-  console.log(`   ${index === 0 ? '🟢 PRIMARY' : '🔵 FALLBACK'} ${index + 1}: ${url.substring(0, 50)}...`);
+  console.log(`   ${index === 0 ? '🟢 PRIMARY' : '🔵 FALLBACK'} ${index + 1}: ${url.substring(0, 60)}...`);
 });
 
 let currentRpcIndex = 0;
 function getNextBscRpc() {
   const rpc = BSC_RPC_URLS[currentRpcIndex];
-  console.log(`🔌 Using BSC RPC: ${rpc.substring(0, 50)}... (index: ${currentRpcIndex})`);
+  console.log(`🔌 Using BSC RPC: ${rpc.substring(0, 60)}... (index: ${currentRpcIndex})`);
   currentRpcIndex = (currentRpcIndex + 1) % BSC_RPC_URLS.length;
   return rpc;
 }
 
-// Initialize with Chainstack as primary
+// Initialize provider
 let bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
 
 // COMPANY wallets - TRC20
@@ -130,21 +140,25 @@ app.use((req, res, next) => {
 });
 
 // ========== CONSTANTS ==========
-const USDT_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
-const USDT_BSC_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
+const USDT_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t'; // TRON
+const USDT_BSC_CONTRACT = (process.env.USDT_BSC_CONTRACT || '0x55d398326f99059fF775485246999027B3197955').toLowerCase();
 const USDT_ABI = [
   "function balanceOf(address) view returns (uint256)",
   "function transfer(address to, uint256 amount) returns (bool)",
   "event Transfer(address indexed from, address indexed to, uint256 value)"
 ];
 
-const MIN_DEPOSIT = 10;
-const KEEP_AMOUNT = 1.0;
-const MIN_TRX_FOR_FEE = 3;
-const MIN_BNB_FOR_FEE = 0.005;
-const FUND_TRX_AMOUNT = 10;
-const FUND_BNB_AMOUNT = 0.01;
-const BSC_BLOCK_RANGE = 120; // УМЕНЬШЕНО ДО 100 БЛОКОВ!
+const MIN_DEPOSIT = Number(process.env.MIN_DEPOSIT || 10);
+const KEEP_AMOUNT = Number(process.env.KEEP_AMOUNT || 1.0);
+const MIN_TRX_FOR_FEE = Number(process.env.MIN_TRX_FOR_FEE || 3);
+const MIN_BNB_FOR_FEE = Number(process.env.MIN_BNB_FOR_FEE || 0.005);
+const FUND_TRX_AMOUNT = Number(process.env.FUND_TRX_AMOUNT || 10);
+const FUND_BNB_AMOUNT = Number(process.env.FUND_BNB_AMOUNT || 0.01);
+
+// New: how many blocks to look back (for performance, not too large)
+const BSC_BLOCK_LOOKBACK = Number(process.env.BSC_BLOCK_LOOKBACK || 12000); // ~12k blocks by default
+let BSC_CHUNK_SIZE = Number(process.env.BSC_CHUNK_SIZE || 1500); // blocks per getLogs chunk (safe default)
+const BSC_WALLET_CONCURRENCY = Number(process.env.BSC_WALLET_CONCURRENCY || 10); // parallel wallets
 
 // Throttling / concurrency
 const BALANCE_CONCURRENCY = Number(process.env.BALANCE_CONCURRENCY || 2);
@@ -201,7 +215,17 @@ function runBalanceQueue() {
   }
 }
 
-// ========== BSC FUNCTIONS WITH CHAINSTACK ==========
+// ========== BSC FUNCTIONS WITH CHAINSTACK & ROBUST LOGS CHUNKING ==========
+async function rotateProvider() {
+  try {
+    bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
+    // quick test call
+    await bscProvider.getBlockNumber();
+  } catch (e) {
+    console.warn('🔁 rotateProvider warning:', e.message);
+  }
+}
+
 async function getBSCUSDTBalance(address) {
   console.log(`🔍 Checking BSC USDT balance for: ${address}`);
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -214,106 +238,12 @@ async function getBSCUSDTBalance(address) {
     } catch (error) {
       console.error(`❌ BSC USDT balance attempt ${attempt + 1} error:`, error.message);
       if (attempt < 2) {
-        // Switch to next RPC on error
-        bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
-        await sleep(1000);
+        await rotateProvider();
+        await sleep(1000 * (attempt + 1));
       }
     }
   }
   return 0;
-}
-
-async function getBSCTransactions(address) {
-  try {
-    if (!address) return [];
-
-    console.log(`🔍 Checking BSC transactions via RPC: ${address}`);
-    
-    const currentBlock = await bscProvider.getBlockNumber();
-    // УМЕНЬШЕНО ДО 100 БЛОКОВ!
-    const fromBlock = Math.max(0, currentBlock - BSC_BLOCK_RANGE);
-    
-    console.log(`📊 Checking blocks: ${fromBlock} to ${currentBlock} (${currentBlock - fromBlock} blocks)`);
-
-    const transferTopic = ethers.utils.id("Transfer(address,address,uint256)");
-    
-    console.log(`🎯 Searching for transfers to: ${address}`);
-    
-    const logs = await bscProvider.getLogs({
-      address: USDT_BSC_CONTRACT,
-      topics: [
-        transferTopic,
-        null,
-        ethers.utils.hexZeroPad(address.toLowerCase(), 32)
-      ],
-      fromBlock: fromBlock,
-      toBlock: 'latest'
-    });
-
-    console.log(`✅ RPC: Found ${logs.length} raw transfer events for ${address}`);
-
-    const transactions = [];
-    
-    for (const log of logs) {
-      try {
-        const from = '0x' + log.topics[1].substring(26);
-        const to = '0x' + log.topics[2].substring(26);
-        
-        console.log(`📨 Processing transfer: from ${from} to ${to}`);
-        
-        // Проверяем что это ВХОДЯЩАЯ транзакция
-        if (to.toLowerCase() !== address.toLowerCase()) {
-          console.log(`➡️  Skipping outgoing transfer from ${from} to ${to}`);
-          continue;
-        }
-        
-        const value = ethers.BigNumber.from(log.data);
-        const amount = Number(ethers.utils.formatUnits(value, 18));
-
-        let timestamp = Date.now();
-        try {
-          const tx = await bscProvider.getTransaction(log.transactionHash);
-          if (tx && tx.blockNumber) {
-            const block = await bscProvider.getBlock(tx.blockNumber);
-            timestamp = block.timestamp * 1000;
-            console.log(`⏰ Block ${tx.blockNumber}, timestamp: ${timestamp}`);
-          }
-        } catch (blockError) {
-          console.warn('Could not get block timestamp:', blockError.message);
-        }
-
-        transactions.push({
-          transaction_id: log.transactionHash,
-          to: to,
-          from: from,
-          amount: amount,
-          token: 'USDT',
-          confirmed: true,
-          network: 'BEP20',
-          timestamp: timestamp
-        });
-
-        console.log(`💰 FOUND BSC DEPOSIT: ${amount} USDT from ${from} to ${to}`);
-      } catch (e) {
-        console.warn('❌ Skipping malformed BSC log:', e.message);
-        continue;
-      }
-    }
-
-    console.log(`📈 Total BSC deposits found: ${transactions.length}`);
-    
-    // Sort by timestamp (newest first)
-    transactions.sort((a, b) => b.timestamp - a.timestamp);
-    return transactions;
-    
-  } catch (error) {
-    console.error('❌ BSC transactions error:', error.message);
-    
-    // Try to switch to next RPC on error
-    bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
-    
-    return [];
-  }
 }
 
 async function getBSCBalance(address) {
@@ -327,8 +257,8 @@ async function getBSCBalance(address) {
     } catch (error) {
       console.error(`❌ BSC balance attempt ${attempt + 1} error:`, error.message);
       if (attempt < 2) {
-        bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
-        await sleep(1000);
+        await rotateProvider();
+        await sleep(1000 * (attempt + 1));
       }
     }
   }
@@ -356,8 +286,8 @@ async function sendBSC(fromPrivateKey, toAddress, amount) {
     } catch (error) {
       console.error(`❌ BSC send attempt ${attempt + 1} error:`, error.message);
       if (attempt < 2) {
-        bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
-        await sleep(1000);
+        await rotateProvider();
+        await sleep(1000 * (attempt + 1));
       }
     }
   }
@@ -385,15 +315,150 @@ async function transferBSCUSDT(fromPrivateKey, toAddress, amount) {
     } catch (error) {
       console.error(`❌ BSC USDT transfer attempt ${attempt + 1} error:`, error.message);
       if (attempt < 2) {
-        bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
-        await sleep(1000);
+        await rotateProvider();
+        await sleep(1000 * (attempt + 1));
       }
     }
   }
   return false;
 }
 
-// ========== TRON FUNCTIONS ==========
+// Robust getLogs with chunking to avoid "limit exceeded"
+async function fetchLogsInChunks(provider, filter, fromBlock, toBlock, initialChunkSize = BSC_CHUNK_SIZE) {
+  let results = [];
+  let chunkSize = initialChunkSize;
+  const latest = toBlock;
+
+  for (let start = fromBlock; start <= latest; ) {
+    let end = Math.min(start + chunkSize - 1, latest);
+    try {
+      const logs = await provider.getLogs({
+        ...filter,
+        fromBlock: ethers.utils.hexlify(start),
+        toBlock: ethers.utils.hexlify(end)
+      });
+      if (logs && logs.length) {
+        results.push(...logs);
+      }
+      // small pause to avoid rate limiting
+      await sleep(200);
+      start = end + 1;
+      // gently increase chunkSize back towards initial if we reduced it earlier
+      if (chunkSize < initialChunkSize) chunkSize = Math.min(initialChunkSize, Math.floor(chunkSize * 1.5));
+    } catch (err) {
+      const msg = (err && err.message) ? err.message.toLowerCase() : '';
+      // Detect "limit exceeded" or RPC server error and reduce chunk size
+      if (err && (err.code === -32005 || msg.includes('limit exceeded') || msg.includes('exceeded'))) {
+        console.warn(`⚠️ RPC limit exceeded for range ${start}-${end}. Reducing chunk size (was ${chunkSize}).`);
+        // reduce chunk size
+        chunkSize = Math.max(200, Math.floor(chunkSize / 2));
+        // if chunkSize is small, rotate provider to try another RPC endpoint
+        if (chunkSize === 200) {
+          console.log('🔁 Rotating RPC provider due to repeated limit exceeded...');
+          await rotateProvider();
+          // small pause
+          await sleep(500);
+        }
+        // retry same start with reduced chunkSize (do not increment start)
+        continue;
+      } else {
+        console.error(`❌ fetchLogsInChunks error for ${start}-${end}:`, err.message || err);
+        // on non-limit error rotate provider and try next chunk
+        await rotateProvider();
+        start = end + 1;
+        await sleep(300);
+      }
+    }
+  }
+  return results;
+}
+
+async function getBSCTransactions(address) {
+  try {
+    if (!address) return [];
+    console.log(`🔍 Checking BSC transactions via RPC: ${address}`);
+
+    const currentBlock = await bscProvider.getBlockNumber();
+    const fromBlock = Math.max(0, currentBlock - BSC_BLOCK_LOOKBACK);
+    console.log(`📊 Checking blocks: ${fromBlock} to ${currentBlock} (${currentBlock - fromBlock} blocks)`);
+
+    const transferTopic = ethers.utils.id("Transfer(address,address,uint256)");
+    // prepare recipient topic (32 bytes)
+    let toTopic;
+    try {
+      toTopic = ethers.utils.hexZeroPad(ethers.utils.getAddress(address), 32);
+    } catch (e) {
+      // fallback to lowercased padded
+      const raw = address.toLowerCase().replace(/^0x/, '');
+      toTopic = '0x' + raw.padStart(64, '0');
+    }
+
+    const filter = {
+      address: USDT_BSC_CONTRACT,
+      topics: [transferTopic, null, toTopic],
+    };
+
+    const logs = await fetchLogsInChunks(bscProvider, filter, fromBlock, currentBlock, BSC_CHUNK_SIZE);
+    console.log(`✅ RPC: Found ${logs.length} raw transfer events for ${address}`);
+
+    const transactions = [];
+
+    // attempt to fetch timestamp info for each unique block
+    const blockCache = {};
+
+    for (const log of logs) {
+      try {
+        const fromAddr = ethers.utils.getAddress('0x' + log.topics[1].substring(26));
+        const toAddr = ethers.utils.getAddress('0x' + log.topics[2].substring(26));
+        const value = ethers.BigNumber.from(log.data);
+        const amount = Number(ethers.utils.formatUnits(value, 18));
+
+        // Try to get tx details and block timestamp (best-effort)
+        let timestamp = Date.now();
+        try {
+          const tx = await bscProvider.getTransaction(log.transactionHash);
+          if (tx && tx.blockNumber) {
+            const blockNumber = tx.blockNumber;
+            if (!blockCache[blockNumber]) {
+              const block = await bscProvider.getBlock(blockNumber);
+              blockCache[blockNumber] = block ? (block.timestamp * 1000) : Date.now();
+            }
+            timestamp = blockCache[blockNumber];
+          }
+        } catch (blockError) {
+          console.warn('Could not get block timestamp for tx', log.transactionHash, blockError.message);
+        }
+
+        transactions.push({
+          transaction_id: log.transactionHash,
+          to: toAddr,
+          from: fromAddr,
+          amount: amount,
+          token: 'USDT',
+          confirmed: true,
+          network: 'BEP20',
+          timestamp: timestamp
+        });
+
+        console.log(`💰 FOUND BSC DEPOSIT: ${amount} USDT from ${fromAddr} to ${toAddr} (tx: ${log.transactionHash})`);
+      } catch (e) {
+        console.warn('❌ Skipping malformed BSC log:', e.message);
+        continue;
+      }
+    }
+
+    transactions.sort((a, b) => b.timestamp - a.timestamp);
+    console.log(`📈 Total BSC deposits found: ${transactions.length}`);
+    return transactions;
+  } catch (error) {
+    console.error('❌ BSC transactions error:', error.message || error);
+    // rotate provider on fatal error
+    await rotateProvider();
+    return [];
+  }
+}
+
+// ========== TRON FUNCTIONS (UNCHANGED) ==========
 async function getUSDTBalance(address) {
   return enqueueBalanceJob(async () => {
     try {
@@ -611,7 +676,7 @@ async function transferUSDT(fromPrivateKey, toAddress, amount) {
   }
 }
 
-// ========== UNIVERSAL AUTO-COLLECT ==========
+// ========== UNIVERSAL AUTO-COLLECT (UNCHANGED LOGIC) ==========
 async function autoCollectToMainWallet(wallet) {
   try {
     console.log(`💰 AUTO-COLLECT started for: ${wallet.address} (${wallet.network})`);
@@ -750,7 +815,7 @@ async function processDeposit(wallet, amount, txid, network) {
     }
 
     const { data: user, error: userError } = await supabase
-      .from('profiles')  // ✅ ИСПРАВЛЕНО: ТОЛЬКО profiles
+      .from('profiles')  // ✅ ТОЛЬКО profiles
       .select('balance, total_profit, vip_level')
       .eq('id', wallet.user_id)
       .single();
@@ -767,7 +832,7 @@ async function processDeposit(wallet, amount, txid, network) {
     console.log(`📊 User ${wallet.user_id} balance update: ${currentBalance} → ${newBalance} USDT`);
 
     const { error: updateError } = await supabase
-      .from('profiles')  // ✅ ИСПРАВЛЕНО: ТОЛЬКО profiles
+      .from('profiles')
       .update({
         balance: newBalance,
         total_profit: newTotalProfit,
@@ -783,7 +848,7 @@ async function processDeposit(wallet, amount, txid, network) {
     // Обновляем статус на 'completed'
     await supabase
       .from('deposits')
-      .update({ status: 'completed' }) // ← ИСПРАВЛЕНО: используем разрешенный статус
+      .update({ status: 'completed' })
       .eq('id', newDeposit.id);
 
     await supabase.from('transactions').insert({
@@ -797,7 +862,7 @@ async function processDeposit(wallet, amount, txid, network) {
 
     if (newBalance >= 20 && user.vip_level === 0) {
       await supabase
-        .from('profiles')  // ✅ ИСПРАВЛЕНО: ТОЛЬКО profiles
+        .from('profiles')
         .update({ vip_level: 1 })
         .eq('id', wallet.user_id);
       console.log(`⭐ VIP Level upgraded to 1 for user ${wallet.user_id}`);
@@ -832,7 +897,7 @@ async function processDeposit(wallet, amount, txid, network) {
         .delete()
         .eq('txid', txid)
         .eq('network', network)
-        .eq('status', 'pending'); // ← ИСПРАВЛЕНО: используем разрешенный статус
+        .eq('status', 'pending');
     } catch (cleanupError) {
       console.error('Cleanup error:', cleanupError);
     }
@@ -841,7 +906,7 @@ async function processDeposit(wallet, amount, txid, network) {
   }
 }
 
-// ========== API Endpoints ==========
+// ========== API Endpoints & WALLET CHECK WITH PARALLEL BATCHING ==========
 app.post('/generate-wallet', async (req, res) => {
   try {
     const { user_id, network = 'TRC20' } = req.body;
@@ -938,13 +1003,14 @@ app.get('/deposit-address/:userId/:network', async (req, res) => {
   }
 });
 
+// Manual check endpoints
 app.post('/check-deposits', async (req, res) => { await handleCheckDeposits(req, res); });
 app.get('/check-deposits', async (req, res) => { await handleCheckDeposits(req, res); });
 
 async function handleCheckDeposits(req = {}, res = {}) {
   try {
     console.log('🔄 ===== MANUAL DEPOSIT CHECK STARTED =====');
-    const { data: wallets, error } = await supabase.from('user_wallets').select('*').limit(200);
+    const { data: wallets, error } = await supabase.from('user_wallets').select('*').limit(2000);
     if (error) throw error;
 
     console.log(`🔍 Checking ${wallets?.length || 0} wallets across all networks`);
@@ -953,58 +1019,83 @@ async function handleCheckDeposits(req = {}, res = {}) {
     let depositsFound = 0;
     let duplicatesSkipped = 0;
 
-    for (const wallet of wallets || []) {
+    // Split wallets into BEP20 and others
+    const bep20Wallets = (wallets || []).filter(w => w.network === 'BEP20');
+    const otherWallets = (wallets || []).filter(w => w.network !== 'BEP20');
+
+    // Process non-BEP20 (TRC20) sequentially (unchanged)
+    for (const wallet of otherWallets) {
       try {
         console.log(`🔍 Processing wallet ${wallet.address} (${wallet.network}) for user ${wallet.user_id}`);
-        
-        if (wallet.network === 'BEP20') {
-          await sleep(500);
-        } else {
-          await sleep(1000);
-        }
-        
+        await sleep(1000);
         let transactions = [];
-
         if (wallet.network === 'TRC20') {
           transactions = await getUSDTTransactions(wallet.address);
-        } else if (wallet.network === 'BEP20') {
-          transactions = await getBSCTransactions(wallet.address);
         }
-
         console.log(`📊 Found ${transactions.length} transactions for wallet ${wallet.address}`);
-
         for (const tx of transactions) {
-          const recipient = wallet.network === 'TRC20' ? tx.to : tx.to.toLowerCase();
-          const walletAddress = wallet.network === 'TRC20' ? wallet.address : wallet.address.toLowerCase();
-          
-          // Улучшенная проверка для BEP20
-          const isRecipientMatch = wallet.network === 'TRC20' 
-            ? recipient === walletAddress
-            : recipient.toLowerCase() === walletAddress.toLowerCase();
-
-          if (isRecipientMatch && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
+          const recipient = tx.to;
+          const walletAddress = wallet.address;
+          if (recipient === walletAddress && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
             console.log(`🎯 CONFIRMED ${wallet.network} DEPOSIT: ${tx.amount} USDT to ${walletAddress}, txid: ${tx.transaction_id}`);
             try {
               const result = await processDeposit(wallet, tx.amount, tx.transaction_id, wallet.network);
               if (result.success) {
                 depositsFound++;
-                console.log(`✅ Deposit processed successfully: ${tx.amount} USDT for user ${wallet.user_id}`);
               } else if (result.reason === 'already_processed' || result.reason === 'concurrent_processing') {
                 duplicatesSkipped++;
-                console.log(`ℹ️ Deposit already processed: ${tx.transaction_id}`);
               }
             } catch (err) {
               console.error(`❌ Error processing deposit ${tx.transaction_id}:`, err.message);
             }
           }
         }
-
         await supabase.from('user_wallets').update({ last_checked: new Date().toISOString() }).eq('id', wallet.id);
         processedCount++;
-        console.log(`✅ Completed processing wallet ${wallet.address}`);
       } catch (err) {
         console.error(`❌ Error processing wallet ${wallet.address}:`, err.message);
       }
+    }
+
+    // Process BEP20 in parallel batches
+    const batchSize = BSC_WALLET_CONCURRENCY;
+    for (let i = 0; i < bep20Wallets.length; i += batchSize) {
+      const batch = bep20Wallets.slice(i, i + batchSize);
+      console.log(`🔁 Processing BEP20 batch ${Math.floor(i/batchSize)+1} (size ${batch.length})`);
+      await Promise.all(batch.map(async (wallet) => {
+        try {
+          console.log(`🔍 Processing wallet ${wallet.address} (BEP20) for user ${wallet.user_id}`);
+          // small per-wallet delay
+          await sleep(200);
+          const transactions = await getBSCTransactions(wallet.address);
+          console.log(`📊 Found ${transactions.length} transactions for wallet ${wallet.address}`);
+          for (const tx of transactions) {
+            try {
+              const recipient = ethers.utils.getAddress(tx.to);
+              const walletAddrNorm = ethers.utils.getAddress(wallet.address);
+              if (recipient === walletAddrNorm && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
+                console.log(`🎯 CONFIRMED BEP20 DEPOSIT: ${tx.amount} USDT to ${walletAddrNorm}, txid: ${tx.transaction_id}`);
+                const result = await processDeposit(wallet, tx.amount, tx.transaction_id, wallet.network);
+                if (result.success) {
+                  depositsFound++;
+                } else if (result.reason === 'already_processed' || result.reason === 'concurrent_processing') {
+                  duplicatesSkipped++;
+                }
+              }
+            } catch (innerErr) {
+              console.warn('⚠️ Error checking tx for wallet', wallet.address, innerErr.message);
+            }
+          }
+          await supabase.from('user_wallets').update({ last_checked: new Date().toISOString() }).eq('id', wallet.id);
+          processedCount++;
+        } catch (err) {
+          console.error(`❌ Error processing BEP20 wallet ${wallet.address}:`, err.message);
+          // rotate provider if needed
+          await rotateProvider();
+        }
+      }));
+      // small pause between batches
+      await sleep(500);
     }
 
     const message = `✅ Deposit check completed: Processed ${processedCount} wallets, found ${depositsFound} new deposits, skipped ${duplicatesSkipped} duplicates`;
@@ -1028,7 +1119,7 @@ app.get('/collect-funds', async (req, res) => { await handleCollectFunds(req, re
 async function handleCollectFunds(req = {}, res = {}) {
   try {
     console.log('💰 ===== MANUAL FUNDS COLLECTION STARTED =====');
-    const { data: wallets, error } = await supabase.from('user_wallets').select('*').limit(200);
+    const { data: wallets, error } = await supabase.from('user_wallets').select('*').limit(2000);
     if (error) throw error;
 
     console.log(`🔍 Starting collection for ${wallets?.length || 0} wallets`);
@@ -1075,13 +1166,11 @@ async function handleCollectFunds(req = {}, res = {}) {
 // ========== helper DB functions ==========
 async function ensureUserExists(userId) {
   try {
-    // Проверяем существование пользователя ТОЛЬКО в profiles
     const { data } = await supabase.from('profiles').select('id').eq('id', userId).single();
     
     if (!data) {
       console.log(`👤 Creating new user in profiles: ${userId}`);
       
-      // Создаем пользователя ТОЛЬКО в profiles
       const { error: insertError } = await supabase.from('profiles').insert({
         id: userId,
         email: `user-${userId}@temp.com`,
@@ -1144,7 +1233,6 @@ async function checkUserDeposits(userId, network) {
       const recipient = network === 'TRC20' ? tx.to : tx.to.toLowerCase();
       const walletAddress = network === 'TRC20' ? wallet.address : wallet.address.toLowerCase();
       
-      // Улучшенная проверка для BEP20
       const isRecipientMatch = network === 'TRC20' 
         ? recipient === walletAddress
         : recipient.toLowerCase() === walletAddress.toLowerCase();
@@ -1167,7 +1255,7 @@ async function checkUserDeposits(userId, network) {
   }
 }
 
-// ========== TEST ENDPOINTS ==========
+// ========== TEST / HEALTH ENDPOINTS ==========
 app.get('/test-logs', (req, res) => {
   console.log('🧪 TEST LOG: This should appear in Railway logs');
   console.error('🔴 TEST ERROR LOG: This should appear as error');
@@ -1209,7 +1297,6 @@ app.get('/health', (req, res) => {
   res.json(healthCheck);
 });
 
-// ========== HEALTH CHECK ==========
 app.get('/', (req, res) => {
   const status = {
     status: '✅ WORKING',
@@ -1218,7 +1305,7 @@ app.get('/', (req, res) => {
     networks: ['TRC20', 'BEP20'],
     features: [
       'Multi-Network Wallet Generation',
-      'Deposit Processing',
+      'Deposit Processing (BEP20 improved)',
       'Auto Collection',
       'Enhanced Logging',
       'Chainstack BSC Integration'
@@ -1227,8 +1314,9 @@ app.get('/', (req, res) => {
       checkInterval: `${CHECK_INTERVAL_MS / 1000} seconds`,
       minDeposit: `${MIN_DEPOSIT} USDT`,
       keepAmount: `${KEEP_AMOUNT} USDT`,
-      bscProvider: 'Chainstack (Primary)',
-      blockRange: `${BSC_BLOCK_RANGE} blocks`
+      bscProvider: 'Chainstack (Primary) + rotation',
+      blockRangeLookback: `${BSC_BLOCK_LOOKBACK} blocks`,
+      bscChunkSize: `${BSC_CHUNK_SIZE} blocks`
     }
   };
   
@@ -1261,13 +1349,10 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SERVER SUCCESSFULLY STARTED on port ${PORT}`);
   console.log(`✅ SUPABASE: CONNECTED`);
   console.log(`✅ TRONGRID: API KEY SET`);
-  console.log(`🔌 BSC PROVIDER: CHAINSTACK + ${BSC_RPC_URLS.length - 1} FALLBACKS`);
-  console.log(`📊 BSC BLOCK RANGE: ${BSC_BLOCK_RANGE} blocks (УМЕНЬШЕНО!)`);
-  console.log(`💰 TRC20 MASTER: ${COMPANY.MASTER.address}`);
-  console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
-  console.log(`💰 BEP20 MASTER: ${COMPANY_BSC.MASTER.address}`);
-  console.log(`💰 BEP20 MAIN: ${COMPANY_BSC.MAIN.address}`);
-  console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
+  console.log(`🔌 BSC PROVIDER: ROTATING among ${BSC_RPC_URLS.length} endpoints`);
+  console.log(`📊 BSC BLOCK LOOKBACK: ${BSC_BLOCK_LOOKBACK} blocks`);
+  console.log(`📊 BSC CHUNK SIZE: ${BSC_CHUNK_SIZE} blocks`);
+  console.log(`📊 BEP20 WALLET CONCURRENCY: ${BSC_WALLET_CONCURRENCY}`);
   console.log('===================================');
-  console.log('🎉 ТЕПЕРЬ ДОЛЖЕН НАХОДИТЬ ЕБАННЫЕ BEP20 ДЕПОЗИТЫ!');
+  console.log('🎉 BEP20 deposit detection improvements enabled!');
 });

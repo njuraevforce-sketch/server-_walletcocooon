@@ -17,7 +17,6 @@ console.log('NODE_ENV:', process.env.NODE_ENV || 'not set');
 console.log('SUPABASE_URL:', process.env.SUPABASE_URL ? '✅ SET' : '❌ MISSING');
 console.log('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? '✅ SET' : '❌ MISSING');
 console.log('TRONGRID_API_KEY:', process.env.TRONGRID_API_KEY ? '✅ SET' : '❌ MISSING');
-console.log('CHAINSTACK_BSC_URL:', process.env.CHAINSTACK_BSC_URL ? '✅ SET' : '❌ MISSING');
 
 // Enhanced error handling
 process.on('uncaughtException', (error) => {
@@ -39,8 +38,15 @@ const SUPABASE_URL = process.env.SUPABASE_URL || 'https://eqzfivdckzrkkncahlyn.s
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVxemZpdmRja3pya2tuY2FobHluIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTYwNTg2NSwiZXhwIjoyMDc3MTgxODY1fQ.AuGqzDDMzWS1COhHdBMchHarYmd1gNC_9PfRfJWPTxc';
 const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '33759ca3-ffb8-41bc-9036-25a32601eae2';
 
-// ========== CHAINSTACK BSC CONFIGURATION ==========
-const CHAINSTACK_BSC_URL = process.env.CHAINSTACK_BSC_URL || 'https://bsc-mainnet.core.chainstack.com/5de4f946fec6345ad71e18bf5f6386a5';
+// ========== BSC RPC CONFIGURATION ==========
+const BSC_RPC_URLS = [
+  'https://bsc-dataseed.binance.org/',
+  'https://bsc-dataseed1.defibit.io/', 
+  'https://bsc-dataseed1.ninicoin.io/',
+  'https://bsc-dataseed2.defibit.io/',
+  'https://bsc-dataseed3.defibit.io/',
+  'https://bsc-dataseed4.defibit.io/',
+];
 
 console.log('🔄 Initializing Supabase client...');
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -53,28 +59,16 @@ const tronWeb = new TronWeb({
 });
 console.log('✅ TronWeb initialized');
 
-// ========== BSC RPC CONFIGURATION WITH CHAINSTACK ==========
-const BSC_RPC_URLS = [
-  CHAINSTACK_BSC_URL, // Primary - Chainstack
-  'https://bsc-dataseed.binance.org/', // Fallback 1
-  'https://bsc-dataseed1.defibit.io/', // Fallback 2
-  'https://bsc-dataseed1.ninicoin.io/', // Fallback 3
-];
-
-console.log('🔌 BSC RPC URLs configured:');
-BSC_RPC_URLS.forEach((url, index) => {
-  console.log(`   ${index === 0 ? '🟢 PRIMARY' : '🔵 FALLBACK'} ${index + 1}: ${url.substring(0, 50)}...`);
-});
+console.log('🔌 BSC RPC URLs configured:', BSC_RPC_URLS.length);
 
 let currentRpcIndex = 0;
 function getNextBscRpc() {
   const rpc = BSC_RPC_URLS[currentRpcIndex];
-  console.log(`🔌 Using BSC RPC: ${rpc.substring(0, 50)}... (index: ${currentRpcIndex})`);
   currentRpcIndex = (currentRpcIndex + 1) % BSC_RPC_URLS.length;
   return rpc;
 }
 
-// Initialize with Chainstack as primary
+// Initialize with first RPC
 let bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
 
 // COMPANY wallets - TRC20
@@ -145,7 +139,6 @@ const FUND_TRX_AMOUNT = 10;
 const FUND_BNB_AMOUNT = 0.01;
 
 // Throttling / concurrency
-const BSC_CONCURRENCY = 3; // Chainstack 25 RPS limit
 const CHECK_INTERVAL_BEP20_MS = 60 * 1000; // 1 minute for BEP20
 const CHECK_INTERVAL_TRC20_MS = 2 * 60 * 1000; // 2 minutes for TRC20
 
@@ -172,107 +165,56 @@ function toBase58IfHex(addr) {
   return addr;
 }
 
-// Queue for BSC requests
-let currentBscRequests = 0;
-const pendingBscQueue = [];
-function enqueueBscJob(fn) {
-  return new Promise((resolve, reject) => {
-    pendingBscQueue.push({ fn, resolve, reject });
-    runBscQueue();
-  });
-}
-
-function runBscQueue() {
-  while (currentBscRequests < BSC_CONCURRENCY && pendingBscQueue.length) {
-    const job = pendingBscQueue.shift();
-    currentBscRequests++;
-    job.fn()
-      .then(res => {
-        currentBscRequests--;
-        job.resolve(res);
-        setTimeout(runBscQueue, 100);
-      })
-      .catch(err => {
-        currentBscRequests--;
-        job.reject(err);
-        setTimeout(runBscQueue, 100);
-      });
-  }
-}
-
-// Cache for balances
-const balanceCache = new Map();
-const BALANCE_CACHE_TTL = 30000; // 30 seconds
-
-// ========== BSC FUNCTIONS WITH CHAINSTACK ==========
+// ========== BSC FUNCTIONS ==========
 async function getBSCUSDTBalance(address) {
-  return enqueueBscJob(async () => {
+  console.log(`🔍 Checking BSC USDT balance for: ${address}`);
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      // Check cache first
-      const cacheKey = `usdt_${address}`;
-      const cached = balanceCache.get(cacheKey);
-      if (cached && Date.now() - cached.timestamp < BALANCE_CACHE_TTL) {
-        console.log(`🔍 Using cached BSC USDT balance for: ${address} - ${cached.balance} USDT`);
-        return cached.balance;
-      }
-
-      console.log(`🔍 Checking BSC USDT balance for: ${address}`);
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, bscProvider);
-          const balance = await contract.balanceOf(address);
-          const formatted = Number(ethers.utils.formatUnits(balance, 18));
-          console.log(`✅ BSC USDT balance for ${address}: ${formatted} USDT`);
-          
-          // Save to cache
-          balanceCache.set(cacheKey, {
-            balance: formatted,
-            timestamp: Date.now()
-          });
-          
-          return formatted;
-        } catch (error) {
-          console.error(`❌ BSC USDT balance attempt ${attempt + 1} error:`, error.message);
-          if (attempt < 1) {
-            bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
-            await sleep(500);
-          }
-        }
-      }
-      return 0;
+      const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, bscProvider);
+      const balance = await contract.balanceOf(address);
+      const formatted = Number(ethers.utils.formatUnits(balance, 18));
+      console.log(`✅ BSC USDT balance for ${address}: ${formatted} USDT`);
+      return formatted;
     } catch (error) {
-      console.error('❌ getBSCUSDTBalance fatal error:', error.message);
-      return 0;
+      console.error(`❌ BSC USDT balance attempt ${attempt + 1} error:`, error.message);
+      if (attempt < 2) {
+        bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
+        await sleep(1000);
+      }
     }
-  });
+  }
+  return 0;
 }
 
+// УЛУЧШЕННАЯ ФУНКЦИЯ ДЛЯ BSC ТРАНЗАКЦИЙ
 async function getBSCTransactions(address) {
-  return enqueueBscJob(async () => {
-    try {
-      console.log(`🔍 Checking BSC transactions for: ${address}`);
-      
-      const transactions = [];
-      const currentBlock = await bscProvider.getBlockNumber();
-      const fromBlock = currentBlock - 10000; // Check last ~2 days
-      
-      console.log(`📦 Checking blocks ${fromBlock} to ${currentBlock} for ${address}`);
-      
-      // Create contract for event filtering
-      const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, bscProvider);
-      
-      // Filter Transfer events where to is our address
-      const filter = contract.filters.Transfer(null, address);
+  console.log(`🔍 Checking BSC transactions for: ${address}`);
+  
+  try {
+    const transactions = [];
+    const currentBlock = await bscProvider.getBlockNumber();
+    // Проверяем только последние 1000 блоков для скорости
+    const fromBlock = Math.max(0, currentBlock - 1000);
+    
+    console.log(`📦 Checking blocks ${fromBlock} to ${currentBlock} for ${address}`);
+    
+    // Разбиваем на маленькие чанки по 200 блоков
+    const chunkSize = 200;
+    
+    for (let block = fromBlock; block <= currentBlock; block += chunkSize) {
+      const toBlock = Math.min(block + chunkSize - 1, currentBlock);
       
       try {
-        const logs = await contract.queryFilter(filter, fromBlock, currentBlock);
-        console.log(`✅ Found ${logs.length} USDT transfer events to ${address}`);
+        const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, bscProvider);
+        const filter = contract.filters.Transfer(null, address);
+        const logs = await contract.queryFilter(filter, block, toBlock);
         
         for (const log of logs) {
           try {
-            const tx = await bscProvider.getTransactionReceipt(log.transactionHash);
+            // Проверяем статус транзакции
+            const txReceipt = await bscProvider.getTransactionReceipt(log.transactionHash);
             
-            if (tx && tx.status === 1) { // Successful transaction
+            if (txReceipt && txReceipt.status === 1) {
               const amount = Number(ethers.utils.formatUnits(log.args.value, 18));
               
               transactions.push({
@@ -290,45 +232,50 @@ async function getBSCTransactions(address) {
               console.log(`📥 Found BSC deposit: ${amount} USDT from ${log.args.from}`);
             }
           } catch (txError) {
-            console.warn('Skipping malformed BSC transaction:', txError.message);
+            console.warn('Skipping transaction check:', txError.message);
             continue;
           }
         }
-      } catch (logsError) {
-        console.error('❌ Error querying event logs:', logsError.message);
-        return [];
+        
+        // Задержка между чанками
+        await sleep(200);
+        
+      } catch (chunkError) {
+        console.warn(`❌ Chunk ${block}-${toBlock} failed: ${chunkError.message}`);
+        // Продолжаем со следующим чанком
+        continue;
       }
-      
-      // Sort by time (newest first)
-      transactions.sort((a, b) => b.timestamp - a.timestamp);
-      return transactions.slice(0, 50); // Limit to 50 most recent
-      
-    } catch (error) {
-      console.error('❌ BSC transactions error:', error.message);
-      return [];
     }
-  });
+    
+    // Сортируем по времени (новые сначала)
+    transactions.sort((a, b) => b.timestamp - a.timestamp);
+    console.log(`✅ Found ${transactions.length} BSC transactions for ${address}`);
+    
+    return transactions;
+    
+  } catch (error) {
+    console.error('❌ BSC transactions error:', error.message);
+    return [];
+  }
 }
 
 async function getBSCBalance(address) {
-  return enqueueBscJob(async () => {
-    console.log(`🔍 Checking BSC native balance for: ${address}`);
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const balance = await bscProvider.getBalance(address);
-        const formatted = Number(ethers.utils.formatEther(balance));
-        console.log(`✅ BSC native balance for ${address}: ${formatted} BNB`);
-        return formatted;
-      } catch (error) {
-        console.error(`❌ BSC balance attempt ${attempt + 1} error:`, error.message);
-        if (attempt < 1) {
-          bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
-          await sleep(500);
-        }
+  console.log(`🔍 Checking BSC native balance for: ${address}`);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const balance = await bscProvider.getBalance(address);
+      const formatted = Number(ethers.utils.formatEther(balance));
+      console.log(`✅ BSC native balance for ${address}: ${formatted} BNB`);
+      return formatted;
+    } catch (error) {
+      console.error(`❌ BSC balance attempt ${attempt + 1} error:`, error.message);
+      if (attempt < 2) {
+        bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
+        await sleep(1000);
       }
     }
-    return 0;
-  });
+  }
+  return 0;
 }
 
 async function sendBSC(fromPrivateKey, toAddress, amount) {
@@ -952,72 +899,53 @@ async function checkBep20Deposits() {
     let depositsFound = 0;
     let errors = 0;
 
-    // Process wallets in batches for better performance
-    const batchSize = 10;
-    for (let i = 0; i < wallets.length; i += batchSize) {
-      const batch = wallets.slice(i, i + batchSize);
-      console.log(`🔍 Processing batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(wallets.length / batchSize)}`);
-      
-      // Parallel processing of wallets in batch
-      const batchPromises = batch.map(async (wallet) => {
-        try {
-          console.log(`🔍 Processing wallet ${wallet.address} for user ${wallet.user_id}`);
-          
-          // Small delay between wallets in batch
-          await sleep(200);
-          
-          const transactions = await getBSCTransactions(wallet.address);
-          console.log(`📊 Found ${transactions.length} transactions for wallet ${wallet.address}`);
+    // Process wallets sequentially with optimized delays
+    for (const wallet of wallets || []) {
+      try {
+        console.log(`🔍 Processing wallet ${wallet.address} for user ${wallet.user_id}`);
+        
+        await sleep(300); // Reduced delay between wallets
+        
+        const transactions = await getBSCTransactions(wallet.address);
+        console.log(`📊 Found ${transactions.length} transactions for wallet ${wallet.address}`);
 
-          let walletDeposits = 0;
+        let walletDeposits = 0;
+        
+        for (const tx of transactions) {
+          const recipient = tx.to.toLowerCase();
+          const walletAddress = wallet.address.toLowerCase();
           
-          for (const tx of transactions) {
-            const recipient = tx.to.toLowerCase();
-            const walletAddress = wallet.address.toLowerCase();
-            
-            if (recipient === walletAddress && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
-              console.log(`💰 Potential deposit found: ${tx.amount} USDT to ${walletAddress}, txid: ${tx.transaction_id}`);
-              try {
-                const result = await processDeposit(wallet, tx.amount, tx.transaction_id, wallet.network);
-                if (result.success) {
-                  walletDeposits++;
-                  console.log(`✅ Deposit processed successfully: ${tx.amount} USDT for user ${wallet.user_id}`);
-                } else if (result.reason === 'already_processed') {
-                  console.log(`ℹ️ Deposit already processed: ${tx.transaction_id}`);
-                }
-              } catch (err) {
-                console.error(`❌ Error processing deposit ${tx.transaction_id}:`, err.message);
-                errors++;
+          if (recipient === walletAddress && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
+            console.log(`💰 Potential deposit found: ${tx.amount} USDT to ${walletAddress}, txid: ${tx.transaction_id}`);
+            try {
+              const result = await processDeposit(wallet, tx.amount, tx.transaction_id, wallet.network);
+              if (result.success) {
+                walletDeposits++;
+                console.log(`✅ Deposit processed successfully: ${tx.amount} USDT for user ${wallet.user_id}`);
+              } else if (result.reason === 'already_processed') {
+                console.log(`ℹ️ Deposit already processed: ${tx.transaction_id}`);
               }
+            } catch (err) {
+              console.error(`❌ Error processing deposit ${tx.transaction_id}:`, err.message);
+              errors++;
             }
           }
-
-          // Update last checked time
-          await supabase
-            .from('user_wallets')
-            .update({ last_checked: new Date().toISOString() })
-            .eq('id', wallet.id);
-
-          processedCount++;
-          depositsFound += walletDeposits;
-          
-          console.log(`✅ Completed processing wallet ${wallet.address}, found ${walletDeposits} deposits`);
-          
-          return { success: true, deposits: walletDeposits };
-        } catch (err) {
-          console.error(`❌ Error processing wallet ${wallet.address}:`, err.message);
-          errors++;
-          return { success: false, error: err.message };
         }
-      });
 
-      // Wait for current batch to complete
-      await Promise.all(batchPromises);
-      
-      // Delay between batches
-      if (i + batchSize < wallets.length) {
-        console.log(`⏳ Waiting 2 seconds before next batch...`);
-        await sleep(2000);
+        // Update last checked time
+        await supabase
+          .from('user_wallets')
+          .update({ last_checked: new Date().toISOString() })
+          .eq('id', wallet.id);
+
+        processedCount++;
+        depositsFound += walletDeposits;
+        
+        console.log(`✅ Completed processing wallet ${wallet.address}, found ${walletDeposits} deposits`);
+        
+      } catch (err) {
+        console.error(`❌ Error processing wallet ${wallet.address}:`, err.message);
+        errors++;
       }
     }
 
@@ -1054,7 +982,7 @@ async function checkTrc20Deposits() {
     for (const wallet of wallets || []) {
       try {
         console.log(`🔍 Processing wallet ${wallet.address} for user ${wallet.user_id}`);
-        await sleep(1000); // Rate limiting for TRON
+        await sleep(800); // Rate limiting for TRON
         
         const transactions = await getUSDTTransactions(wallet.address);
         console.log(`📊 Found ${transactions.length} transactions for wallet ${wallet.address}`);
@@ -1131,7 +1059,7 @@ app.post('/check-deposits', async (req, res) => {
   try {
     console.log('🔄 MANUAL ALL DEPOSITS CHECK STARTED');
     const bep20Result = await checkBep20Deposits();
-    await sleep(5000); // Wait between networks
+    await sleep(3000);
     const trc20Result = await checkTrc20Deposits();
     
     res.json({
@@ -1161,14 +1089,13 @@ app.post('/collect-funds', async (req, res) => {
     for (const wallet of wallets || []) {
       try {
         console.log(`🔍 Processing collection for wallet ${wallet.address} (${wallet.network})`);
-        await sleep(2000); // Rate limiting
+        await sleep(1500); // Rate limiting
         
         const result = await autoCollectToMainWallet(wallet);
         if (result && result.success) {
           collectedCount++;
           totalCollected += result.amount;
           console.log(`✅ Successfully collected ${result.amount} USDT from ${wallet.address}`);
-          await sleep(1000);
         } else {
           failedCount++;
           console.log(`❌ Failed to collect from ${wallet.address}: ${result?.reason || 'Unknown error'}`);
@@ -1194,13 +1121,13 @@ app.post('/collect-funds', async (req, res) => {
 // ========== helper DB functions ==========
 async function ensureUserExists(userId) {
   try {
-    // Check if user exists ONLY in profiles
+    // Проверяем существование пользователя ТОЛЬКО в profiles
     const { data } = await supabase.from('profiles').select('id').eq('id', userId).single();
     
     if (!data) {
       console.log(`👤 Creating new user in profiles: ${userId}`);
       
-      // Create user ONLY in profiles
+      // Создаем пользователя ТОЛЬКО в profiles
       const { error: insertError } = await supabase.from('profiles').insert({
         id: userId,
         email: `user-${userId}@temp.com`,
@@ -1246,7 +1173,7 @@ async function checkUserDeposits(userId, network) {
     console.log(`🔍 Checking ${network} deposits for user ${userId}, wallet: ${wallet.address}`);
     
     if (network === 'BEP20') {
-      await sleep(500);
+      await sleep(300);
     }
     
     let transactions = [];
@@ -1314,8 +1241,7 @@ app.get('/health', (req, res) => {
     env: {
       NODE_ENV: process.env.NODE_ENV,
       PORT: process.env.PORT,
-      SUPABASE_URL: process.env.SUPABASE_URL ? 'SET' : 'MISSING',
-      CHAINSTACK_BSC_URL: process.env.CHAINSTACK_BSC_URL ? 'SET' : 'MISSING'
+      SUPABASE_URL: process.env.SUPABASE_URL ? 'SET' : 'MISSING'
     }
   };
   
@@ -1336,14 +1262,14 @@ app.get('/', (req, res) => {
       'Deposit Processing',
       'Auto Collection',
       'Enhanced Logging',
-      'Chainstack BSC Integration'
+      'Optimized BSC Scanning'
     ],
     stats: {
       checkIntervalBEP20: `${CHECK_INTERVAL_BEP20_MS / 1000} seconds`,
       checkIntervalTRC20: `${CHECK_INTERVAL_TRC20_MS / 1000} seconds`,
       minDeposit: `${MIN_DEPOSIT} USDT`,
       keepAmount: `${KEEP_AMOUNT} USDT`,
-      bscProvider: 'Chainstack (Primary)'
+      bscProvider: 'Public RPC (Multi-Fallback)'
     }
   };
   
@@ -1387,7 +1313,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SERVER SUCCESSFULLY STARTED on port ${PORT}`);
   console.log(`✅ SUPABASE: CONNECTED`);
   console.log(`✅ TRONGRID: API KEY SET`);
-  console.log(`🔌 BSC PROVIDER: CHAINSTACK`);
+  console.log(`🔌 BSC PROVIDER: PUBLIC RPC (${BSC_RPC_URLS.length} endpoints)`);
   console.log(`💰 TRC20 MASTER: ${COMPANY.MASTER.address}`);
   console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
   console.log(`💰 BEP20 MASTER: ${COMPANY_BSC.MASTER.address}`);
@@ -1395,5 +1321,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`⏰ BEP20 AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_BEP20_MS / 1000)}s`);
   console.log(`⏰ TRC20 AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_TRC20_MS / 1000)}s`);
   console.log('===================================');
-  console.log('🎉 APPLICATION READY - BEP20 OPTIMIZED WITH CHAINSTACK');
+  console.log('🎉 APPLICATION READY - BEP20 OPTIMIZED WITH PUBLIC RPC');
+  console.log('🔥 250 BEP20 wallets will be checked in 1-3 minutes!');
 });

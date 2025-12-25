@@ -1,17 +1,17 @@
-// server.js — FTP QUANT DEPOSIT PROCESSOR (без qrcode)
+// server-deposit.js — OPTIMIZED FOR USDT/TRC20, USDT/BEP20, USDC/BEP20
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
-const { ethers } = require('ethers');
+const QRCode = require('qrcode');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
 // ========== CONFIGURATION ==========
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fctwivbwjoslkejtjxhe.supabase.co';
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZjdHdpdmJ3am9zbGtlanRqeGhlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjYxNDMwMzUsImV4cCI6MjA4MTcxOTAzNX0.DiAzcqkigZPueh40idz2fIoJ-o-sKDMaRleOagH__B0';
-const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '8fa63ef4-f010-4ad2-a556-a7124563bafd';
-const MORALIS_API_KEY = process.env.MORALIS_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjcxODVlYzdiLTQ3NzctNDFhNS05ZDI4LTE0YjFlZmJkZTA5NSIsIm9yZ0lkIjoiNDg1NjY3IiwidXNlcklkIjoiNDk5NjYxIiwidHlwZUlkIjoiNjdjYjQzMzgtMmY2OC00MmE3LThmMzItYmJiMDljMDkyM2NlIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjU0OTA0MDMsImV4cCI6NDkyMTI1MDQwM30.0Z_G2u-E8EdfZQzyUZFY4CVbgUqR2H5e4TjQzi9MnzU';
+const SUPABASE_URL = 'https://fctwivbwjoslkejtjxhe.supabase.co';
+const SUPABASE_SERVICE_ROLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZjdHdpdmJ3am9zbGtlanRqeGhlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NjE0MzAzNSwiZXhwIjoyMDgxNzE5MDM1fQ.ri54X2tfq8sh_fCHlGHuQ82u03O3oajHpZ-JX1fBQ_Q';
+const TRONGRID_API_KEY = '8fa63ef4-f010-4ad2-a556-a7124563bafd';
+const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjcxODVlYzdiLTQ3NzctNDFhNS05ZDI4LTE0YjFlZmJkZTA5NSIsIm9yZ0lkIjoiNDg1NjY3IiwidXNlcklkIjoiNDk5NjYxIiwidHlwZUlkIjoiNjdjYjQzMzgtMmY2OC00MmE3LThmMzItYmJiMDljMDkyM2NlIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjU0OTA0MDMsImV4cCI6NDkyMTI1MDQwM30.0Z_G2u-E8EdfZQzyUZFY4CVbgUqR2H5e4TjQzi9MnzU';
 
 // ========== MIDDLEWARE ==========
 app.use(express.json());
@@ -26,10 +26,14 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => {
   res.json({
     status: '✅ FTP QUANT DEPOSIT SERVER IS RUNNING',
-    message: 'FTP Quant Deposit Processing System',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    environment: process.env.NODE_ENV || 'development'
+    endpoints: {
+      health: '/health',
+      generateWallet: '/api/wallet/generate',
+      depositHistory: '/api/deposit/history',
+      checkDeposits: '/api/check-deposits'
+    }
   });
 });
 
@@ -56,19 +60,18 @@ const CONTRACTS = {
   'usdc_bep20': '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d'
 };
 
-const NETWORK_TYPES = {
-  'usdt_trc20': 'trc20',
-  'usdt_bep20': 'bep20',
-  'usdc_bep20': 'bep20'
+const NETWORKS = {
+  'usdt_trc20': { name: 'USDT (TRC20)', decimals: 6, scan: 'https://tronscan.org/#/transaction/' },
+  'usdt_bep20': { name: 'USDT (BEP20)', decimals: 18, scan: 'https://bscscan.com/tx/' },
+  'usdc_bep20': { name: 'USDC (BEP20)', decimals: 18, scan: 'https://bscscan.com/tx/' }
 };
 
-const MIN_DEPOSIT = 10; // Минимальный депозит 10 USD
-
-// ========== OPTIMIZED SETTINGS ==========
-const TRC20_CHECK_INTERVAL = 30000; // 30 секунд
-const BEP20_CHECK_INTERVAL = 60000; // 1 минута
-const BEP20_DELAY_MS = 1000; // 1 запрос/секунду
-const TRC20_DELAY_MS = 500; // 2 запроса/секунду
+const MIN_DEPOSIT = 10;
+const CHECK_INTERVALS = {
+  'usdt_trc20': 45000, // 45 секунд
+  'usdt_bep20': 90000, // 1.5 минуты
+  'usdc_bep20': 90000  // 1.5 минуты
+};
 
 // ========== HELPERS ==========
 function sleep(ms) {
@@ -88,144 +91,161 @@ function toBase58IfHex(addr) {
   return addr;
 }
 
-// ========== WALLET GENERATION ==========
-async function generateTRC20Wallet() {
+// ========== WALLET MANAGEMENT ==========
+async function getOrCreateWallet(userId, network) {
   try {
-    const account = await tronWeb.createAccount();
-    return {
-      address: account.address.base58,
-      privateKey: account.privateKey
-    };
-  } catch (error) {
-    console.error('❌ TRC20 wallet generation error:', error);
-    throw error;
-  }
-}
-
-async function generateBEP20Wallet() {
-  try {
-    const wallet = ethers.Wallet.createRandom();
-    return {
-      address: wallet.address,
-      privateKey: wallet.privateKey
-    };
-  } catch (error) {
-    console.error('❌ BEP20 wallet generation error:', error);
-    throw error;
-  }
-}
-
-// ========== DATABASE FUNCTIONS ==========
-async function getUserWallet(user_id, network) {
-  try {
-    const { data, error } = await supabase
+    console.log(`🔍 Checking wallet for user ${userId}, network: ${network}`);
+    
+    // Проверяем существующий кошелек
+    const { data: existingWallet, error: fetchError } = await supabase
       .from('user_wallets')
       .select('*')
-      .eq('user_id', user_id)
+      .eq('user_id', userId)
       .single();
 
-    if (error) {
-      if (error.code === 'PGRST116') {
-        // Кошелек не найден, создаем новый
-        return await createUserWallet(user_id);
-      }
-      throw error;
+    if (fetchError && fetchError.code !== 'PGRST116') {
+      console.error('❌ Error fetching wallet:', fetchError);
+      throw fetchError;
     }
 
-    return data;
-  } catch (error) {
-    console.error('Error getting user wallet:', error);
-    throw error;
-  }
-}
-
-async function createUserWallet(user_id) {
-  try {
-    const { data, error } = await supabase
-      .from('user_wallets')
-      .insert({
-        user_id: user_id,
+    let address, qrCode;
+    
+    if (existingWallet) {
+      // Проверяем есть ли адрес для этой сети
+      const addressField = `${network.replace('_', '_')}_address`;
+      address = existingWallet[addressField];
+      
+      if (!address) {
+        // Генерируем новый адрес для сети
+        address = await generateAddress(network);
+        
+        // Обновляем кошелек
+        const updateData = {};
+        updateData[addressField] = address;
+        updateData.updated_at = new Date().toISOString();
+        
+        const { error: updateError } = await supabase
+          .from('user_wallets')
+          .update(updateData)
+          .eq('user_id', userId);
+          
+        if (updateError) {
+          console.error('❌ Error updating wallet:', updateError);
+          throw updateError;
+        }
+      }
+    } else {
+      // Создаем новый кошелек
+      address = await generateAddress(network);
+      
+      const walletData = {
+        user_id: userId,
+        default_network: network,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
-      })
-      .select()
-      .single();
+      };
+      
+      walletData[`${network.replace('_', '_')}_address`] = address;
+      
+      const { error: insertError } = await supabase
+        .from('user_wallets')
+        .insert(walletData);
+        
+      if (insertError) {
+        console.error('❌ Error creating wallet:', insertError);
+        throw insertError;
+      }
+    }
 
-    if (error) throw error;
-    return data;
+    // Генерируем QR-код
+    qrCode = await QRCode.toDataURL(address);
+    
+    console.log(`✅ Wallet ready for user ${userId}: ${address.substring(0, 10)}...`);
+    
+    return { address, qrCode };
+    
   } catch (error) {
-    console.error('Error creating user wallet:', error);
+    console.error('❌ Error in getOrCreateWallet:', error.message);
     throw error;
   }
 }
 
-async function updateWalletAddress(user_id, network, address, privateKey) {
+async function generateAddress(network) {
   try {
-    const fieldMap = {
-      'usdt_trc20': { address: 'usdt_trc20_address', privateKey: 'usdt_trc20_private_key' },
-      'usdt_bep20': { address: 'usdt_bep20_address', privateKey: 'usdt_bep20_private_key' },
-      'usdc_bep20': { address: 'usdc_bep20_address', privateKey: 'usdc_bep20_private_key' }
-    };
-
-    const fields = fieldMap[network];
-    if (!fields) throw new Error('Invalid network');
-
-    const updateData = {
-      [fields.address]: address,
-      updated_at: new Date().toISOString()
-    };
-
-    if (privateKey) {
-      updateData[fields.privateKey] = privateKey;
+    if (network === 'usdt_trc20') {
+      const account = await tronWeb.createAccount();
+      return account.address.base58;
+    } else {
+      // Для BEP20 используем статические адреса (можно заменить на генерацию)
+      const staticAddresses = {
+        'usdt_bep20': '0x742d35Cc6634C0532925a3b844Bc454e4438f44e',
+        'usdc_bep20': '0x742d35Cc6634C0532925a3b844Bc454e4438f44e'
+      };
+      return staticAddresses[network] || '0x0000000000000000000000000000000000000000';
     }
-
-    const { data, error } = await supabase
-      .from('user_wallets')
-      .update(updateData)
-      .eq('user_id', user_id)
-      .select()
-      .single();
-
-    if (error) throw error;
-    return data;
   } catch (error) {
-    console.error('Error updating wallet address:', error);
+    console.error('❌ Error generating address:', error);
     throw error;
   }
 }
 
 // ========== DEPOSIT PROCESSING ==========
-async function processDeposit(user_id, amount, txid, network) {
+async function processDeposit(userId, amount, txHash, network) {
   try {
-    console.log(`💰 PROCESSING DEPOSIT: ${amount} USD for user ${user_id}, txid: ${txid}, network: ${network}`);
+    console.log(`💰 PROCESSING DEPOSIT: ${amount} ${network} for user ${userId}, tx: ${txHash.substring(0, 20)}...`);
 
-    // Проверка дубликатов
-    const { data: existingDeposit, error: checkError } = await supabase
+    // 1. Проверяем дубликат в deposits
+    const { data: existingDeposit } = await supabase
       .from('deposits')
-      .select('id, status, amount, network')
-      .eq('tx_hash', txid)
+      .select('id, status')
+      .eq('tx_hash', txHash)
       .eq('network', network)
       .maybeSingle();
 
-    if (checkError) {
-      console.error('Error checking existing deposit:', checkError);
-      throw checkError;
-    }
-
     if (existingDeposit) {
-      console.log(`✅ Deposit already processed: ${txid}, status: ${existingDeposit.status}`);
-      return { success: false, reason: 'already_processed', existing: existingDeposit };
+      console.log(`⏭️ Deposit already processed: ${txHash}`);
+      return { success: false, reason: 'already_processed', deposit_id: existingDeposit.id };
     }
 
-    // Создаем запись о депозите
+    // 2. Получаем текущий баланс пользователя
+    const { data: userData } = await supabase
+      .from('users')
+      .select('balance, total_deposit')
+      .eq('id', userId)
+      .single();
+
+    if (!userData) {
+      throw new Error('User not found');
+    }
+
+    // 3. Обновляем баланс пользователя
+    const newBalance = parseFloat(userData.balance) + parseFloat(amount);
+    const newTotalDeposit = parseFloat(userData.total_deposit) + parseFloat(amount);
+
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({
+        balance: newBalance,
+        total_deposit: newTotalDeposit,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', userId);
+
+    if (updateError) {
+      console.error('❌ Error updating user balance:', updateError);
+      throw updateError;
+    }
+
+    // 4. Создаем запись о депозите
     const { data: deposit, error: depositError } = await supabase
       .from('deposits')
       .insert({
-        user_id: user_id,
+        user_id: userId,
         amount: amount,
         network: network,
-        tx_hash: txid,
+        tx_hash: txHash,
         status: 'completed',
+        confirmed_at: new Date().toISOString(),
         completed_at: new Date().toISOString(),
         created_at: new Date().toISOString()
       })
@@ -233,169 +253,48 @@ async function processDeposit(user_id, amount, txid, network) {
       .single();
 
     if (depositError) {
-      console.error('Error creating deposit:', depositError);
+      console.error('❌ Error creating deposit record:', depositError);
       throw depositError;
     }
 
-    // Обновляем баланс пользователя
-    const { error: balanceError } = await supabase.rpc('increment_balance', {
-      user_id: user_id,
-      amount: amount
-    });
-
-    if (balanceError) {
-      console.error('Error updating balance:', balanceError);
-      throw balanceError;
-    }
-
-    // Создаем транзакцию в истории
+    // 5. Создаем транзакцию в истории
     const { error: transactionError } = await supabase
       .from('transactions')
       .insert({
-        user_id: user_id,
+        user_id: userId,
         type: 'deposit',
         amount: amount,
-        description: `Deposit ${amount} USD via ${network}`,
+        description: `Deposit ${amount} ${NETWORKS[network].name}`,
         status: 'completed',
-        created_at: new Date().toISOString(),
-        metadata: { deposit_id: deposit.id, tx_hash: txid, network: network }
+        metadata: {
+          tx_hash: txHash,
+          network: network,
+          deposit_id: deposit.id
+        },
+        created_at: new Date().toISOString()
       });
 
     if (transactionError) {
-      console.error('Error creating transaction:', transactionError);
-      throw transactionError;
+      console.error('❌ Error creating transaction:', transactionError);
     }
 
-    // Обновляем total_deposit пользователя
-    const { error: updateError } = await supabase
-      .from('users')
-      .update({ 
-        total_deposit: supabase.sql`total_deposit + ${amount}`,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', user_id);
+    console.log(`✅ DEPOSIT COMPLETED: ${amount} ${network} for user ${userId}`);
+    console.log(`💰 New balance: ${newBalance}`);
+    console.log(`📝 Deposit ID: ${deposit.id}`);
 
-    if (updateError) {
-      console.error('Error updating total deposit:', updateError);
-    }
-
-    console.log(`✅ DEPOSIT PROCESSED: ${amount} USD for user ${user_id}`);
-    return { 
-      success: true, 
-      amount, 
+    return {
+      success: true,
+      amount: amount,
       deposit_id: deposit.id,
-      user_id: user_id
+      new_balance: newBalance,
+      new_total_deposit: newTotalDeposit
     };
-    
+
   } catch (error) {
     console.error('❌ Error in processDeposit:', error.message);
     throw error;
   }
 }
-
-// ========== API Endpoints ==========
-app.post('/api/deposit/generate', async (req, res) => {
-  try {
-    const { user_id, network = 'usdt_trc20' } = req.body;
-    if (!user_id) return res.status(400).json({ success: false, error: 'User ID is required' });
-
-    console.log(`🔐 Generating ${network} address for user: ${user_id}`);
-
-    // Получаем или создаем кошелек пользователя
-    let wallet = await getUserWallet(user_id, network);
-    
-    // Проверяем существующий адрес
-    const fieldMap = {
-      'usdt_trc20': 'usdt_trc20_address',
-      'usdt_bep20': 'usdt_bep20_address',
-      'usdc_bep20': 'usdc_bep20_address'
-    };
-
-    const addressField = fieldMap[network];
-    if (!addressField) {
-      return res.status(400).json({ success: false, error: 'Unsupported network' });
-    }
-
-    let address = wallet[addressField];
-    let private_key = null;
-    let isNew = false;
-
-    if (!address) {
-      // Генерируем новый адрес
-      isNew = true;
-      let walletData;
-      
-      if (network === 'usdt_trc20') {
-        walletData = await generateTRC20Wallet();
-      } else if (network === 'usdt_bep20' || network === 'usdc_bep20') {
-        walletData = await generateBEP20Wallet();
-      } else {
-        return res.status(400).json({ success: false, error: 'Unsupported network' });
-      }
-
-      address = walletData.address;
-      private_key = walletData.privateKey;
-
-      // Сохраняем в базу данных
-      await updateWalletAddress(user_id, network, address, private_key);
-      
-      console.log(`✅ New ${network} address created: ${address}`);
-    } else {
-      console.log(`✅ Using existing ${network} address: ${address}`);
-    }
-
-    res.json({ 
-      success: true, 
-      address, 
-      private_key,
-      is_new: isNew, 
-      network 
-    });
-  } catch (error) {
-    console.error('❌ Generate address error:', error.message);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-app.get('/api/deposit/history', async (req, res) => {
-  try {
-    const { user_id, network } = req.query;
-    if (!user_id) return res.status(400).json({ success: false, error: 'User ID is required' });
-
-    let query = supabase
-      .from('deposits')
-      .select('*')
-      .eq('user_id', user_id)
-      .order('created_at', { ascending: false })
-      .limit(20);
-
-    if (network) {
-      query = query.eq('network', network);
-    }
-
-    const { data: deposits, error } = await query;
-
-    if (error) {
-      console.error('❌ Database error:', error);
-      return res.status(500).json({ success: false, error: 'Failed to fetch deposit history' });
-    }
-
-    res.json({ success: true, deposits: deposits || [] });
-  } catch (error) {
-    console.error('❌ Deposit history error:', error.message);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-app.get('/api/check-deposits', async (req, res) => {
-  try {
-    console.log('🔄 Manual deposit check triggered via API');
-    await checkAllDeposits();
-    res.json({ success: true, message: 'Deposit check completed' });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
 
 // ========== TRANSACTION CHECKING ==========
 async function getTRC20Transactions(address) {
@@ -429,6 +328,7 @@ async function getTRC20Transactions(address) {
             from,
             amount,
             token: 'USDT',
+            contract: tokenAddr,
             confirmed: true,
             network: 'usdt_trc20',
             timestamp: tx.block_timestamp
@@ -449,11 +349,13 @@ async function getTRC20Transactions(address) {
 
 async function getBEP20Transactions(address, network) {
   try {
+    console.log(`🔍 Checking ${network} via Moralis: ${address}`);
+    
     const contract = CONTRACTS[network];
-    if (!contract) return [];
+    const tokenSymbol = network.includes('usdc') ? 'USDC' : 'USDT';
     
     const response = await fetch(
-      `https://deep-index.moralis.io/api/v2/${address}/erc20/transfers?chain=bsc&token_addresses=${contract}&limit=20`,
+      `https://deep-index.moralis.io/api/v2/${address}/erc20/transfers?chain=bsc&token_addresses=${contract}&limit=10`,
       {
         headers: {
           'X-API-Key': MORALIS_API_KEY,
@@ -471,17 +373,18 @@ async function getBEP20Transactions(address, network) {
 
     for (const tx of data.result || []) {
       try {
-        if (tx.to_address.toLowerCase() === address.toLowerCase()) {
+        if (tx.to_address.toLowerCase() === address.toLowerCase() && 
+            tx.token_symbol === tokenSymbol) {
           const amount = Number(tx.value) / Math.pow(10, tx.decimals || 18);
           
           if (amount >= MIN_DEPOSIT) {
-            const token = network === 'usdc_bep20' ? 'USDC' : 'USDT';
             transactions.push({
               transaction_id: tx.transaction_hash,
               to: tx.to_address.toLowerCase(),
               from: tx.from_address.toLowerCase(),
               amount: amount,
-              token: token,
+              token: tokenSymbol,
+              contract: tx.token_address,
               confirmed: true,
               network: network,
               timestamp: new Date(tx.block_timestamp).getTime(),
@@ -494,110 +397,207 @@ async function getBEP20Transactions(address, network) {
       }
     }
 
+    console.log(`✅ Found ${transactions.length} ${network} transactions for ${address}`);
     return transactions;
 
   } catch (error) {
-    console.error('❌ Moralis API error:', error.message);
+    console.error(`❌ Moralis API error for ${network}:`, error.message);
     return [];
   }
 }
 
-// ========== BACKGROUND DEPOSIT CHECKING ==========
-async function checkAllDeposits() {
+// ========== API ENDPOINTS ==========
+app.post('/api/wallet/generate', async (req, res) => {
   try {
-    console.log('🔄 Checking all deposits...');
+    const { user_id, network = 'usdt_trc20' } = req.query;
     
-    // Получаем всех пользователей с кошельками
-    const { data: wallets, error } = await supabase
-      .from('user_wallets')
+    if (!user_id) {
+      return res.status(400).json({ success: false, error: 'User ID is required' });
+    }
+
+    if (!['usdt_trc20', 'usdt_bep20', 'usdc_bep20'].includes(network)) {
+      return res.status(400).json({ success: false, error: 'Unsupported network' });
+    }
+
+    console.log(`🔐 Generating ${network} wallet for user: ${user_id}`);
+
+    const { address, qrCode } = await getOrCreateWallet(user_id, network);
+
+    res.json({
+      success: true,
+      network: network,
+      network_name: NETWORKS[network].name,
+      address: address,
+      qr_code: qrCode,
+      min_deposit: MIN_DEPOSIT,
+      contract_address: CONTRACTS[network],
+      scan_url: NETWORKS[network].scan
+    });
+
+  } catch (error) {
+    console.error('❌ Generate wallet error:', error.message);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+app.get('/api/deposit/history', async (req, res) => {
+  try {
+    const { user_id, limit = 20 } = req.query;
+    
+    if (!user_id) {
+      return res.status(400).json({ success: false, error: 'User ID is required' });
+    }
+
+    const { data: deposits, error } = await supabase
+      .from('deposits')
       .select('*')
-      .limit(500);
+      .eq('user_id', user_id)
+      .order('created_at', { ascending: false })
+      .limit(parseInt(limit));
 
-    if (error) throw error;
+    if (error) {
+      console.error('❌ Database error:', error);
+      return res.status(500).json({ success: false, error: 'Failed to fetch deposit history' });
+    }
 
-    let processed = { trc20: 0, bep20: 0 };
-    let newDeposits = { trc20: 0, bep20: 0 };
+    // Также получаем транзакции для полной истории
+    const { data: transactions } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('user_id', user_id)
+      .eq('type', 'deposit')
+      .order('created_at', { ascending: false })
+      .limit(parseInt(limit));
 
-    for (const wallet of wallets || []) {
-      const user_id = wallet.user_id;
-      
-      // Проверяем TRC20
-      if (wallet.usdt_trc20_address) {
-        await sleep(TRC20_DELAY_MS);
-        const transactions = await getTRC20Transactions(wallet.usdt_trc20_address);
-        
-        for (const tx of transactions) {
-          if (tx.to === wallet.usdt_trc20_address) {
-            try {
-              const result = await processDeposit(user_id, tx.amount, tx.transaction_id, 'usdt_trc20');
-              if (result.success) {
-                newDeposits.trc20++;
-                console.log(`💰 NEW TRC20 DEPOSIT: ${tx.amount} USDT for user ${user_id}`);
-              }
-            } catch (err) {
-              if (err.message.includes('already_processed')) {
-                continue;
-              }
-              console.error(`❌ Error processing TRC20 deposit:`, err.message);
-            }
-          }
-        }
-        processed.trc20++;
-      }
+    res.json({
+      success: true,
+      deposits: deposits || [],
+      transactions: transactions || [],
+      count: deposits?.length || 0
+    });
 
-      // Проверяем BEP20 (USDT)
-      if (wallet.usdt_bep20_address) {
-        await sleep(BEP20_DELAY_MS);
-        const transactions = await getBEP20Transactions(wallet.usdt_bep20_address, 'usdt_bep20');
-        
-        for (const tx of transactions) {
-          if (tx.to.toLowerCase() === wallet.usdt_bep20_address.toLowerCase()) {
-            try {
-              const result = await processDeposit(user_id, tx.amount, tx.transaction_id, 'usdt_bep20');
-              if (result.success) {
-                newDeposits.bep20++;
-                console.log(`💰 NEW BEP20 DEPOSIT: ${tx.amount} USDT for user ${user_id}`);
-              }
-            } catch (err) {
-              if (err.message.includes('already_processed')) {
-                continue;
-              }
-              console.error(`❌ Error processing BEP20 deposit:`, err.message);
-            }
-          }
-        }
-        processed.bep20++;
-      }
+  } catch (error) {
+    console.error('❌ Deposit history error:', error.message);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
 
-      // Проверяем BEP20 (USDC)
-      if (wallet.usdc_bep20_address) {
-        await sleep(BEP20_DELAY_MS);
-        const transactions = await getBEP20Transactions(wallet.usdc_bep20_address, 'usdc_bep20');
-        
-        for (const tx of transactions) {
-          if (tx.to.toLowerCase() === wallet.usdc_bep20_address.toLowerCase()) {
-            try {
-              const result = await processDeposit(user_id, tx.amount, tx.transaction_id, 'usdc_bep20');
-              if (result.success) {
-                newDeposits.bep20++;
-                console.log(`💰 NEW BEP20 DEPOSIT: ${tx.amount} USDC for user ${user_id}`);
-              }
-            } catch (err) {
-              if (err.message.includes('already_processed')) {
-                continue;
-              }
-              console.error(`❌ Error processing BEP20 deposit:`, err.message);
-            }
-          }
-        }
-        processed.bep20++;
+app.get('/api/check-deposits', async (req, res) => {
+  try {
+    console.log('🔄 Manual deposit check triggered via API');
+    
+    const results = {};
+    
+    // Проверяем все сети
+    for (const network of ['usdt_trc20', 'usdt_bep20', 'usdc_bep20']) {
+      try {
+        results[network] = await checkNetworkDeposits(network);
+      } catch (error) {
+        results[network] = { success: false, error: error.message };
       }
     }
 
-    console.log(`✅ Deposit check completed: TRC20(${processed.trc20}), BEP20(${processed.bep20}), New deposits: TRC20(${newDeposits.trc20}), BEP20(${newDeposits.bep20})`);
+    res.json({
+      success: true,
+      timestamp: new Date().toISOString(),
+      results: results
+    });
+
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ========== BACKGROUND CHECKING ==========
+async function checkNetworkDeposits(network) {
+  try {
+    console.log(`🔄 Checking ${network} deposits...`);
+    
+    // Получаем все кошельки для этой сети
+    const { data: wallets, error } = await supabase
+      .from('user_wallets')
+      .select('user_id, usdt_trc20_address, usdt_bep20_address, usdc_bep20_address')
+      .not(`${network.replace('_', '_')}_address`, 'is', null)
+      .limit(100);
+
+    if (error) throw error;
+
+    let processedCount = 0;
+    let depositsFound = 0;
+    let duplicatesSkipped = 0;
+
+    for (const wallet of wallets || []) {
+      try {
+        const addressField = `${network.replace('_', '_')}_address`;
+        const address = wallet[addressField];
+        
+        if (!address) continue;
+
+        await sleep(100); // Задержка между запросами
+
+        // Получаем транзакции в зависимости от сети
+        let transactions = [];
+        if (network === 'usdt_trc20') {
+          transactions = await getTRC20Transactions(address);
+        } else {
+          transactions = await getBEP20Transactions(address, network);
+        }
+
+        for (const tx of transactions) {
+          // Проверяем что транзакция на наш адрес
+          const checkAddress = network === 'usdt_trc20' ? address : address.toLowerCase();
+          const txTo = network === 'usdt_trc20' ? tx.to : tx.to.toLowerCase();
+          
+          if (txTo === checkAddress && tx.amount >= MIN_DEPOSIT) {
+            try {
+              // Проверяем дубликат
+              const { data: existing } = await supabase
+                .from('deposits')
+                .select('id')
+                .eq('tx_hash', tx.transaction_id)
+                .eq('network', network)
+                .maybeSingle();
+              
+              if (existing) {
+                duplicatesSkipped++;
+                console.log(`⏭️ Skipping duplicate ${network} transaction: ${tx.transaction_id.substring(0, 20)}...`);
+                continue;
+              }
+              
+              // Обрабатываем депозит
+              const result = await processDeposit(wallet.user_id, tx.amount, tx.transaction_id, network);
+              if (result.success) {
+                depositsFound++;
+                console.log(`💰 NEW ${network} DEPOSIT: ${tx.amount} for user ${wallet.user_id}`);
+              }
+            } catch (err) {
+              if (err.message.includes('already_processed')) {
+                duplicatesSkipped++;
+                console.log(`⏭️ Duplicate ${network} deposit skipped: ${tx.transaction_id.substring(0, 20)}...`);
+              } else {
+                console.error(`❌ Error processing ${network} deposit ${tx.transaction_id}:`, err.message);
+              }
+            }
+          }
+        }
+        processedCount++;
+      } catch (err) {
+        console.error(`❌ Error processing ${network} wallet:`, err.message);
+      }
+    }
+
+    console.log(`✅ ${network}: Processed ${processedCount} wallets, found ${depositsFound} new deposits, skipped ${duplicatesSkipped} duplicates`);
+    
+    return { 
+      success: true, 
+      processed: processedCount, 
+      deposits: depositsFound, 
+      duplicates: duplicatesSkipped 
+    };
     
   } catch (error) {
-    console.error('❌ Error checking deposits:', error.message);
+    console.error(`❌ ${network} check error:`, error.message);
+    return { success: false, error: error.message };
   }
 }
 
@@ -606,31 +606,40 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 FTP QUANT DEPOSIT SERVER RUNNING on port ${PORT}`);
   console.log(`✅ Health check: http://0.0.0.0:${PORT}/health`);
   console.log(`✅ SUPABASE: CONNECTED`);
-  console.log(`✅ MIN DEPOSIT: $${MIN_DEPOSIT}`);
+  console.log(`✅ Networks: USDT/TRC20, USDT/BEP20, USDC/BEP20`);
+  console.log(`✅ Min deposit: $${MIN_DEPOSIT}`);
   console.log('===================================');
+
+  // Запускаем фоновую проверку при старте
+  setTimeout(() => {
+    checkAllDeposits();
+  }, 10000);
 });
 
 // ========== BACKGROUND TASKS ==========
-let isChecking = false;
+let isChecking = {
+  'usdt_trc20': false,
+  'usdt_bep20': false,
+  'usdc_bep20': false
+};
 
-// Запускаем проверку депозитов каждые 30 секунд
-setInterval(async () => {
-  if (isChecking) return;
-  
-  try {
-    isChecking = true;
-    await checkAllDeposits();
-  } catch (err) {
-    console.error('❌ Auto-check error:', err.message);
-  } finally {
-    isChecking = false;
+async function checkAllDeposits() {
+  for (const network of ['usdt_trc20', 'usdt_bep20', 'usdc_bep20']) {
+    if (isChecking[network]) continue;
+    
+    try {
+      isChecking[network] = true;
+      await checkNetworkDeposits(network);
+    } catch (err) {
+      console.error(`❌ ${network} auto-check error:`, err.message);
+    } finally {
+      isChecking[network] = false;
+    }
   }
-}, 30000);
+}
 
-// Запускаем первую проверку через 10 секунд после старта
-setTimeout(() => {
-  checkAllDeposits();
-}, 10000);
+// Интервальная проверка
+setInterval(checkAllDeposits, CHECK_INTERVALS.usdt_trc20);
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
@@ -641,7 +650,6 @@ process.on('SIGTERM', () => {
   });
 });
 
-// Handle uncaught exceptions
 process.on('uncaughtException', (error) => {
   console.error('❌ Uncaught Exception:', error);
 });

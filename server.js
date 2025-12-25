@@ -1,8 +1,7 @@
-// server.js — FTP QUANT DEPOSIT PROCESSOR
+// server.js — FTP QUANT DEPOSIT PROCESSOR (без qrcode)
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
-const QRCode = require('qrcode');
 const { ethers } = require('ethers');
 
 const app = express();
@@ -345,27 +344,10 @@ app.post('/api/deposit/generate', async (req, res) => {
       console.log(`✅ Using existing ${network} address: ${address}`);
     }
 
-    // Генерируем QR-код
-    let qrCode = '';
-    try {
-      qrCode = await QRCode.toDataURL(address, {
-        width: 300,
-        height: 300,
-        margin: 1,
-        color: {
-          dark: '#000000',
-          light: '#FFFFFF'
-        }
-      });
-    } catch (qrError) {
-      console.error('QR code generation error:', qrError);
-    }
-
     res.json({ 
       success: true, 
       address, 
       private_key,
-      qr_code: qrCode,
       is_new: isNew, 
       network 
     });
@@ -405,32 +387,13 @@ app.get('/api/deposit/history', async (req, res) => {
   }
 });
 
-app.get('/api/qrcode', async (req, res) => {
+app.get('/api/check-deposits', async (req, res) => {
   try {
-    const { text } = req.query;
-    if (!text) return res.status(400).json({ success: false, error: 'Text is required' });
-
-    const qrCode = await QRCode.toDataURL(text, {
-      width: 300,
-      height: 300,
-      margin: 1,
-      color: {
-        dark: '#000000',
-        light: '#FFFFFF'
-      }
-    });
-
-    const base64Data = qrCode.replace(/^data:image\/png;base64,/, '');
-    const imgBuffer = Buffer.from(base64Data, 'base64');
-
-    res.writeHead(200, {
-      'Content-Type': 'image/png',
-      'Content-Length': imgBuffer.length
-    });
-    res.end(imgBuffer);
+    console.log('🔄 Manual deposit check triggered via API');
+    await checkAllDeposits();
+    res.json({ success: true, message: 'Deposit check completed' });
   } catch (error) {
-    console.error('❌ QR code error:', error.message);
-    res.status(500).json({ success: false, error: 'Failed to generate QR code' });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 

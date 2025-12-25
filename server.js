@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 8080;
 const SUPABASE_URL = 'https://fctwivbwjoslkejtjxhe.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZjdHdpdmJ3am9zbGtlanRqeGhlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NjE0MzAzNSwiZXhwIjoyMDgxNzE5MDM1fQ.KV5XSZklL_cRlMJVxcBMQrkWLxqaeN8fkp4wXHYueh0';
 const TRONGRID_API_KEY = '8fa63ef4-f010-4ad2-a556-a7124563bafd';
-const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjA2NTU1NTc1LWM1OGItNDVkYi1hM2NjLTMzYzgwNzhlMDIxMyIsIm9yZ0lkIjoiNDg1NTk3IiwidXNlcklkIjoiNDk5NTkwIiwidHlwZUlkIjoiOGJkYmI4MTctY2FjYy00MTNiLWE1NzAtOTIxNDRmNTYxYmZjIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjU0NTY4MzYsImV4cCI6NDkyMTIxNjgzNn0.FoutXU8bmSPbs2dDC2_5Qb8MuXNvEiLJfxSqOYjKNp0';
+const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjcxODVlYzdiLTQ3NzctNDFhNS05ZDI4LTE0YjFlZmJkZTA5NSIsIm9yZ2lkIjoiNDg1NjY3IiwidXNlcklkIjoiNDk5NjYxIiwidHlwZUlkIjoiNjdjYjQzMzgtMmY2OC00MmE3LThmMzItYmJiMDljMDkyM2NlIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjU0OTA0MDMsImV4cCI6NDkyMTI1MDQwM30.0Z_G2u-E8EdfZQzyUZFY4CVbgUqR2H5e4TjQzi9MnzU';
 
 // ========== MIDDLEWARE ==========
 app.use(express.json());
@@ -60,7 +60,7 @@ const tronWeb = new TronWeb({
 const USDT_TRC20_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
 const USDT_BSC_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
 const USDC_BSC_CONTRACT = '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d';
-const MIN_DEPOSIT = 10; // ИЗМЕНЕНО С 17 НА 10
+const MIN_DEPOSIT = 10; // ИЗМЕНЕНО С 17 НА 10 USDT
 
 // ========== NETWORK FIELD MAPPING ==========
 const networkFields = {
@@ -132,125 +132,167 @@ async function generateBEP20Wallet() {
   }
 }
 
-// ========== DEPOSIT PROCESSING ==========
+// ========== АТОМАРНАЯ ФУНКЦИЯ ДЛЯ ДЕПОЗИТОВ ==========
 async function processDeposit(userId, amount, txid, network) {
   try {
-    console.log(`💰 PROCESSING DEPOSIT: ${amount} for user ${userId}, txid: ${txid}, network: ${network}`);
+    console.log(`💰 ATOMIC DEPOSIT PROCESSING: $${amount} for user ${userId}, tx: ${txid}, network: ${network}`);
 
+    // 1. Проверяем минимальный депозит
+    if (amount < MIN_DEPOSIT) {
+      console.log(`⏭️ Deposit too small: $${amount}, minimum: $${MIN_DEPOSIT}`);
+      return { success: false, error: `Minimum deposit is $${MIN_DEPOSIT}` };
+    }
+
+    // 2. Проверяем дубль в базе
     const { data: existingDeposit, error: checkError } = await supabase
       .from('deposits')
-      .select('id, status, amount, network')
+      .select('id, status, amount, user_id')
       .eq('tx_hash', txid)
       .eq('network', network)
       .maybeSingle();
 
     if (checkError) {
-      console.error('Error checking existing deposit:', checkError);
+      console.error('❌ Error checking existing deposit:', checkError);
       throw checkError;
     }
 
     if (existingDeposit) {
-      console.log(`✅ Deposit already processed: ${txid}, status: ${existingDeposit.status}`);
-      return { success: false, reason: 'already_processed' };
+      console.log(`⏭️ Deposit already exists: #${existingDeposit.id}, status: ${existingDeposit.status}`);
+      
+      // Если депозит уже обработан
+      if (existingDeposit.status === 'completed') {
+        return { 
+          success: true, 
+          already_processed: true,
+          deposit_id: existingDeposit.id,
+          message: 'Deposit already processed'
+        };
+      }
+      
+      // Если депозит pending, пытаемся обработать
+      if (existingDeposit.status === 'pending') {
+        console.log(`🔄 Processing existing pending deposit #${existingDeposit.id}`);
+        const result = await processDepositAtomic(userId, amount, txid, network);
+        if (result.success) {
+          // Обновляем статус существующего депозита
+          const { error: updateError } = await supabase
+            .from('deposits')
+            .update({
+              status: 'completed',
+              confirmed_at: new Date().toISOString(),
+              completed_at: new Date().toISOString()
+            })
+            .eq('id', existingDeposit.id);
+          
+          if (updateError) {
+            console.error('❌ Error updating deposit status:', updateError);
+          }
+        }
+        return result;
+      }
     }
 
-    const depositResult = await processDepositTransaction(userId, amount, txid, network);
-    return depositResult;
+    // 3. Обрабатываем новый депозит
+    return await processDepositAtomic(userId, amount, txid, network);
+    
   } catch (error) {
     console.error('❌ Error in processDeposit:', error.message);
-    throw error;
+    
+    // Логируем ошибку
+    try {
+      await supabase
+        .from('system_logs')
+        .insert({
+          log_type: 'deposit_processing_error',
+          message: `Deposit processing error: ${error.message}`,
+          metadata: {
+            user_id: userId,
+            amount: amount,
+            tx_hash: txid,
+            network: network,
+            error: error.message
+          }
+        });
+    } catch (logErr) {
+      console.error('❌ Error logging error:', logErr);
+    }
+    
+    return { success: false, error: error.message };
   }
 }
 
-async function processDepositTransaction(userId, amount, txid, network) {
+async function processDepositAtomic(userId, amount, txid, network) {
   try {
-    // 1. Создаем запись о депозите
-    const { data: depositData, error: depositError } = await supabase
-      .from('deposits')
-      .insert({
-        user_id: userId,
-        amount: amount,
-        network: network,
-        tx_hash: txid,
-        status: 'completed',
-        confirmed_at: new Date().toISOString(),
-        completed_at: new Date().toISOString(),
-        created_at: new Date().toISOString()
-      })
-      .select()
-      .single();
-
-    if (depositError) {
-      if (depositError.code === '23505') {
-        console.log(`⏭️ Duplicate transaction: ${txid}`);
-        return { success: false, reason: 'already_processed' };
-      }
-      console.error('❌ Deposit insert error:', depositError);
-      throw new Error(`Database error: ${depositError.message}`);
-    }
-
-    console.log(`💰 Created deposit record #${depositData.id} for user ${userId}, amount: $${amount}`);
-
-    // 2. Обновляем баланс пользователя через RPC функцию
-    console.log(`📊 Calling increment_user_balance for user ${userId}, amount: ${amount}`);
+    console.log(`🚀 Processing deposit atomically for user ${userId}, $${amount}`);
     
-    const { data: balanceResult, error: balanceError } = await supabase.rpc('increment_user_balance', {
-      user_id: userId,
-      amount: amount
+    // Используем атомарную процедуру в БД
+    const { data: result, error } = await supabase.rpc('create_deposit_with_balance', {
+      p_user_id: userId,
+      p_amount: amount,
+      p_network: network,
+      p_tx_hash: txid
     });
 
-    if (balanceError) {
-      console.error('❌ User balance update error:', balanceError);
-      // Пробуем обновить вручную
-      const { error: manualUpdateError } = await supabase
-        .from('users')
-        .update({
-          balance: supabase.raw('balance + ?', [amount]),
-          total_deposit: supabase.raw('COALESCE(total_deposit, 0) + ?', [amount]),
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', userId);
+    if (error) {
+      console.error('❌ Atomic deposit RPC error:', error);
       
-      if (manualUpdateError) {
-        console.error('❌ Manual balance update also failed:', manualUpdateError);
-        throw new Error(`Balance update failed: ${balanceError.message}`);
+      // Проверяем если это ошибка дубликата
+      if (error.message && error.message.includes('duplicate')) {
+        console.log(`⏭️ Duplicate detected by RPC: ${txid}`);
+        
+        // Проверяем существующий депозит
+        const { data: existingDeposit } = await supabase
+          .from('deposits')
+          .select('*')
+          .eq('tx_hash', txid)
+          .eq('network', network)
+          .maybeSingle();
+        
+        if (existingDeposit && existingDeposit.status === 'completed') {
+          return { 
+            success: true, 
+            already_processed: true,
+            deposit_id: existingDeposit.id
+          };
+        }
       }
-      console.log(`✅ Balance updated manually for user ${userId}`);
-    } else {
-      console.log(`✅ Balance updated via RPC for user ${userId}:`, balanceResult);
+      
+      throw error;
     }
 
-    // 3. Создаем запись в истории транзакций
-    const { error: txError } = await supabase
-      .from('transactions')
+    if (!result || !result.success) {
+      console.error('❌ Atomic deposit failed:', result?.error);
+      throw new Error(result?.error || 'Deposit processing failed');
+    }
+
+    console.log(`✅ ATOMIC DEPOSIT SUCCESS: #${result.deposit_id}, new balance: $${result.new_balance}`);
+    
+    // Дополнительное логирование
+    await supabase
+      .from('system_logs')
       .insert({
-        user_id: userId,
-        type: 'deposit',
-        amount: amount,
-        description: `Deposit via ${network.toUpperCase()}`,
-        status: 'completed',
-        metadata: { tx_hash: txid, network: network },
-        created_at: new Date().toISOString()
+        log_type: 'deposit_atomic_success',
+        message: `Atomic deposit successful for user ${userId}`,
+        metadata: {
+          deposit_id: result.deposit_id,
+          user_id: userId,
+          amount: amount,
+          old_balance: result.old_balance,
+          new_balance: result.new_balance,
+          tx_hash: txid
+        }
       });
 
-    if (txError) {
-      console.error('❌ Transaction insert error:', txError);
-    } else {
-      console.log(`📝 Transaction record created for user ${userId}`);
-    }
-
-    console.log(`✅ DEPOSIT PROCESSED: $${amount} for user ${userId}`);
-    console.log(`📝 Deposit ID: ${depositData.id}`);
-
-    return { 
-      success: true, 
-      amount: amount, 
-      deposit_id: depositData.id,
-      user_id: userId
+    return {
+      success: true,
+      deposit_id: result.deposit_id,
+      old_balance: result.old_balance,
+      new_balance: result.new_balance,
+      amount: amount
     };
     
   } catch (error) {
-    console.error('❌ Error in deposit processing:', error.message);
+    console.error('❌ Atomic deposit error:', error.message);
     throw error;
   }
 }
@@ -305,21 +347,19 @@ app.post('/api/deposit/generate', async (req, res) => {
 
     console.log(`✅ Generated ${network} wallet: ${address}`);
 
-    // Сохраняем в базу данных
+    // Сохраняем в базу данных (адрес И приватный ключ)
+    const walletData = {
+      [addressField]: address,
+      [privateKeyField]: privateKey, // ✅ СОХРАНЯЕМ ПРИВАТНЫЙ КЛЮЧ
+      updated_at: new Date().toISOString()
+    };
+
     if (existingWallet) {
       // Обновляем существующий кошелек
-      const updateData = {
-        [addressField]: address,
-        [privateKeyField]: privateKey,
-        updated_at: new Date().toISOString()
-      };
-
-      const { data, error } = await supabase
+      const { error } = await supabase
         .from('user_wallets')
-        .update(updateData)
-        .eq('user_id', user_id)
-        .select()
-        .single();
+        .update(walletData)
+        .eq('user_id', user_id);
 
       if (error) {
         console.error('❌ Database update error:', error);
@@ -327,20 +367,13 @@ app.post('/api/deposit/generate', async (req, res) => {
       }
     } else {
       // Создаем новый кошелек
-      const walletData = {
-        user_id: user_id,
-        [addressField]: address,
-        [privateKeyField]: privateKey,
-        default_network: network,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      };
+      walletData.user_id = user_id;
+      walletData.default_network = network;
+      walletData.created_at = new Date().toISOString();
       
-      const { data, error } = await supabase
+      const { error } = await supabase
         .from('user_wallets')
-        .insert(walletData)
-        .select()
-        .single();
+        .insert(walletData);
 
       if (error) {
         console.error('❌ Database insert error:', error);
@@ -535,6 +568,7 @@ async function handleCheckTRC20Deposits() {
     let processedCount = 0;
     let depositsFound = 0;
     let duplicatesSkipped = 0;
+    let errors = 0;
 
     for (const wallet of wallets || []) {
       try {
@@ -547,12 +581,12 @@ async function handleCheckTRC20Deposits() {
             try {
               const { data: existing } = await supabase
                 .from('deposits')
-                .select('id')
+                .select('id, status')
                 .eq('tx_hash', tx.transaction_id)
                 .eq('network', 'usdt_trc20')
                 .maybeSingle();
               
-              if (existing) {
+              if (existing && existing.status === 'completed') {
                 duplicatesSkipped++;
                 console.log(`⏭️ Skipping duplicate TRC20 transaction: ${tx.transaction_id}`);
                 continue;
@@ -561,14 +595,15 @@ async function handleCheckTRC20Deposits() {
               const result = await processDeposit(wallet.user_id, tx.amount, tx.transaction_id, 'usdt_trc20');
               if (result.success) {
                 depositsFound++;
-                console.log(`💰 NEW TRC20 DEPOSIT: ${tx.amount} USDT for user ${wallet.user_id}`);
+                console.log(`💰 NEW TRC20 DEPOSIT: $${tx.amount} for user ${wallet.user_id}`);
               }
             } catch (err) {
-              if (err.message.includes('already_processed') || (err.reason && err.reason === 'already_processed')) {
+              if (err.message && (err.message.includes('already_processed') || err.message.includes('duplicate'))) {
                 duplicatesSkipped++;
                 console.log(`⏭️ Duplicate TRC20 deposit skipped: ${tx.transaction_id}`);
               } else {
                 console.error(`❌ Error processing TRC20 deposit ${tx.transaction_id}:`, err.message);
+                errors++;
               }
             }
           }
@@ -576,11 +611,18 @@ async function handleCheckTRC20Deposits() {
         processedCount++;
       } catch (err) {
         console.error(`❌ Error processing TRC20 wallet ${wallet.usdt_trc20_address}:`, err.message);
+        errors++;
       }
     }
 
-    console.log(`✅ TRC20: Processed ${processedCount} wallets, found ${depositsFound} new deposits, skipped ${duplicatesSkipped} duplicates`);
-    return { success: true, processed: processedCount, deposits: depositsFound, duplicates: duplicatesSkipped };
+    console.log(`✅ TRC20: Processed ${processedCount} wallets, found ${depositsFound} new deposits, skipped ${duplicatesSkipped} duplicates, errors: ${errors}`);
+    return { 
+      success: true, 
+      processed: processedCount, 
+      deposits: depositsFound, 
+      duplicates: duplicatesSkipped,
+      errors: errors
+    };
     
   } catch (error) {
     console.error('❌ TRC20 check error:', error.message);
@@ -604,6 +646,7 @@ async function handleCheckBEP20Deposits() {
     let processedCount = 0;
     let depositsFound = 0;
     let duplicatesSkipped = 0;
+    let errors = 0;
 
     for (const wallet of wallets || []) {
       try {
@@ -621,12 +664,12 @@ async function handleCheckBEP20Deposits() {
               try {
                 const { data: existing } = await supabase
                   .from('deposits')
-                  .select('id')
+                  .select('id, status')
                   .eq('tx_hash', tx.transaction_id)
                   .eq('network', addr.network)
                   .maybeSingle();
                 
-                if (existing) {
+                if (existing && existing.status === 'completed') {
                   duplicatesSkipped++;
                   console.log(`⏭️ Skipping duplicate ${addr.network} transaction: ${tx.transaction_id}`);
                   continue;
@@ -635,14 +678,15 @@ async function handleCheckBEP20Deposits() {
                 const result = await processDeposit(wallet.user_id, tx.amount, tx.transaction_id, addr.network);
                 if (result.success) {
                   depositsFound++;
-                  console.log(`💰 NEW ${addr.network} DEPOSIT: ${tx.amount} ${tx.token} for user ${wallet.user_id}`);
+                  console.log(`💰 NEW ${addr.network} DEPOSIT: $${tx.amount} ${tx.token} for user ${wallet.user_id}`);
                 }
               } catch (err) {
-                if (err.message.includes('already_processed') || (err.reason && err.reason === 'already_processed')) {
+                if (err.message && (err.message.includes('already_processed') || err.message.includes('duplicate'))) {
                   duplicatesSkipped++;
                   console.log(`⏭️ Duplicate ${addr.network} deposit skipped: ${tx.transaction_id}`);
                 } else {
                   console.error(`❌ Error processing ${addr.network} deposit ${tx.transaction_id}:`, err.message);
+                  errors++;
                 }
               }
             }
@@ -651,11 +695,18 @@ async function handleCheckBEP20Deposits() {
         processedCount++;
       } catch (err) {
         console.error(`❌ Error processing BEP20 wallet ${wallet.user_id}:`, err.message);
+        errors++;
       }
     }
 
-    console.log(`✅ BEP20: Processed ${processedCount} wallets, found ${depositsFound} new deposits, skipped ${duplicatesSkipped} duplicates`);
-    return { success: true, processed: processedCount, deposits: depositsFound, duplicates: duplicatesSkipped };
+    console.log(`✅ BEP20: Processed ${processedCount} wallets, found ${depositsFound} new deposits, skipped ${duplicatesSkipped} duplicates, errors: ${errors}`);
+    return { 
+      success: true, 
+      processed: processedCount, 
+      deposits: depositsFound, 
+      duplicates: duplicatesSkipped,
+      errors: errors
+    };
     
   } catch (error) {
     console.error('❌ BEP20 check error:', error.message);
@@ -679,28 +730,9 @@ async function checkUserTRC20Deposits(userId) {
     for (const tx of transactions) {
       if (tx.to === wallet.usdt_trc20_address && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
         try {
-          const { data: existing } = await supabase
-            .from('deposits')
-            .select('id')
-            .eq('tx_hash', tx.transaction_id)
-            .eq('network', 'usdt_trc20')
-            .maybeSingle();
-          
-          if (existing) {
-            console.log(`⏭️ Skipping duplicate TRC20 transaction for user ${userId}: ${tx.transaction_id}`);
-            continue;
-          }
-          
-          const result = await processDeposit(userId, tx.amount, tx.transaction_id, 'usdt_trc20');
-          if (result.success) {
-            console.log(`💰 FOUND NEW TRC20 DEPOSIT: ${tx.amount} USDT for user ${userId}`);
-          }
+          await processDeposit(userId, tx.amount, tx.transaction_id, 'usdt_trc20');
         } catch (err) {
-          if (err.message.includes('already_processed') || err.reason === 'already_processed') {
-            console.log(`⏭️ Duplicate TRC20 deposit for user ${userId}: ${tx.transaction_id}`);
-          } else {
-            console.error(`❌ Error processing transaction ${tx.transaction_id}:`, err);
-          }
+          console.error(`❌ Error processing transaction ${tx.transaction_id}:`, err.message);
         }
       }
     }
@@ -729,28 +761,9 @@ async function checkUserBEP20Deposits(userId) {
       for (const tx of transactions) {
         if (tx.to.toLowerCase() === addr.address.toLowerCase() && tx.network === addr.network && tx.amount >= MIN_DEPOSIT) {
           try {
-            const { data: existing } = await supabase
-              .from('deposits')
-              .select('id')
-              .eq('tx_hash', tx.transaction_id)
-              .eq('network', addr.network)
-              .maybeSingle();
-            
-            if (existing) {
-              console.log(`⏭️ Skipping duplicate ${addr.network} transaction for user ${userId}: ${tx.transaction_id}`);
-              continue;
-            }
-            
-            const result = await processDeposit(userId, tx.amount, tx.transaction_id, addr.network);
-            if (result.success) {
-              console.log(`💰 FOUND NEW ${addr.network} DEPOSIT: ${tx.amount} ${tx.token} for user ${userId}`);
-            }
+            await processDeposit(userId, tx.amount, tx.transaction_id, addr.network);
           } catch (err) {
-            if (err.message.includes('already_processed') || err.reason === 'already_processed') {
-              console.log(`⏭️ Duplicate ${addr.network} deposit for user ${userId}: ${tx.transaction_id}`);
-            } else {
-              console.error(`❌ Error processing transaction ${tx.transaction_id}:`, err);
-            }
+            console.error(`❌ Error processing transaction ${tx.transaction_id}:`, err.message);
           }
         }
       }
@@ -772,6 +785,8 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ BEP20 (USDT & USDC): Checking every 3 minutes`);
   console.log(`✅ MINIMUM DEPOSIT: $${MIN_DEPOSIT} USDT`);
   console.log(`✅ PRIVATE KEY SAVING: ENABLED`);
+  console.log(`✅ ATOMIC DEPOSITS: ENABLED (Stored Procedure)`);
+  console.log(`✅ DUPLICATE PROTECTION: Multiple layers`);
   console.log('===================================');
 });
 

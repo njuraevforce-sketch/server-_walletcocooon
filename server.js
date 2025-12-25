@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 8080;
 const SUPABASE_URL = 'https://fctwivbwjoslkejtjxhe.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZjdHdpdmJ3am9zbGtlanRqeGhlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NjE0MzAzNSwiZXhwIjoyMDgxNzE5MDM1fQ.KV5XSZklL_cRlMJVxcBMQrkWLxqaeN8fkp4wXHYueh0';
 const TRONGRID_API_KEY = '8fa63ef4-f010-4ad2-a556-a7124563bafd';
-const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjA2NTU1NTc1LWM1OGItNDVkYi1hM2NjLTMzYzgwNzhlMDIxMyIsIm9yZ0lkIjoiNDg1NTk3IiwidXNlcklkIjoiNDk5NTkwIiwidHlwZUlkIjoiOGJkYmI4MTctY2FjYy00MTNiLWE1NzAtOTIxNDRmNTYxYmZjIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjU0NTY4MzYsImV4cCI6NDkyMTIxNjgzNn0.FoutXU8bmSPbs2dDC2_5Qb8MuXNvEiLJfxSqOYjKNp0';
+const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjcxODVlYzdiLTQ3NzctNDFhNS05ZDI4LTE0YjFlZmJkZTA5NSIsIm9yZ2lkIjoiNDg1NjY3IiwidXNlcklkIjoiNDk5NjYxIiwidHlwZUlkIjoiNjdjYjQzMzgtMmY2OC00MmE3LThmMzItYmJiMDljMDkyM2NlIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjU0OTA0MDMsImV4cCI6NDkyMTI1MDQwM30.0Z_G2u-E8EdfZQzyUZFY4CVbgUqR2H5e4TjQzi9MnzU';
 
 // ========== MIDDLEWARE ==========
 app.use(express.json());
@@ -60,7 +60,26 @@ const tronWeb = new TronWeb({
 const USDT_TRC20_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
 const USDT_BSC_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
 const USDC_BSC_CONTRACT = '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d';
-const MIN_DEPOSIT = 17;
+const MIN_DEPOSIT = 10; // ИЗМЕНЕНО С 17 НА 10
+
+// ========== NETWORK FIELD MAPPING ==========
+const networkFields = {
+  usdt_trc20: { 
+    addressField: 'usdt_trc20_address', 
+    privateKeyField: 'usdt_trc20_private_key',
+    contractAddress: USDT_TRC20_CONTRACT
+  },
+  usdt_bep20: { 
+    addressField: 'usdt_bep20_address', 
+    privateKeyField: 'usdt_bep20_private_key',
+    contractAddress: USDT_BSC_CONTRACT
+  },
+  usdc_bep20: { 
+    addressField: 'usdc_bep20_address', 
+    privateKeyField: 'usdc_bep20_private_key',
+    contractAddress: USDC_BSC_CONTRACT
+  }
+};
 
 // ========== OPTIMIZED SETTINGS ==========
 const TRC20_CHECK_INTERVAL = 45000; // 45 секунд
@@ -145,6 +164,7 @@ async function processDeposit(userId, amount, txid, network) {
 
 async function processDepositTransaction(userId, amount, txid, network) {
   try {
+    // 1. Создаем запись о депозите
     const { data: depositData, error: depositError } = await supabase
       .from('deposits')
       .insert({
@@ -169,17 +189,38 @@ async function processDepositTransaction(userId, amount, txid, network) {
       throw new Error(`Database error: ${depositError.message}`);
     }
 
-    const { data: userData, error: userError } = await supabase
-      .rpc('increment_user_balance', {
-        user_id: userId,
-        amount: amount
-      });
+    console.log(`💰 Created deposit record #${depositData.id} for user ${userId}, amount: $${amount}`);
 
-    if (userError) {
-      console.error('❌ User balance update error:', userError);
-      throw new Error(`Balance update failed: ${userError.message}`);
+    // 2. Обновляем баланс пользователя через RPC функцию
+    console.log(`📊 Calling increment_user_balance for user ${userId}, amount: ${amount}`);
+    
+    const { data: balanceResult, error: balanceError } = await supabase.rpc('increment_user_balance', {
+      user_id: userId,
+      amount: amount
+    });
+
+    if (balanceError) {
+      console.error('❌ User balance update error:', balanceError);
+      // Пробуем обновить вручную
+      const { error: manualUpdateError } = await supabase
+        .from('users')
+        .update({
+          balance: supabase.raw('balance + ?', [amount]),
+          total_deposit: supabase.raw('COALESCE(total_deposit, 0) + ?', [amount]),
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', userId);
+      
+      if (manualUpdateError) {
+        console.error('❌ Manual balance update also failed:', manualUpdateError);
+        throw new Error(`Balance update failed: ${balanceError.message}`);
+      }
+      console.log(`✅ Balance updated manually for user ${userId}`);
+    } else {
+      console.log(`✅ Balance updated via RPC for user ${userId}:`, balanceResult);
     }
 
+    // 3. Создаем запись в истории транзакций
     const { error: txError } = await supabase
       .from('transactions')
       .insert({
@@ -194,9 +235,11 @@ async function processDepositTransaction(userId, amount, txid, network) {
 
     if (txError) {
       console.error('❌ Transaction insert error:', txError);
+    } else {
+      console.log(`📝 Transaction record created for user ${userId}`);
     }
 
-    console.log(`✅ DEPOSIT PROCESSED: ${amount} for user ${userId}`);
+    console.log(`✅ DEPOSIT PROCESSED: $${amount} for user ${userId}`);
     console.log(`📝 Deposit ID: ${depositData.id}`);
 
     return { 
@@ -220,64 +263,74 @@ app.post('/api/deposit/generate', async (req, res) => {
 
     console.log(`🔐 Generating ${network} wallet for user: ${user_id}`);
 
-    const { data: existingWallet } = await supabase
+    // Проверяем поддерживаемую сеть
+    const fields = networkFields[network];
+    if (!fields) {
+      return res.status(400).json({ success: false, error: 'Unsupported network' });
+    }
+
+    const { addressField, privateKeyField } = fields;
+
+    // Проверяем существующий кошелек
+    const { data: existingWallet, error: walletError } = await supabase
       .from('user_wallets')
       .select('*')
       .eq('user_id', user_id)
       .single();
 
-    let address, private_key;
-    let walletField;
-
-    if (network === 'usdt_trc20') {
-      walletField = 'usdt_trc20_address';
-    } else if (network === 'usdt_bep20') {
-      walletField = 'usdt_bep20_address';
-    } else if (network === 'usdc_bep20') {
-      walletField = 'usdc_bep20_address';
-    } else {
-      return res.status(400).json({ success: false, error: 'Unsupported network' });
-    }
-
-    if (existingWallet && existingWallet[walletField]) {
-      console.log(`✅ Wallet already exists: ${existingWallet[walletField]}`);
+    let address, privateKey;
+    
+    // Если кошелек уже существует
+    if (existingWallet && existingWallet[addressField]) {
+      console.log(`✅ Wallet already exists: ${existingWallet[addressField]}`);
       return res.json({ 
         success: true, 
-        address: existingWallet[walletField], 
+        address: existingWallet[addressField], 
+        private_key: existingWallet[privateKeyField] || null,
         exists: true, 
         network 
       });
     }
 
+    // Генерируем новый кошелек
     if (network === 'usdt_trc20') {
       const wallet = await generateTRC20Wallet();
       address = wallet.address;
-      private_key = wallet.privateKey;
+      privateKey = wallet.privateKey;
     } else {
       const wallet = await generateBEP20Wallet();
       address = wallet.address;
-      private_key = wallet.privateKey;
+      privateKey = wallet.privateKey;
     }
 
+    console.log(`✅ Generated ${network} wallet: ${address}`);
+
+    // Сохраняем в базу данных
     if (existingWallet) {
+      // Обновляем существующий кошелек
+      const updateData = {
+        [addressField]: address,
+        [privateKeyField]: privateKey,
+        updated_at: new Date().toISOString()
+      };
+
       const { data, error } = await supabase
         .from('user_wallets')
-        .update({ 
-          [walletField]: address,
-          updated_at: new Date().toISOString()
-        })
+        .update(updateData)
         .eq('user_id', user_id)
         .select()
         .single();
 
       if (error) {
-        console.error('❌ Database error:', error);
+        console.error('❌ Database update error:', error);
         return res.status(500).json({ success: false, error: 'Failed to update wallet' });
       }
     } else {
+      // Создаем новый кошелек
       const walletData = {
         user_id: user_id,
-        [walletField]: address,
+        [addressField]: address,
+        [privateKeyField]: privateKey,
         default_network: network,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
@@ -290,13 +343,14 @@ app.post('/api/deposit/generate', async (req, res) => {
         .single();
 
       if (error) {
-        console.error('❌ Database error:', error);
+        console.error('❌ Database insert error:', error);
         return res.status(500).json({ success: false, error: 'Failed to save wallet' });
       }
     }
 
-    console.log(`✅ New ${network} wallet created: ${address}`);
-    
+    console.log(`✅ ${network} wallet saved to database with private key`);
+
+    // Запускаем проверку депозитов через 10 секунд
     setTimeout(() => {
       if (network === 'usdt_trc20') {
         checkUserTRC20Deposits(user_id);
@@ -308,7 +362,7 @@ app.post('/api/deposit/generate', async (req, res) => {
     res.json({ 
       success: true, 
       address: address, 
-      private_key: private_key,
+      private_key: privateKey,
       exists: false, 
       network: network 
     });
@@ -716,7 +770,8 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ MORALIS: API KEY SET`);
   console.log(`✅ TRC20 (USDT): Checking every 45 seconds`);
   console.log(`✅ BEP20 (USDT & USDC): Checking every 3 minutes`);
-  console.log(`✅ ATOMIC DEPOSITS: ENABLED`);
+  console.log(`✅ MINIMUM DEPOSIT: $${MIN_DEPOSIT} USDT`);
+  console.log(`✅ PRIVATE KEY SAVING: ENABLED`);
   console.log('===================================');
 });
 

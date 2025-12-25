@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 8080;
 // ========== CONFIGURATION ==========
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fctwivbwjoslkejtjxhe.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZjdHdpdmJ3am9zbGtlanRqeGhlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NjE0MzAzNSwiZXhwIjoyMDgxNzE5MDM1fQ.DiAzcqkigZPueh40idz2fIoJ-o-sKDMaRleOagH__B0';
-const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '8fa63ef4-f010-4ad2-a556-a7124563bafd';
+const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '33759ca3-ffb8-41bc-9036-25a32601eae2';
 const MORALIS_API_KEY = process.env.MORALIS_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjA2NTU1NTc1LWM1OGItNDVkYi1hM2NjLTMzYzgwNzhlMDIxMyIsIm9yZ0lkIjoiNDg1NTk3IiwidXNlcklkIjoiNDk5NTkwIiwidHlwZUlkIjoiOGJkYmI4MTctY2FjYy00MTNiLWE1NzAtOTIxNDRmNTYxYmZjIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjU0NTY4MzYsImV4cCI6NDkyMTIxNjgzNn0.FoutXU8bmSPbs2dDC2_5Qb8MuXNvEiLJfxSqOYjKNp0';
 
 // ========== MIDDLEWARE ==========

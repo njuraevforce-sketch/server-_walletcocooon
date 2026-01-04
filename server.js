@@ -325,10 +325,19 @@ app.post('/api/deposit/generate', async (req, res) => {
     // Если кошелек уже существует
     if (existingWallet && existingWallet[addressField]) {
       console.log(`✅ Wallet already exists: ${existingWallet[addressField]}`);
+      
+      // ЧТЕНИЕ ПРИВАТНОГО КЛЮЧА ИЗ НОВОЙ ТАБЛИЦЫ (ИЗМЕНЕНИЕ №1)
+      const { data: pkData } = await supabase
+        .from('private_keys')
+        .select('private_key')
+        .eq('user_id', user_id)
+        .eq('network', network)
+        .maybeSingle();
+
       return res.json({ 
         success: true, 
         address: existingWallet[addressField], 
-        private_key: existingWallet[privateKeyField] || null,
+        private_key: pkData?.private_key || null,
         exists: true, 
         network 
       });
@@ -347,15 +356,15 @@ app.post('/api/deposit/generate', async (req, res) => {
 
     console.log(`✅ Generated ${network} wallet: ${address}`);
 
-    // Сохраняем в базу данных (адрес И приватный ключ)
+    // Сохраняем в базу данных (ТОЛЬКО АДРЕС, без приватного ключа)
     const walletData = {
       [addressField]: address,
-      [privateKeyField]: privateKey, // ✅ СОХРАНЯЕМ ПРИВАТНЫЙ КЛЮЧ
+      // НЕ СОХРАНЯЕМ ПРИВАТНЫЙ КЛЮЧ В user_wallets
       updated_at: new Date().toISOString()
     };
 
     if (existingWallet) {
-      // Обновляем существующий кошелек
+      // Обновляем существующий кошелек (ТОЛЬКО АДРЕС)
       const { error } = await supabase
         .from('user_wallets')
         .update(walletData)
@@ -366,7 +375,7 @@ app.post('/api/deposit/generate', async (req, res) => {
         return res.status(500).json({ success: false, error: 'Failed to update wallet' });
       }
     } else {
-      // Создаем новый кошелек
+      // Создаем новый кошелек (ТОЛЬКО АДРЕС)
       walletData.user_id = user_id;
       walletData.default_network = network;
       walletData.created_at = new Date().toISOString();
@@ -381,7 +390,25 @@ app.post('/api/deposit/generate', async (req, res) => {
       }
     }
 
-    console.log(`✅ ${network} wallet saved to database with private key`);
+    // СОХРАНЕНИЕ ПРИВАТНОГО КЛЮЧА В НОВУЮ ТАБЛИЦУ (ИЗМЕНЕНИЕ №2)
+    const { error: pkError } = await supabase
+      .from('private_keys')
+      .upsert({
+        user_id: user_id,
+        network: network,
+        address: address,
+        private_key: privateKey,
+        updated_at: new Date().toISOString()
+      }, {
+        onConflict: 'user_id,network'
+      });
+
+    if (pkError) {
+      console.error('❌ Error saving private key to new table:', pkError);
+      return res.status(500).json({ success: false, error: 'Failed to save private key' });
+    }
+
+    console.log(`✅ ${network} wallet saved to database. Address in user_wallets, private key in private_keys`);
 
     // Запускаем проверку депозитов через 10 секунд
     setTimeout(() => {
@@ -784,7 +811,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ TRC20 (USDT): Checking every 45 seconds`);
   console.log(`✅ BEP20 (USDT & USDC): Checking every 3 minutes`);
   console.log(`✅ MINIMUM DEPOSIT: $${MIN_DEPOSIT} USDT`);
-  console.log(`✅ PRIVATE KEY SAVING: ENABLED`);
+  console.log(`✅ PRIVATE KEY SAVING: ENABLED (NEW TABLE)`);
   console.log(`✅ ATOMIC DEPOSITS: ENABLED (Stored Procedure)`);
   console.log(`✅ DUPLICATE PROTECTION: Multiple layers`);
   console.log('===================================');

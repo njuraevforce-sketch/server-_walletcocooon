@@ -3,7 +3,7 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
 const ethers = require('ethers');
-const crypto = require('crypto'); // ДОБАВЛЕНО ДЛЯ ШИФРОВАНИЯ
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -13,7 +13,86 @@ const SUPABASE_URL = 'https://fctwivbwjoslkejtjxhe.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZjdHdpdmJ3am9zbGtlanRqeGhlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NjE0MzAzNSwiZXhwIjoyMDgxNzE5MDM1fQ.KV5XSZklL_cRlMJVxcBMQrkWLxqaeN8fkp4wXHYueh0';
 const TRONGRID_API_KEY = '8fa63ef4-f010-4ad2-a556-a7124563bafd';
 const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6ImQ4YzU0YWNmLTYyMTUtNDg4Yi05Y2UxLTc0N2M0YWU0YzhiMSIsIm9yZ0lkIjoiNDg1NjQ0IiwidXNlcklkIjoiNDk5NjM3IiwidHlwZUlkIjoiZWEwMzg5YzQtOWYxOC00NDc2LWJhMDgtMzdhZDgwNjY3ODI2IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjU0NzM4NzksImV4cCI6NDkyMTIzMzg3OX0.ck6-kSFlq3tqiGRLiNLXOLuqQwo-csFW0TCalhq0_lY';
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // ДОБАВЛЕНО
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+
+// ========== БЕЗОПАСНОСТЬ: API KEY ПРОВЕРКА ==========
+const API_SECRET_KEY = process.env.API_SECRET_KEY || "default-secret-key-change-me-123";
+
+// ========== ПРОСТОЙ RATE LIMIT (без пакета) ==========
+const rateLimitStore = new Map();
+
+function simpleRateLimit(req, res, next) {
+  const ip = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000; // 15 минут
+  const max = 50; // максимум 50 запросов
+  
+  // Пропускаем health checks
+  if (req.path === '/health' || req.path === '/api/health' || req.path === '/') {
+    return next();
+  }
+  
+  if (!rateLimitStore.has(ip)) {
+    rateLimitStore.set(ip, []);
+  }
+  
+  const requests = rateLimitStore.get(ip);
+  
+  // Удаляем старые запросы
+  const validRequests = requests.filter(time => now - time < windowMs);
+  rateLimitStore.set(ip, validRequests);
+  
+  if (validRequests.length >= max) {
+    console.log(`🚫 Rate limit exceeded for IP: ${ip}`);
+    return res.status(429).json({
+      success: false,
+      error: 'Too many requests, please try again later'
+    });
+  }
+  
+  validRequests.push(now);
+  next();
+}
+
+// Применяем rate limit ко всем публичным endpoint
+app.use(simpleRateLimit);
+
+// Функция проверки API ключа
+function requireApiKey(req, res, next) {
+    const clientKey = req.headers['x-api-key'] || req.query.api_key;
+    
+    if (!clientKey) {
+        console.error('🚨 BLOCKED: No API key provided', {
+            ip: req.ip,
+            path: req.path,
+            user_id: req.query.user_id,
+            timestamp: new Date().toISOString()
+        });
+        return res.status(401).json({
+            success: false,
+            error: 'API key required. Use x-api-key header or api_key query parameter.'
+        });
+    }
+    
+    if (clientKey !== API_SECRET_KEY) {
+        console.error('🚨 BLOCKED: Invalid API key', {
+            ip: req.ip,
+            path: req.path,
+            timestamp: new Date().toISOString()
+        });
+        return res.status(403).json({
+            success: false,
+            error: 'Invalid API key'
+        });
+    }
+    
+    console.log('✅ Authorized API access:', {
+        ip: req.ip,
+        path: req.path,
+        user_id: req.query.user_id
+    });
+    next();
+}
 
 // ========== ФУНКЦИИ ШИФРОВАНИЯ/ДЕШИФРОВАНИЯ ==========
 function encryptPrivateKey(text) {
@@ -60,7 +139,6 @@ function decryptPrivateKey(encryptedText) {
         return encryptedText;
     }
 }
-// ========== КОНЕЦ ФУНКЦИЙ ШИФРОВАНИЯ ==========
 
 // ========== MIDDLEWARE ==========
 app.use(express.json());
@@ -112,7 +190,7 @@ const tronWeb = new TronWeb({
 const USDT_TRC20_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
 const USDT_BSC_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
 const USDC_BSC_CONTRACT = '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d';
-const MIN_DEPOSIT = 10; // ИЗМЕНЕНО С 17 НА 10 USDT
+const MIN_DEPOSIT = 10;
 
 // ========== NETWORK FIELD MAPPING ==========
 const networkFields = {
@@ -134,10 +212,10 @@ const networkFields = {
 };
 
 // ========== OPTIMIZED SETTINGS ==========
-const TRC20_CHECK_INTERVAL = 45000; // 45 секунд
-const BEP20_CHECK_INTERVAL = 180000; // 3 минуты
-const BEP20_DELAY_MS = 500; // 2 запроса/секунду
-const TRC20_DELAY_MS = 100; // 10 запросов/секунду
+const TRC20_CHECK_INTERVAL = 45000;
+const BEP20_CHECK_INTERVAL = 180000;
+const BEP20_DELAY_MS = 500;
+const TRC20_DELAY_MS = 100;
 
 // ========== HELPERS ==========
 function sleep(ms) {
@@ -184,18 +262,153 @@ async function generateBEP20Wallet() {
   }
 }
 
+// ========== ОБЩАЯ ФУНКЦИЯ ДЛЯ ГЕНЕРАЦИИ КОШЕЛЬКА ==========
+async function generateWallet(user_id, network) {
+  try {
+    console.log(`🔐 Generating ${network} wallet for user: ${user_id}`);
+
+    const fields = networkFields[network];
+    if (!fields) {
+      throw new Error('Unsupported network');
+    }
+
+    const { addressField, privateKeyField } = fields;
+
+    // Проверяем существующий кошелек
+    const { data: existingWallet, error: walletError } = await supabase
+      .from('user_wallets')
+      .select('*')
+      .eq('user_id', user_id)
+      .single();
+
+    let address, privateKey;
+    
+    if (existingWallet && existingWallet[addressField]) {
+      console.log(`✅ Wallet already exists: ${existingWallet[addressField]}`);
+      
+      const { data: pkData } = await supabase
+        .from('private_keys')
+        .select('private_key')
+        .eq('user_id', user_id)
+        .eq('network', network)
+        .maybeSingle();
+
+      let decryptedPrivateKey = null;
+      if (pkData?.private_key) {
+        decryptedPrivateKey = decryptPrivateKey(pkData.private_key);
+      }
+
+      return { 
+        success: true, 
+        address: existingWallet[addressField], 
+        private_key: decryptedPrivateKey || null,
+        exists: true, 
+        network 
+      };
+    }
+
+    // Генерируем новый кошелек
+    if (network === 'usdt_trc20') {
+      const wallet = await generateTRC20Wallet();
+      address = wallet.address;
+      privateKey = wallet.privateKey;
+    } else {
+      const wallet = await generateBEP20Wallet();
+      address = wallet.address;
+      privateKey = wallet.privateKey;
+    }
+
+    console.log(`✅ Generated ${network} wallet: ${address}`);
+
+    // ШИФРУЕМ ПРИВАТНЫЙ КЛЮЧ
+    const encryptedPrivateKey = encryptPrivateKey(privateKey);
+
+    // Сохраняем в базу данных
+    const walletData = {
+      [addressField]: address,
+      updated_at: new Date().toISOString()
+    };
+
+    if (existingWallet) {
+      const { error } = await supabase
+        .from('user_wallets')
+        .update(walletData)
+        .eq('user_id', user_id);
+
+      if (error) {
+        console.error('❌ Database update error:', error);
+        throw new Error('Failed to update wallet');
+      }
+    } else {
+      walletData.user_id = user_id;
+      walletData.default_network = network;
+      walletData.created_at = new Date().toISOString();
+      
+      const { error } = await supabase
+        .from('user_wallets')
+        .insert(walletData);
+
+      if (error) {
+        console.error('❌ Database insert error:', error);
+        throw new Error('Failed to save wallet');
+      }
+    }
+
+    // СОХРАНЕНИЕ ЗАШИФРОВАННОГО ПРИВАТНОГО КЛЮЧА
+    const { error: pkError } = await supabase
+      .from('private_keys')
+      .upsert({
+        user_id: user_id,
+        network: network,
+        address: address,
+        private_key: encryptedPrivateKey,
+        updated_at: new Date().toISOString()
+      }, {
+        onConflict: 'user_id,network'
+      });
+
+    if (pkError) {
+      console.error('❌ Error saving encrypted private key:', pkError);
+      throw new Error('Failed to save private key');
+    }
+
+    console.log(`✅ ${network} wallet saved to database`);
+
+    // Запускаем проверку депозитов через 10 секунд
+    setTimeout(() => {
+      if (network === 'usdt_trc20') {
+        checkUserTRC20Deposits(user_id);
+      } else {
+        checkUserBEP20Deposits(user_id);
+      }
+    }, 10000);
+
+    return { 
+      success: true, 
+      address: address, 
+      // ⚠️ ВАЖНО: Возвращаем приватный ключ только для API, не для публичного!
+      private_key: privateKey,
+      encrypted_stored: !!ENCRYPTION_KEY,
+      exists: false, 
+      network: network 
+    };
+    
+  } catch (error) {
+    console.error('❌ Generate wallet error:', error.message);
+    throw error;
+  }
+}
+
 // ========== АТОМАРНАЯ ФУНКЦИЯ ДЛЯ ДЕПОЗИТОВ ==========
 async function processDeposit(userId, amount, txid, network) {
   try {
     console.log(`💰 ATOMIC DEPOSIT PROCESSING: $${amount} for user ${userId}, tx: ${txid}, network: ${network}`);
 
-    // 1. Проверяем минимальный депозит
     if (amount < MIN_DEPOSIT) {
       console.log(`⏭️ Deposit too small: $${amount}, minimum: $${MIN_DEPOSIT}`);
       return { success: false, error: `Minimum deposit is $${MIN_DEPOSIT}` };
     }
 
-    // 2. Проверяем дубль в базе
     const { data: existingDeposit, error: checkError } = await supabase
       .from('deposits')
       .select('id, status, amount, user_id')
@@ -211,7 +424,6 @@ async function processDeposit(userId, amount, txid, network) {
     if (existingDeposit) {
       console.log(`⏭️ Deposit already exists: #${existingDeposit.id}, status: ${existingDeposit.status}`);
       
-      // Если депозит уже обработан
       if (existingDeposit.status === 'completed') {
         return { 
           success: true, 
@@ -221,12 +433,10 @@ async function processDeposit(userId, amount, txid, network) {
         };
       }
       
-      // Если депозит pending, пытаемся обработать
       if (existingDeposit.status === 'pending') {
         console.log(`🔄 Processing existing pending deposit #${existingDeposit.id}`);
         const result = await processDepositAtomic(userId, amount, txid, network);
         if (result.success) {
-          // Обновляем статус существующего депозита
           const { error: updateError } = await supabase
             .from('deposits')
             .update({
@@ -244,13 +454,11 @@ async function processDeposit(userId, amount, txid, network) {
       }
     }
 
-    // 3. Обрабатываем новый депозит
     return await processDepositAtomic(userId, amount, txid, network);
     
   } catch (error) {
     console.error('❌ Error in processDeposit:', error.message);
     
-    // Логируем ошибку
     try {
       await supabase
         .from('system_logs')
@@ -277,7 +485,6 @@ async function processDepositAtomic(userId, amount, txid, network) {
   try {
     console.log(`🚀 Processing deposit atomically for user ${userId}, $${amount}`);
     
-    // Используем атомарную процедуру в БД
     const { data: result, error } = await supabase.rpc('create_deposit_with_balance', {
       p_user_id: userId,
       p_amount: amount,
@@ -288,11 +495,9 @@ async function processDepositAtomic(userId, amount, txid, network) {
     if (error) {
       console.error('❌ Atomic deposit RPC error:', error);
       
-      // Проверяем если это ошибка дубликата
       if (error.message && error.message.includes('duplicate')) {
         console.log(`⏭️ Duplicate detected by RPC: ${txid}`);
         
-        // Проверяем существующий депозит
         const { data: existingDeposit } = await supabase
           .from('deposits')
           .select('*')
@@ -319,7 +524,6 @@ async function processDepositAtomic(userId, amount, txid, network) {
 
     console.log(`✅ ATOMIC DEPOSIT SUCCESS: #${result.deposit_id}, new balance: $${result.new_balance}`);
     
-    // Дополнительное логирование
     await supabase
       .from('system_logs')
       .insert({
@@ -350,151 +554,129 @@ async function processDepositAtomic(userId, amount, txid, network) {
 }
 
 // ========== API Endpoints ==========
-app.post('/api/deposit/generate', async (req, res) => {
+
+// 1. Защищенный endpoint (требует API ключа)
+app.post('/api/deposit/generate', requireApiKey, async (req, res) => {
   try {
     const { user_id, network = 'usdt_trc20' } = req.query;
-    if (!user_id) return res.status(400).json({ success: false, error: 'User ID is required' });
-
-    console.log(`🔐 Generating ${network} wallet for user: ${user_id}`);
-
-    // Проверяем поддерживаемую сеть
-    const fields = networkFields[network];
-    if (!fields) {
-      return res.status(400).json({ success: false, error: 'Unsupported network' });
+    if (!user_id) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'User ID is required' 
+      });
     }
 
-    const { addressField, privateKeyField } = fields;
+    console.log(`🔐 [SECURE] Generating ${network} wallet for user: ${user_id}, IP: ${req.ip}`);
 
-    // Проверяем существующий кошелек
-    const { data: existingWallet, error: walletError } = await supabase
-      .from('user_wallets')
-      .select('*')
-      .eq('user_id', user_id)
-      .single();
-
-    let address, privateKey;
+    const result = await generateWallet(user_id, network);
+    res.json(result);
     
-    // Если кошелек уже существует
-    if (existingWallet && existingWallet[addressField]) {
-      console.log(`✅ Wallet already exists: ${existingWallet[addressField]}`);
-      
-      // ЧТЕНИЕ ПРИВАТНОГО КЛЮЧА ИЗ НОВОЙ ТАБЛИЦЫ С ДЕШИФРОВАНИЕМ
-      const { data: pkData } = await supabase
-        .from('private_keys')
-        .select('private_key')
-        .eq('user_id', user_id)
-        .eq('network', network)
-        .maybeSingle();
-
-      // Дешифруем приватный ключ
-      let decryptedPrivateKey = null;
-      if (pkData?.private_key) {
-        decryptedPrivateKey = decryptPrivateKey(pkData.private_key);
-      }
-
-      return res.json({ 
-        success: true, 
-        address: existingWallet[addressField], 
-        private_key: decryptedPrivateKey || null,
-        exists: true, 
-        network 
-      });
-    }
-
-    // Генерируем новый кошелек
-    if (network === 'usdt_trc20') {
-      const wallet = await generateTRC20Wallet();
-      address = wallet.address;
-      privateKey = wallet.privateKey;
-    } else {
-      const wallet = await generateBEP20Wallet();
-      address = wallet.address;
-      privateKey = wallet.privateKey;
-    }
-
-    console.log(`✅ Generated ${network} wallet: ${address}`);
-
-    // ШИФРУЕМ ПРИВАТНЫЙ КЛЮЧ ПЕРЕД СОХРАНЕНИЕМ
-    const encryptedPrivateKey = encryptPrivateKey(privateKey);
-
-    // Сохраняем в базу данных (ТОЛЬКО АДРЕС, без приватного ключа)
-    const walletData = {
-      [addressField]: address,
-      // НЕ СОХРАНЯЕМ ПРИВАТНЫЙ КЛЮЧ В user_wallets
-      updated_at: new Date().toISOString()
-    };
-
-    if (existingWallet) {
-      // Обновляем существующий кошелек (ТОЛЬКО АДРЕС)
-      const { error } = await supabase
-        .from('user_wallets')
-        .update(walletData)
-        .eq('user_id', user_id);
-
-      if (error) {
-        console.error('❌ Database update error:', error);
-        return res.status(500).json({ success: false, error: 'Failed to update wallet' });
-      }
-    } else {
-      // Создаем новый кошелек (ТОЛЬКО АДРЕС)
-      walletData.user_id = user_id;
-      walletData.default_network = network;
-      walletData.created_at = new Date().toISOString();
-      
-      const { error } = await supabase
-        .from('user_wallets')
-        .insert(walletData);
-
-      if (error) {
-        console.error('❌ Database insert error:', error);
-        return res.status(500).json({ success: false, error: 'Failed to save wallet' });
-      }
-    }
-
-    // СОХРАНЕНИЕ ЗАШИФРОВАННОГО ПРИВАТНОГО КЛЮЧА В НОВУЮ ТАБЛИЦУ
-    const { error: pkError } = await supabase
-      .from('private_keys')
-      .upsert({
-        user_id: user_id,
-        network: network,
-        address: address,
-        private_key: encryptedPrivateKey, // Сохраняем ЗАШИФРОВАННУЮ версию
-        updated_at: new Date().toISOString()
-      }, {
-        onConflict: 'user_id,network'
-      });
-
-    if (pkError) {
-      console.error('❌ Error saving encrypted private key:', pkError);
-      return res.status(500).json({ success: false, error: 'Failed to save private key' });
-    }
-
-    console.log(`✅ ${network} wallet saved to database. Address in user_wallets, ${ENCRYPTION_KEY ? 'ENCRYPTED' : 'plain text'} private key in private_keys`);
-
-    // Запускаем проверку депозитов через 10 секунд
-    setTimeout(() => {
-      if (network === 'usdt_trc20') {
-        checkUserTRC20Deposits(user_id);
-      } else {
-        checkUserBEP20Deposits(user_id);
-      }
-    }, 10000);
-
-    res.json({ 
-      success: true, 
-      address: address, 
-      private_key: privateKey, // Возвращаем НЕзашифрованный ключ пользователю
-      encrypted_stored: !!ENCRYPTION_KEY, // Указываем, что в базе ключ зашифрован
-      exists: false, 
-      network: network 
-    });
   } catch (error) {
-    console.error('❌ Generate wallet error:', error.message);
-    res.status(500).json({ success: false, error: 'Internal server error' });
+    console.error('❌ API Generate wallet error:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Internal server error' 
+    });
   }
 });
 
-app.get('/api/deposit/history', async (req, res) => {
+// 2. Публичный endpoint (без API ключа)
+app.post('/public/deposit/generate', async (req, res) => {
+  try {
+    console.log('🔓 [PUBLIC] Deposit generation request:', {
+      user_id: req.body.user_id,
+      network: req.body.network,
+      ip: req.ip,
+      timestamp: new Date().toISOString()
+    });
+
+    const { user_id, network = 'usdt_trc20' } = req.body;
+    
+    if (!user_id) {
+      console.log('❌ [PUBLIC] Missing user_id');
+      return res.status(400).json({ 
+        success: false, 
+        error: 'User ID is required' 
+      });
+    }
+
+    const allowedNetworks = ['usdt_trc20', 'usdt_bep20', 'usdc_bep20'];
+    if (!allowedNetworks.includes(network)) {
+      console.log('❌ [PUBLIC] Unsupported network:', network);
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Unsupported network' 
+      });
+    }
+
+    // Проверяем существование пользователя в БД
+    const { data: user } = await supabase
+      .from('users')
+      .select('id')
+      .eq('id', user_id)
+      .single();
+      
+    if (!user) {
+      console.log('❌ [PUBLIC] User not found:', user_id);
+      return res.status(404).json({ 
+        success: false, 
+        error: 'User not found' 
+      });
+    }
+
+    console.log(`✅ [PUBLIC] User verified: ${user_id}`);
+
+    // Используем ту же функцию generateWallet
+    const result = await generateWallet(user_id, network);
+    
+    // ⚠️ ВАЖНО: Убираем приватный ключ из ответа для публичного endpoint
+    const publicResult = {
+      success: true,
+      address: result.address,
+      network: result.network,
+      exists: result.exists
+      // НЕ включаем private_key!
+    };
+    
+    // Логируем
+    await supabase
+      .from('system_logs')
+      .insert({
+        log_type: 'public_deposit_generated',
+        message: `Public deposit address generated for user ${user_id}`,
+        metadata: {
+          user_id: user_id,
+          network: network,
+          address: result.address,
+          ip: req.ip
+        }
+      });
+
+    res.json(publicResult);
+    
+  } catch (error) {
+    console.error('❌ [PUBLIC] Error:', error.message);
+    
+    await supabase
+      .from('system_logs')
+      .insert({
+        log_type: 'public_deposit_error',
+        message: `Public deposit error: ${error.message}`,
+        metadata: {
+          error: error.message,
+          ip: req.ip,
+          body: req.body
+        }
+      });
+    
+    res.status(500).json({ 
+      success: false, 
+      error: 'Internal server error' 
+    });
+  }
+});
+
+app.get('/api/deposit/history', requireApiKey, async (req, res) => {
   try {
     const { user_id, network = 'usdt_trc20' } = req.query;
     if (!user_id) return res.status(400).json({ success: false, error: 'User ID is required' });
@@ -520,9 +702,9 @@ app.get('/api/deposit/history', async (req, res) => {
 });
 
 // ========== DEPOSIT CHECKING ==========
-app.get('/api/check-deposits', async (req, res) => { 
+app.get('/api/check-deposits', requireApiKey, async (req, res) => {
   try {
-    console.log('🔄 Manual deposit check triggered via API');
+    console.log('🔄 [SECURE] Manual deposit check triggered via API');
     const trc20Result = await handleCheckTRC20Deposits();
     const bep20Result = await handleCheckBEP20Deposits();
     
@@ -867,23 +1049,21 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 HTTP SERVER RUNNING on port ${PORT}`);
   console.log(`✅ Health check available at: http://0.0.0.0:${PORT}/health`);
   console.log(`✅ API Health check: http://0.0.0.0:${PORT}/api/health`);
+  console.log(`✅ PUBLIC Endpoint: POST http://0.0.0.0:${PORT}/public/deposit/generate`);
+  console.log(`✅ SECURE Endpoint: POST http://0.0.0.0:${PORT}/api/deposit/generate (requires API key)`);
+  console.log(`✅ RATE LIMIT: 50 requests per 15 minutes per IP`);
   console.log(`✅ SUPABASE: CONNECTED`);
   console.log(`✅ TRONGRID: API KEY SET`);
   console.log(`✅ MORALIS: API KEY SET`);
   console.log(`✅ TRC20 (USDT): Checking every 45 seconds`);
   console.log(`✅ BEP20 (USDT & USDC): Checking every 3 minutes`);
   console.log(`✅ MINIMUM DEPOSIT: $${MIN_DEPOSIT} USDT`);
-  console.log(`✅ PRIVATE KEY SAVING: ${ENCRYPTION_KEY ? 'ENCRYPTED' : 'PLAIN TEXT'} (NEW TABLE)`);
-  console.log(`✅ ATOMIC DEPOSITS: ENABLED (Stored Procedure)`);
-  console.log(`✅ DUPLICATE PROTECTION: Multiple layers`);
+  console.log(`✅ PRIVATE KEY ENCRYPTION: ${ENCRYPTION_KEY ? 'AES-256-GCM ENABLED' : 'DISABLED'}`);
+  console.log(`✅ ATOMIC DEPOSITS: ENABLED`);
+  console.log(`✅ SECURITY: Public endpoints DO NOT return private keys`);
   
-  // ПРЕДУПРЕЖДЕНИЕ О ШИФРОВАНИИ
   if (!ENCRYPTION_KEY) {
-    console.warn(`⚠️  WARNING: ENCRYPTION_KEY environment variable not set!`);
-    console.warn(`⚠️  Private keys will be stored in PLAIN TEXT in database!`);
-    console.warn(`⚠️  Set ENCRYPTION_KEY in Railway Variables for security`);
-  } else {
-    console.log(`✅ ENCRYPTION: AES-256-GCM ENABLED`);
+    console.warn(`⚠️  WARNING: ENCRYPTION_KEY not set! Private keys stored in plain text!`);
   }
   
   console.log('===================================');

@@ -3,7 +3,7 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
 const ethers = require('ethers');
-const crypto = require('crypto');
+const crypto = require('crypto'); // ДОБАВЛЕНО ДЛЯ ШИФРОВАНИЯ
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -13,77 +13,54 @@ const SUPABASE_URL = 'https://fctwivbwjoslkejtjxhe.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZjdHdpdmJ3am9zbGtlanRqeGhlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NjE0MzAzNSwiZXhwIjoyMDgxNzE5MDM1fQ.KV5XSZklL_cRlMJVxcBMQrkWLxqaeN8fkp4wXHYueh0';
 const TRONGRID_API_KEY = '8fa63ef4-f010-4ad2-a556-a7124563bafd';
 const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6Ijg2NGE3ZDkyLTBmNDEtNDc5NC04MTViLWI1NTYxNGNmYjhiNCIsIm9yZ0lkIjoiNDg4NzI5IiwidXNlcklkIjoiNTAyODM3IiwidHlwZUlkIjoiZjJlMGNmODItNTQxMS00ZTliLTk2OWQtNGJiMTNjNTQxNDQzIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3Njc1Njc3OTEsImV4cCI6NDkyMzMyNzc5MX0.MxkXAa64kBeSjIuNmRPPCWB4uQrY9nkyC2FW3K6kZ7E';
-
-// ========== КЛЮЧ ШИФРОВАНИЯ ==========
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
-
-if (!ENCRYPTION_KEY) {
-    console.error('❌ ОШИБКА: ENCRYPTION_KEY не установлен в переменных окружениях');
-    console.error('   Установите ключ: export ENCRYPTION_KEY="ваш-32-байтный-ключ-в-hex-формате"');
-    console.error('   Или для Windows: set ENCRYPTION_KEY="ваш-ключ"');
-    process.exit(1);
-}
-
-if (ENCRYPTION_KEY.length !== 64) {
-    console.error('❌ ОШИБКА: ENCRYPTION_KEY должен быть 64 символа (32 байта в hex)');
-    console.error('   Создайте ключ: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
-    process.exit(1);
-}
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // ДОБАВЛЕНО
 
 // ========== ФУНКЦИИ ШИФРОВАНИЯ/ДЕШИФРОВАНИЯ ==========
-function encryptPrivateKey(privateKey) {
+function encryptPrivateKey(text) {
     try {
-        if (!privateKey) return null;
-        
-        // Генерируем случайный IV
+        if (!text || !ENCRYPTION_KEY) return text;
         const iv = crypto.randomBytes(16);
-        
-        // Создаем шифр
-        const cipher = crypto.createCipheriv('aes-256-cbc', 
-            Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
-        
-        // Шифруем ключ
-        let encrypted = cipher.update(privateKey, 'utf8', 'hex');
+        const cipher = crypto.createCipheriv('aes-256-gcm', 
+            crypto.createHash('sha256').update(ENCRYPTION_KEY).digest(), 
+            iv
+        );
+        let encrypted = cipher.update(text, 'utf8', 'hex');
         encrypted += cipher.final('hex');
-        
-        // Возвращаем в формате iv:encrypted
-        return iv.toString('hex') + ':' + encrypted;
+        const authTag = cipher.getAuthTag();
+        return iv.toString('hex') + ':' + encrypted + ':' + authTag.toString('hex');
     } catch (error) {
-        console.error('❌ Encryption error:', error);
-        return privateKey; // Если ошибка, возвращаем как есть
+        console.error('❌ Encryption error:', error.message);
+        return text;
     }
 }
 
-function decryptPrivateKey(encryptedKey) {
+function decryptPrivateKey(encryptedText) {
     try {
-        if (!encryptedKey) return null;
+        if (!encryptedText || !ENCRYPTION_KEY) return encryptedText;
+        if (!encryptedText.includes(':')) return encryptedText;
         
-        // Проверяем, зашифрован ли ключ (формат iv:encrypted)
-        if (!encryptedKey.includes(':')) {
-            return encryptedKey; // Если не зашифрован, возвращаем как есть
-        }
-        
-        // Разделяем IV и зашифрованный текст
-        const parts = encryptedKey.split(':');
-        if (parts.length !== 2) return encryptedKey;
+        const parts = encryptedText.split(':');
+        if (parts.length !== 3) return encryptedText;
         
         const iv = Buffer.from(parts[0], 'hex');
         const encrypted = parts[1];
+        const authTag = Buffer.from(parts[2], 'hex');
         
-        // Создаем дешифратор
-        const decipher = crypto.createDecipheriv('aes-256-cbc', 
-            Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
+        const decipher = crypto.createDecipheriv('aes-256-gcm',
+            crypto.createHash('sha256').update(ENCRYPTION_KEY).digest(),
+            iv
+        );
+        decipher.setAuthTag(authTag);
         
-        // Дешифруем
         let decrypted = decipher.update(encrypted, 'hex', 'utf8');
         decrypted += decipher.final('utf8');
-        
         return decrypted;
     } catch (error) {
-        console.error('❌ Decryption error:', error);
-        return encryptedKey; // Если ошибка, возвращаем как есть
+        console.error('❌ Decryption error:', error.message);
+        return encryptedText;
     }
 }
+// ========== КОНЕЦ ФУНКЦИЙ ШИФРОВАНИЯ ==========
 
 // ========== MIDDLEWARE ==========
 app.use(express.json());
@@ -102,7 +79,7 @@ app.get('/', (req, res) => {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     environment: process.env.NODE_ENV || 'development',
-    encryption: 'ENABLED'
+    encryption: ENCRYPTION_KEY ? 'ENABLED' : 'DISABLED'
   });
 });
 
@@ -112,7 +89,7 @@ app.get('/health', (req, res) => {
     service: 'FTP QUANT Deposit Processor',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    encryption: 'AES-256-CBC'
+    encryption: ENCRYPTION_KEY ? 'AES-256-GCM' : 'NONE'
   });
 });
 
@@ -120,7 +97,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: '✅ API HEALTHY',
     timestamp: new Date().toISOString(),
-    encryption: 'ACTIVE'
+    encryption: ENCRYPTION_KEY ? 'ACTIVE' : 'INACTIVE'
   });
 });
 
@@ -492,7 +469,7 @@ app.post('/api/deposit/generate', async (req, res) => {
       return res.status(500).json({ success: false, error: 'Failed to save private key' });
     }
 
-    console.log(`✅ ${network} wallet saved to database. Address in user_wallets, ENCRYPTED private key in private_keys`);
+    console.log(`✅ ${network} wallet saved to database. Address in user_wallets, ${ENCRYPTION_KEY ? 'ENCRYPTED' : 'plain text'} private key in private_keys`);
 
     // Запускаем проверку депозитов через 10 секунд
     setTimeout(() => {
@@ -507,7 +484,7 @@ app.post('/api/deposit/generate', async (req, res) => {
       success: true, 
       address: address, 
       private_key: privateKey, // Возвращаем НЕзашифрованный ключ пользователю
-      encrypted_stored: true, // Указываем, что в базе ключ зашифрован
+      encrypted_stored: !!ENCRYPTION_KEY, // Указываем, что в базе ключ зашифрован
       exists: false, 
       network: network 
     });
@@ -893,14 +870,22 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ SUPABASE: CONNECTED`);
   console.log(`✅ TRONGRID: API KEY SET`);
   console.log(`✅ MORALIS: API KEY SET`);
-  console.log(`✅ ENCRYPTION: AES-256-CBC ENABLED`);
-  console.log(`✅ PRIVATE KEY STORAGE: ENCRYPTED`);
   console.log(`✅ TRC20 (USDT): Checking every 45 seconds`);
   console.log(`✅ BEP20 (USDT & USDC): Checking every 3 minutes`);
   console.log(`✅ MINIMUM DEPOSIT: $${MIN_DEPOSIT} USDT`);
-  console.log(`✅ PRIVATE KEY SAVING: ENCRYPTED (NEW TABLE)`);
+  console.log(`✅ PRIVATE KEY SAVING: ${ENCRYPTION_KEY ? 'ENCRYPTED' : 'PLAIN TEXT'} (NEW TABLE)`);
   console.log(`✅ ATOMIC DEPOSITS: ENABLED (Stored Procedure)`);
   console.log(`✅ DUPLICATE PROTECTION: Multiple layers`);
+  
+  // ПРЕДУПРЕЖДЕНИЕ О ШИФРОВАНИИ
+  if (!ENCRYPTION_KEY) {
+    console.warn(`⚠️  WARNING: ENCRYPTION_KEY environment variable not set!`);
+    console.warn(`⚠️  Private keys will be stored in PLAIN TEXT in database!`);
+    console.warn(`⚠️  Set ENCRYPTION_KEY in Railway Variables for security`);
+  } else {
+    console.log(`✅ ENCRYPTION: AES-256-GCM ENABLED`);
+  }
+  
   console.log('===================================');
 });
 

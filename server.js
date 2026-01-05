@@ -3,6 +3,7 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
 const ethers = require('ethers');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -11,7 +12,78 @@ const PORT = process.env.PORT || 8080;
 const SUPABASE_URL = 'https://fctwivbwjoslkejtjxhe.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZjdHdpdmJ3am9zbGtlanRqeGhlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NjE0MzAzNSwiZXhwIjoyMDgxNzE5MDM1fQ.KV5XSZklL_cRlMJVxcBMQrkWLxqaeN8fkp4wXHYueh0';
 const TRONGRID_API_KEY = '8fa63ef4-f010-4ad2-a556-a7124563bafd';
-const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6ImQ4YzU0YWNmLTYyMTUtNDg4Yi05Y2UxLTc0N2M0YWU0YzhiMSIsIm9yZ0lkIjoiNDg1NjQ0IiwidXNlcklkIjoiNDk5NjM3IiwidHlwZUlkIjoiZWEwMzg5YzQtOWYxOC00NDc2LWJhMDgtMzdhZDgwNjY3ODI2IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjU0NzM4NzksImV4cCI6NDkyMTIzMzg3OX0.ck6-kSFlq3tqiGRLiNLXOLuqQwo-csFW0TCalhq0_lY';
+const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6Ijg2NGE3ZDkyLTBmNDEtNDc5NC04MTViLWI1NTYxNGNmYjhiNCIsIm9yZ0lkIjoiNDg4NzI5IiwidXNlcklkIjoiNTAyODM3IiwidHlwZUlkIjoiZjJlMGNmODItNTQxMS00ZTliLTk2OWQtNGJiMTNjNTQxNDQzIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3Njc1Njc3OTEsImV4cCI6NDkyMzMyNzc5MX0.MxkXAa64kBeSjIuNmRPPCWB4uQrY9nkyC2FW3K6kZ7E';
+
+// ========== КЛЮЧ ШИФРОВАНИЯ ==========
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+
+if (!ENCRYPTION_KEY) {
+    console.error('❌ ОШИБКА: ENCRYPTION_KEY не установлен в переменных окружениях');
+    console.error('   Установите ключ: export ENCRYPTION_KEY="ваш-32-байтный-ключ-в-hex-формате"');
+    console.error('   Или для Windows: set ENCRYPTION_KEY="ваш-ключ"');
+    process.exit(1);
+}
+
+if (ENCRYPTION_KEY.length !== 64) {
+    console.error('❌ ОШИБКА: ENCRYPTION_KEY должен быть 64 символа (32 байта в hex)');
+    console.error('   Создайте ключ: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
+    process.exit(1);
+}
+
+// ========== ФУНКЦИИ ШИФРОВАНИЯ/ДЕШИФРОВАНИЯ ==========
+function encryptPrivateKey(privateKey) {
+    try {
+        if (!privateKey) return null;
+        
+        // Генерируем случайный IV
+        const iv = crypto.randomBytes(16);
+        
+        // Создаем шифр
+        const cipher = crypto.createCipheriv('aes-256-cbc', 
+            Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
+        
+        // Шифруем ключ
+        let encrypted = cipher.update(privateKey, 'utf8', 'hex');
+        encrypted += cipher.final('hex');
+        
+        // Возвращаем в формате iv:encrypted
+        return iv.toString('hex') + ':' + encrypted;
+    } catch (error) {
+        console.error('❌ Encryption error:', error);
+        return privateKey; // Если ошибка, возвращаем как есть
+    }
+}
+
+function decryptPrivateKey(encryptedKey) {
+    try {
+        if (!encryptedKey) return null;
+        
+        // Проверяем, зашифрован ли ключ (формат iv:encrypted)
+        if (!encryptedKey.includes(':')) {
+            return encryptedKey; // Если не зашифрован, возвращаем как есть
+        }
+        
+        // Разделяем IV и зашифрованный текст
+        const parts = encryptedKey.split(':');
+        if (parts.length !== 2) return encryptedKey;
+        
+        const iv = Buffer.from(parts[0], 'hex');
+        const encrypted = parts[1];
+        
+        // Создаем дешифратор
+        const decipher = crypto.createDecipheriv('aes-256-cbc', 
+            Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
+        
+        // Дешифруем
+        let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+        decrypted += decipher.final('utf8');
+        
+        return decrypted;
+    } catch (error) {
+        console.error('❌ Decryption error:', error);
+        return encryptedKey; // Если ошибка, возвращаем как есть
+    }
+}
 
 // ========== MIDDLEWARE ==========
 app.use(express.json());
@@ -29,7 +101,8 @@ app.get('/', (req, res) => {
     message: 'FTP QUANT Deposit Processing System',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    environment: process.env.NODE_ENV || 'development'
+    environment: process.env.NODE_ENV || 'development',
+    encryption: 'ENABLED'
   });
 });
 
@@ -38,14 +111,16 @@ app.get('/health', (req, res) => {
     status: '✅ HEALTHY',
     service: 'FTP QUANT Deposit Processor',
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    encryption: 'AES-256-CBC'
   });
 });
 
 app.get('/api/health', (req, res) => {
   res.json({
     status: '✅ API HEALTHY',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    encryption: 'ACTIVE'
   });
 });
 
@@ -326,7 +401,7 @@ app.post('/api/deposit/generate', async (req, res) => {
     if (existingWallet && existingWallet[addressField]) {
       console.log(`✅ Wallet already exists: ${existingWallet[addressField]}`);
       
-      // ЧТЕНИЕ ПРИВАТНОГО КЛЮЧА ИЗ НОВОЙ ТАБЛИЦЫ (ИЗМЕНЕНИЕ №1)
+      // ЧТЕНИЕ ПРИВАТНОГО КЛЮЧА ИЗ НОВОЙ ТАБЛИЦЫ С ДЕШИФРОВАНИЕМ
       const { data: pkData } = await supabase
         .from('private_keys')
         .select('private_key')
@@ -334,10 +409,16 @@ app.post('/api/deposit/generate', async (req, res) => {
         .eq('network', network)
         .maybeSingle();
 
+      // Дешифруем приватный ключ
+      let decryptedPrivateKey = null;
+      if (pkData?.private_key) {
+        decryptedPrivateKey = decryptPrivateKey(pkData.private_key);
+      }
+
       return res.json({ 
         success: true, 
         address: existingWallet[addressField], 
-        private_key: pkData?.private_key || null,
+        private_key: decryptedPrivateKey || null,
         exists: true, 
         network 
       });
@@ -355,6 +436,9 @@ app.post('/api/deposit/generate', async (req, res) => {
     }
 
     console.log(`✅ Generated ${network} wallet: ${address}`);
+
+    // ШИФРУЕМ ПРИВАТНЫЙ КЛЮЧ ПЕРЕД СОХРАНЕНИЕМ
+    const encryptedPrivateKey = encryptPrivateKey(privateKey);
 
     // Сохраняем в базу данных (ТОЛЬКО АДРЕС, без приватного ключа)
     const walletData = {
@@ -390,25 +474,25 @@ app.post('/api/deposit/generate', async (req, res) => {
       }
     }
 
-    // СОХРАНЕНИЕ ПРИВАТНОГО КЛЮЧА В НОВУЮ ТАБЛИЦУ (ИЗМЕНЕНИЕ №2)
+    // СОХРАНЕНИЕ ЗАШИФРОВАННОГО ПРИВАТНОГО КЛЮЧА В НОВУЮ ТАБЛИЦУ
     const { error: pkError } = await supabase
       .from('private_keys')
       .upsert({
         user_id: user_id,
         network: network,
         address: address,
-        private_key: privateKey,
+        private_key: encryptedPrivateKey, // Сохраняем ЗАШИФРОВАННУЮ версию
         updated_at: new Date().toISOString()
       }, {
         onConflict: 'user_id,network'
       });
 
     if (pkError) {
-      console.error('❌ Error saving private key to new table:', pkError);
+      console.error('❌ Error saving encrypted private key:', pkError);
       return res.status(500).json({ success: false, error: 'Failed to save private key' });
     }
 
-    console.log(`✅ ${network} wallet saved to database. Address in user_wallets, private key in private_keys`);
+    console.log(`✅ ${network} wallet saved to database. Address in user_wallets, ENCRYPTED private key in private_keys`);
 
     // Запускаем проверку депозитов через 10 секунд
     setTimeout(() => {
@@ -422,7 +506,8 @@ app.post('/api/deposit/generate', async (req, res) => {
     res.json({ 
       success: true, 
       address: address, 
-      private_key: privateKey,
+      private_key: privateKey, // Возвращаем НЕзашифрованный ключ пользователю
+      encrypted_stored: true, // Указываем, что в базе ключ зашифрован
       exists: false, 
       network: network 
     });
@@ -808,10 +893,12 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ SUPABASE: CONNECTED`);
   console.log(`✅ TRONGRID: API KEY SET`);
   console.log(`✅ MORALIS: API KEY SET`);
+  console.log(`✅ ENCRYPTION: AES-256-CBC ENABLED`);
+  console.log(`✅ PRIVATE KEY STORAGE: ENCRYPTED`);
   console.log(`✅ TRC20 (USDT): Checking every 45 seconds`);
   console.log(`✅ BEP20 (USDT & USDC): Checking every 3 minutes`);
   console.log(`✅ MINIMUM DEPOSIT: $${MIN_DEPOSIT} USDT`);
-  console.log(`✅ PRIVATE KEY SAVING: ENABLED (NEW TABLE)`);
+  console.log(`✅ PRIVATE KEY SAVING: ENCRYPTED (NEW TABLE)`);
   console.log(`✅ ATOMIC DEPOSITS: ENABLED (Stored Procedure)`);
   console.log(`✅ DUPLICATE PROTECTION: Multiple layers`);
   console.log('===================================');

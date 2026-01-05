@@ -12,49 +12,8 @@ const PORT = process.env.PORT || 8080;
 const SUPABASE_URL = 'https://fctwivbwjoslkejtjxhe.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZjdHdpdmJ3am9zbGtlanRqeGhlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NjE0MzAzNSwiZXhwIjoyMDgxNzE5MDM1fQ.KV5XSZklL_cRlMJVxcBMQrkWLxqaeN8fkp4wXHYueh0';
 const TRONGRID_API_KEY = '8fa63ef4-f010-4ad2-a556-a7124563bafd';
-const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6ImQ4YzU0YWNmLTYyMTUtNDg4Yi05Y2UxLTc0N2M0YWU0YzhiMSIsIm9yZ0lkIjoiNDg1NjQ0IiwidXNlcklkIjoiNDk5NjM3IiwidHlwZUlkIjoiZWEwMzg5YzQtOWYxOC00NDc2LWJhMDgtMzdhZDgwNjY3ODI2IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjU0NzM4NzksImV4cCI6NDkyMTIzMzg3OX0.ck6-kSFlq3tqiGRLiNLXOLuqQwo-csFW0TCalhq0_lY';
+const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6Ijg2NGE3ZDkyLTBmNDEtNDc5NC04MTViLWI1NTYxNGNmYjhiNCIsIm9yZ0lkIjoiNDg4NzI5IiwidXNlcklkIjoiNTAyODM3IiwidHlwZUlkIjoiZjJlMGNmODItNTQxMS00ZTliLTk2OWQtNGJiMTNjNTQxNDQzIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3Njc1Njc3OTEsImV4cCI6NDkyMzMyNzc5MX0.MxkXAa64kBeSjIuNmRPPCWB4uQrY9nkyC2FW3K6kZ7E';
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // ДОБАВЛЕНО
-
-// ========== БЕЗОПАСНОСТЬ: API KEY ПРОВЕРКА ==========
-// Установите этот секретный ключ в Railway Variables как API_SECRET_KEY
-const API_SECRET_KEY = process.env.API_SECRET_KEY || "default-secret-key-change-me-123";
-
-// Функция проверки API ключа
-function requireApiKey(req, res, next) {
-    const clientKey = req.headers['x-api-key'] || req.query.api_key;
-    
-    if (!clientKey) {
-        console.error('🚨 BLOCKED: No API key provided', {
-            ip: req.ip,
-            path: req.path,
-            user_id: req.query.user_id,
-            timestamp: new Date().toISOString()
-        });
-        return res.status(401).json({
-            success: false,
-            error: 'API key required. Use x-api-key header or api_key query parameter.'
-        });
-    }
-    
-    if (clientKey !== API_SECRET_KEY) {
-        console.error('🚨 BLOCKED: Invalid API key', {
-            ip: req.ip,
-            path: req.path,
-            timestamp: new Date().toISOString()
-        });
-        return res.status(403).json({
-            success: false,
-            error: 'Invalid API key'
-        });
-    }
-    
-    console.log('✅ Authorized API access:', {
-        ip: req.ip,
-        path: req.path,
-        user_id: req.query.user_id
-    });
-    next();
-}
 
 // ========== ФУНКЦИИ ШИФРОВАНИЯ/ДЕШИФРОВАНИЯ ==========
 function encryptPrivateKey(text) {
@@ -391,12 +350,12 @@ async function processDepositAtomic(userId, amount, txid, network) {
 }
 
 // ========== API Endpoints ==========
-app.post('/api/deposit/generate', requireApiKey, async (req, res) => {  // ← ДОБАВЛЕНА ПРОВЕРКА
+app.post('/api/deposit/generate', async (req, res) => {
   try {
     const { user_id, network = 'usdt_trc20' } = req.query;
     if (!user_id) return res.status(400).json({ success: false, error: 'User ID is required' });
 
-    console.log(`🔐 [SECURE] Generating ${network} wallet for user: ${user_id}, IP: ${req.ip}`);
+    console.log(`🔐 Generating ${network} wallet for user: ${user_id}`);
 
     // Проверяем поддерживаемую сеть
     const fields = networkFields[network];
@@ -535,7 +494,7 @@ app.post('/api/deposit/generate', requireApiKey, async (req, res) => {  // ← �
   }
 });
 
-app.get('/api/deposit/history', requireApiKey, async (req, res) => {  // ← ДОБАВЛЕНА ПРОВЕРКА
+app.get('/api/deposit/history', async (req, res) => {
   try {
     const { user_id, network = 'usdt_trc20' } = req.query;
     if (!user_id) return res.status(400).json({ success: false, error: 'User ID is required' });
@@ -561,9 +520,9 @@ app.get('/api/deposit/history', requireApiKey, async (req, res) => {  // ← Д�
 });
 
 // ========== DEPOSIT CHECKING ==========
-app.get('/api/check-deposits', requireApiKey, async (req, res) => {  // ← ДОБАВЛЕНА ПРОВЕРКА
+app.get('/api/check-deposits', async (req, res) => { 
   try {
-    console.log('🔄 [SECURE] Manual deposit check triggered via API');
+    console.log('🔄 Manual deposit check triggered via API');
     const trc20Result = await handleCheckTRC20Deposits();
     const bep20Result = await handleCheckBEP20Deposits();
     
@@ -917,7 +876,6 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ PRIVATE KEY SAVING: ${ENCRYPTION_KEY ? 'ENCRYPTED' : 'PLAIN TEXT'} (NEW TABLE)`);
   console.log(`✅ ATOMIC DEPOSITS: ENABLED (Stored Procedure)`);
   console.log(`✅ DUPLICATE PROTECTION: Multiple layers`);
-  console.log(`✅ API SECURITY: ${API_SECRET_KEY !== "default-secret-key-change-me-123" ? 'ENABLED' : 'WARNING: Using default key!'}`);
   
   // ПРЕДУПРЕЖДЕНИЕ О ШИФРОВАНИИ
   if (!ENCRYPTION_KEY) {

@@ -190,7 +190,7 @@ const tronWeb = new TronWeb({
 const USDT_TRC20_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
 const USDT_BSC_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
 const USDC_BSC_CONTRACT = '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d';
-const MIN_DEPOSIT = 10;
+const MIN_DEPOSIT = 1;
 
 // ========== NETWORK FIELD MAPPING ==========
 const networkFields = {

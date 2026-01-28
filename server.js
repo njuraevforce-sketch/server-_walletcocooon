@@ -213,7 +213,7 @@ const networkFields = {
 
 // ========== OPTIMIZED SETTINGS ==========
 const TRC20_CHECK_INTERVAL = 45000;
-const BEP20_CHECK_INTERVAL = 180000;
+const BEP20_CHECK_INTERVAL = 120000;
 const BEP20_DELAY_MS = 500;
 const TRC20_DELAY_MS = 100;
 

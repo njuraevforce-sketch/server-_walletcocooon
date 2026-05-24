@@ -22,7 +22,7 @@ from sniper_engine import (
     sync_calendar,
 )
 
-app = FastAPI(title="Volatility Hunter Sniper Bot", version="8.1.0-pro-ws-hotfix")
+app = FastAPI(title="Volatility Hunter Sniper Bot", version="8.3.0-bitget-plan-hotfix")
 
 cors_origins = [x.strip() for x in os.environ.get("CORS_ORIGINS", "*").split(",") if x.strip()]
 app.add_middleware(
@@ -43,7 +43,7 @@ async def require_auth(x_bot_token: Optional[str] = Header(default=None)):
 
 @app.get("/")
 async def health_check():
-    return {"status": "online", "system": "Volatility Hunter Sniper Live Guard", "version": "8.1.0-pro-ws-hotfix"}
+    return {"status": "online", "system": "Volatility Hunter Sniper Live Guard", "version": "8.3.0-bitget-plan-hotfix"}
 
 
 @app.get("/api/status", dependencies=[Depends(require_auth)])
@@ -81,7 +81,7 @@ async def preflight():
     except Exception as e:
         return {
             "status": "error",
-            "version": "8.1.0-pro-ws-hotfix",
+            "version": "8.3.0-bitget-plan-hotfix",
             "stage": "database/settings",
             "checks": checks,
             "errors": [str(e)],
@@ -98,7 +98,7 @@ async def preflight():
     except Exception as e:
         return {
             "status": "error",
-            "version": "8.1.0-pro-ws-hotfix",
+            "version": "8.3.0-bitget-plan-hotfix",
             "stage": "exchange/load_markets",
             "checks": checks,
             "errors": [str(e)],
@@ -127,7 +127,7 @@ async def preflight():
     market_ok = spread_bps <= settings.max_spread_bps
     return {
         "status": "success" if not errors else "warning",
-        "version": "8.1.0-pro-ws-hotfix",
+        "version": "8.3.0-bitget-plan-hotfix",
         "checks": checks,
         "errors": errors,
         "live_allowed": live_allowed,
@@ -210,6 +210,17 @@ async def markets_scan():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+
+
+@app.get("/api/volume-shock", dependencies=[Depends(require_auth)])
+async def volume_shock():
+    settings = db.get_settings()
+    try:
+        scan = await analyze_markets(settings)
+        return {"status": "success", "best_shock": scan.get("best_shock"), "markets": scan.get("markets", []), "symbols": scan.get("symbols", [])}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/ws/status", dependencies=[Depends(require_auth)])
 async def ws_status():

@@ -41,6 +41,38 @@ _last_hot_log_at: Optional[datetime] = None
 
 VOLATILITY_PROVIDERS = {"volatility_scanner", "manual_volatility", "volume_shock"}
 
+VOLUME_SHOCK_DEFAULTS: Dict[str, Any] = {
+    "volume_shock_enabled": True,
+    "volume_shock_min_score": 75.0,
+    "volume_shock_min_volume_spike": 3.0,
+    "volume_shock_min_body_atr": 0.85,
+    "volume_shock_min_range_expansion": 0.70,
+    "volume_shock_max_wick_ratio": 0.45,
+    "volume_shock_max_spread_bps": 8.0,
+    "volume_shock_min_stop_bps": 12.0,
+    "volume_shock_max_stop_bps": 120.0,
+    "volume_shock_stop_atr_mult": 1.05,
+    "volume_shock_min_entry_buffer_bps": 3.0,
+    "volume_shock_max_entry_buffer_bps": 35.0,
+    "volume_shock_entry_buffer_atr": 0.18,
+    "volume_shock_lookback_minutes": 3,
+    "volume_shock_order_life_seconds": 35,
+    "volume_shock_cooldown_minutes": 10,
+}
+
+def sget(settings: BotSettings, name: str, default: Any = None) -> Any:
+    """Read new V8.2+ settings safely even if Railway is running an older BotSettings model.
+
+    This prevents /api/volatility and the engine loop from crashing with:
+    'BotSettings' object has no attribute 'volume_shock_*'
+    """
+    if hasattr(settings, name):
+        value = getattr(settings, name)
+        if value is not None:
+            return value
+    return VOLUME_SHOCK_DEFAULTS.get(name, default)
+
+
 
 @dataclass
 class ArmedPlan:
@@ -98,29 +130,29 @@ def score_volume_shock(metrics: Dict[str, float], spread_bps: float, settings: B
     wick = float(metrics.get("last_wick_ratio") or 1.0)
     direction = float(metrics.get("last_direction") or 0.0)
 
-    vol_score = clamp(vol / max(0.01, settings.volume_shock_min_volume_spike) * 32.0, 0, 34)
-    body_score = clamp(body / max(0.01, settings.volume_shock_min_body_atr) * 20.0, 0, 22)
-    range_score = clamp(range_exp / max(0.01, settings.volume_shock_min_range_expansion) * 16.0, 0, 18)
-    spread_score = clamp((settings.volume_shock_max_spread_bps - spread_bps) / max(0.01, settings.volume_shock_max_spread_bps) * 14.0, 0, 14)
-    wick_score = clamp((settings.volume_shock_max_wick_ratio - wick) / max(0.01, settings.volume_shock_max_wick_ratio) * 12.0, 0, 12)
+    vol_score = clamp(vol / max(0.01, sget(settings, "volume_shock_min_volume_spike")) * 32.0, 0, 34)
+    body_score = clamp(body / max(0.01, sget(settings, "volume_shock_min_body_atr")) * 20.0, 0, 22)
+    range_score = clamp(range_exp / max(0.01, sget(settings, "volume_shock_min_range_expansion")) * 16.0, 0, 18)
+    spread_score = clamp((sget(settings, "volume_shock_max_spread_bps") - spread_bps) / max(0.01, sget(settings, "volume_shock_max_spread_bps")) * 14.0, 0, 14)
+    wick_score = clamp((sget(settings, "volume_shock_max_wick_ratio") - wick) / max(0.01, sget(settings, "volume_shock_max_wick_ratio")) * 12.0, 0, 12)
     shock_score = round(vol_score + body_score + range_score + spread_score + wick_score, 2)
 
     reasons: List[str] = []
-    if not settings.volume_shock_enabled:
+    if not bool(sget(settings, "volume_shock_enabled")):
         reasons.append("volume shock disabled")
-    if spread_bps > settings.volume_shock_max_spread_bps:
+    if spread_bps > sget(settings, "volume_shock_max_spread_bps"):
         reasons.append(f"spread too wide {spread_bps:.2f}bps")
-    if vol < settings.volume_shock_min_volume_spike:
+    if vol < sget(settings, "volume_shock_min_volume_spike"):
         reasons.append(f"volume shock weak {vol:.2f}")
-    if body < settings.volume_shock_min_body_atr:
+    if body < sget(settings, "volume_shock_min_body_atr"):
         reasons.append(f"body impulse weak {body:.2f} ATR")
-    if range_exp < settings.volume_shock_min_range_expansion:
+    if range_exp < sget(settings, "volume_shock_min_range_expansion"):
         reasons.append(f"range impulse weak {range_exp:.2f}")
-    if wick > settings.volume_shock_max_wick_ratio:
+    if wick > sget(settings, "volume_shock_max_wick_ratio"):
         reasons.append(f"wick/fakeout risk {wick:.2f}")
     if direction == 0:
         reasons.append("no candle direction")
-    if shock_score < settings.volume_shock_min_score:
+    if shock_score < sget(settings, "volume_shock_min_score"):
         reasons.append(f"shock score too low {shock_score:.1f}")
 
     valid = not reasons
@@ -145,10 +177,10 @@ def validate_volume_shock(settings: BotSettings, metrics: Dict[str, float], spre
 
 
 def compute_volume_shock_stop_distance(settings: BotSettings, metrics: Dict[str, float], price: float) -> float:
-    min_stop = price * settings.volume_shock_min_stop_bps / 10000.0
-    max_stop = max(min_stop, price * settings.volume_shock_max_stop_bps / 10000.0)
+    min_stop = price * sget(settings, "volume_shock_min_stop_bps") / 10000.0
+    max_stop = max(min_stop, price * sget(settings, "volume_shock_max_stop_bps") / 10000.0)
     raw = max(
-        float(metrics.get("atr14") or 0.0) * settings.volume_shock_stop_atr_mult,
+        float(metrics.get("atr14") or 0.0) * sget(settings, "volume_shock_stop_atr_mult"),
         min_stop,
         float(metrics.get("range") or 0.0) * 0.75,
     )
@@ -156,9 +188,9 @@ def compute_volume_shock_stop_distance(settings: BotSettings, metrics: Dict[str,
 
 
 def compute_volume_shock_entry_buffer(settings: BotSettings, metrics: Dict[str, float], price: float) -> float:
-    min_buffer = price * settings.volume_shock_min_entry_buffer_bps / 10000.0
-    max_buffer = max(min_buffer, price * settings.volume_shock_max_entry_buffer_bps / 10000.0)
-    raw = max(float(metrics.get("atr14") or 0.0) * settings.volume_shock_entry_buffer_atr, min_buffer)
+    min_buffer = price * sget(settings, "volume_shock_min_entry_buffer_bps") / 10000.0
+    max_buffer = max(min_buffer, price * sget(settings, "volume_shock_max_entry_buffer_bps") / 10000.0)
+    raw = max(float(metrics.get("atr14") or 0.0) * sget(settings, "volume_shock_entry_buffer_atr"), min_buffer)
     return min(raw, max_buffer)
 
 
@@ -226,7 +258,7 @@ async def build_armed_plan(exchange, settings: BotSettings, event: NewsEvent) ->
     spread_bps = await get_spread_bps(exchange, settings.symbol)
     is_shock = event.provider == "volume_shock"
     if is_shock:
-        lookback = max(1, int(settings.volume_shock_lookback_minutes))
+        lookback = max(1, int(sget(settings, "volume_shock_lookback_minutes")))
     elif event.provider in VOLATILITY_PROVIDERS:
         lookback = settings.volatility_lookback_minutes
     else:
@@ -359,7 +391,7 @@ def infer_filled(order: Dict[str, Any]) -> bool:
 
 
 async def wait_for_breakout(exchange, settings: BotSettings, plan: ArmedPlan) -> Optional[str]:
-    post_wait = settings.volume_shock_order_life_seconds if plan.event.provider == "volume_shock" else settings.auto_post_wait_seconds if plan.event.provider in {"volatility_scanner", "manual_volatility"} else settings.post_event_wait_seconds
+    post_wait = sget(settings, "volume_shock_order_life_seconds") if plan.event.provider == "volume_shock" else settings.auto_post_wait_seconds if plan.event.provider in {"volatility_scanner", "manual_volatility"} else settings.post_event_wait_seconds
     deadline = plan.event.event_time_utc + timedelta(seconds=post_wait)
     mode = BotMode.VOLATILITY_ARMED.value if plan.event.provider in VOLATILITY_PROVIDERS else BotMode.CALENDAR_ARMED.value
     db.set_runtime_state(mode, True, f"armed traps: {plan.event.title}")
@@ -682,7 +714,7 @@ async def maybe_auto_arm_volatility(settings: BotSettings) -> bool:
     shock_valid = bool(shock_market.get("volume_shock_valid") or shock_market.get("volume_shock_should_arm"))
 
     reason = f"best {selected_symbol} score {score:.1f} / {state}"
-    if settings.volume_shock_enabled:
+    if bool(sget(settings, "volume_shock_enabled")):
         reason += f" | shock {shock_symbol} {shock_score:.1f}"
     db.set_runtime_state(BotMode.VOLATILITY_SCAN.value, True, reason)
 
@@ -691,8 +723,8 @@ async def maybe_auto_arm_volatility(settings: BotSettings) -> bool:
             db.log_event("info", "multi_symbol_volatility_watch", f"Best normal {selected_symbol} score {score:.1f}; best shock {shock_symbol} score {shock_score:.1f}", {"best": market, "best_shock": shock_market, "top": (scan.get("markets") or [])[:5]})
             _last_hot_log_at = utc_now()
 
-    if settings.volume_shock_enabled and shock_valid:
-        if _last_shock_arm_at and (utc_now() - _last_shock_arm_at).total_seconds() < settings.volume_shock_cooldown_minutes * 60:
+    if bool(sget(settings, "volume_shock_enabled")) and shock_valid:
+        if _last_shock_arm_at and (utc_now() - _last_shock_arm_at).total_seconds() < sget(settings, "volume_shock_cooldown_minutes") * 60:
             db.log_event("info", "volume_shock_cooldown", "Volume shock detected but cooldown is active", {"market": shock_market})
         else:
             ok, limit_reason = daily_limits_ok(settings, db.todays_pnl(), db.todays_trade_count(), db.consecutive_losses())

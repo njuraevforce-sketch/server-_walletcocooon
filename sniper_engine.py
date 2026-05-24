@@ -26,8 +26,9 @@ from exchange_client import (
     place_trigger_entry,
     price_precision,
     extract_order_id,
+    fetch_symbol_position,
 )
-from indicators import pre_event_metrics, volatility_metrics, score_volatility
+from indicators import pre_event_metrics, volatility_metrics, score_volatility, clamp
 from models import BotMode, BotSettings, NewsEvent, EventImpact, ManualArmNowPayload
 from risk import compute_order_size, compute_stop_distance, live_trading_allowed, validate_market_for_event, daily_limits_ok
 import bitget_ws
@@ -35,7 +36,10 @@ import bitget_ws
 engine_task: Optional[asyncio.Task] = None
 engine_stop = asyncio.Event()
 _last_vol_arm_at: Optional[datetime] = None
+_last_shock_arm_at: Optional[datetime] = None
 _last_hot_log_at: Optional[datetime] = None
+
+VOLATILITY_PROVIDERS = {"volatility_scanner", "manual_volatility", "volume_shock"}
 
 
 @dataclass
@@ -80,6 +84,84 @@ def synthetic_event(kind: str, delay_seconds: int, title: str, raw: Optional[Dic
     )
 
 
+def score_volume_shock(metrics: Dict[str, float], spread_bps: float, settings: BotSettings) -> Dict[str, Any]:
+    """Fast sudden-volume detector.
+
+    It is intentionally separate from the normal sniper score. Normal sniper waits for
+    full ATR/range confirmation; this mode reacts earlier to an abnormal volume/body
+    impulse, but still requires spread/wick/range sanity and still places traps rather
+    than a market order.
+    """
+    vol = float(metrics.get("volume_spike") or 0.0)
+    body = float(metrics.get("last_body_atr") or 0.0)
+    range_exp = float(metrics.get("range_expansion") or 0.0)
+    wick = float(metrics.get("last_wick_ratio") or 1.0)
+    direction = float(metrics.get("last_direction") or 0.0)
+
+    vol_score = clamp(vol / max(0.01, settings.volume_shock_min_volume_spike) * 32.0, 0, 34)
+    body_score = clamp(body / max(0.01, settings.volume_shock_min_body_atr) * 20.0, 0, 22)
+    range_score = clamp(range_exp / max(0.01, settings.volume_shock_min_range_expansion) * 16.0, 0, 18)
+    spread_score = clamp((settings.volume_shock_max_spread_bps - spread_bps) / max(0.01, settings.volume_shock_max_spread_bps) * 14.0, 0, 14)
+    wick_score = clamp((settings.volume_shock_max_wick_ratio - wick) / max(0.01, settings.volume_shock_max_wick_ratio) * 12.0, 0, 12)
+    shock_score = round(vol_score + body_score + range_score + spread_score + wick_score, 2)
+
+    reasons: List[str] = []
+    if not settings.volume_shock_enabled:
+        reasons.append("volume shock disabled")
+    if spread_bps > settings.volume_shock_max_spread_bps:
+        reasons.append(f"spread too wide {spread_bps:.2f}bps")
+    if vol < settings.volume_shock_min_volume_spike:
+        reasons.append(f"volume shock weak {vol:.2f}")
+    if body < settings.volume_shock_min_body_atr:
+        reasons.append(f"body impulse weak {body:.2f} ATR")
+    if range_exp < settings.volume_shock_min_range_expansion:
+        reasons.append(f"range impulse weak {range_exp:.2f}")
+    if wick > settings.volume_shock_max_wick_ratio:
+        reasons.append(f"wick/fakeout risk {wick:.2f}")
+    if direction == 0:
+        reasons.append("no candle direction")
+    if shock_score < settings.volume_shock_min_score:
+        reasons.append(f"shock score too low {shock_score:.1f}")
+
+    valid = not reasons
+    return {
+        "volume_shock_score": shock_score,
+        "volume_shock_state": "SHOCK_ARM" if valid else "SHOCK_WATCH" if shock_score >= settings.notify_score else "NO_SHOCK",
+        "volume_shock_valid": bool(valid),
+        "volume_shock_should_arm": bool(valid),
+        "volume_shock_reason": "; ".join(reasons) if reasons else "volume shock accepted",
+        "volume_shock_direction": direction,
+        "shock_volume_score": round(vol_score, 2),
+        "shock_body_score": round(body_score, 2),
+        "shock_range_score": round(range_score, 2),
+        "shock_spread_score": round(spread_score, 2),
+        "shock_wick_score": round(wick_score, 2),
+    }
+
+
+def validate_volume_shock(settings: BotSettings, metrics: Dict[str, float], spread_bps: float) -> tuple[bool, str]:
+    shock = score_volume_shock(metrics, spread_bps, settings)
+    return bool(shock.get("volume_shock_valid")), str(shock.get("volume_shock_reason") or "")
+
+
+def compute_volume_shock_stop_distance(settings: BotSettings, metrics: Dict[str, float], price: float) -> float:
+    min_stop = price * settings.volume_shock_min_stop_bps / 10000.0
+    max_stop = max(min_stop, price * settings.volume_shock_max_stop_bps / 10000.0)
+    raw = max(
+        float(metrics.get("atr14") or 0.0) * settings.volume_shock_stop_atr_mult,
+        min_stop,
+        float(metrics.get("range") or 0.0) * 0.75,
+    )
+    return min(raw, max_stop)
+
+
+def compute_volume_shock_entry_buffer(settings: BotSettings, metrics: Dict[str, float], price: float) -> float:
+    min_buffer = price * settings.volume_shock_min_entry_buffer_bps / 10000.0
+    max_buffer = max(min_buffer, price * settings.volume_shock_max_entry_buffer_bps / 10000.0)
+    raw = max(float(metrics.get("atr14") or 0.0) * settings.volume_shock_entry_buffer_atr, min_buffer)
+    return min(raw, max_buffer)
+
+
 async def sync_calendar(settings: BotSettings) -> List[NewsEvent]:
     events = await fetch_calendar(days_ahead=5)
     filtered = filter_events_for_crypto(events, settings)
@@ -97,6 +179,7 @@ async def analyze_market(symbol: str, settings: BotSettings) -> Dict[str, Any]:
         metrics = volatility_metrics(ohlcv, settings.volatility_lookback_minutes, settings.compression_lookback_minutes)
         event_valid, event_reason = validate_market_for_event(settings, metrics, spread_bps)
         score = score_volatility(metrics, spread_bps, settings)
+        shock = score_volume_shock(metrics, spread_bps, settings)
         return {
             "valid_for_sniper": bool(event_valid),
             "valid_for_news_sniper": bool(event_valid),
@@ -105,6 +188,7 @@ async def analyze_market(symbol: str, settings: BotSettings) -> Dict[str, Any]:
             "spread_bps": spread_bps,
             **metrics,
             **score,
+            **shock,
         }
     finally:
         await exchange.close()
@@ -131,26 +215,49 @@ async def analyze_markets(settings: BotSettings) -> Dict[str, Any]:
 
     markets = await asyncio.gather(*(one(sym) for sym in symbols))
     markets_sorted = sorted(markets, key=lambda x: float(x.get("volatility_score") or 0), reverse=True)
+    shock_sorted = sorted(markets, key=lambda x: float(x.get("volume_shock_score") or 0), reverse=True)
     best = markets_sorted[0] if markets_sorted else {}
-    return {"symbols": symbols, "best": best, "markets": markets_sorted}
+    best_shock = shock_sorted[0] if shock_sorted else {}
+    return {"symbols": symbols, "best": best, "best_shock": best_shock, "markets": markets_sorted}
 
 async def build_armed_plan(exchange, settings: BotSettings, event: NewsEvent) -> ArmedPlan:
     await configure_symbol(exchange, settings.symbol, settings.leverage, settings.isolated_margin)
     ohlcv = await fetch_ohlcv(exchange, settings.symbol, settings.timeframe, limit=160)
     spread_bps = await get_spread_bps(exchange, settings.symbol)
-    lookback = settings.volatility_lookback_minutes if event.provider in {"volatility_scanner", "manual_volatility"} else settings.range_lookback_minutes
+    is_shock = event.provider == "volume_shock"
+    if is_shock:
+        lookback = max(1, int(settings.volume_shock_lookback_minutes))
+    elif event.provider in VOLATILITY_PROVIDERS:
+        lookback = settings.volatility_lookback_minutes
+    else:
+        lookback = settings.range_lookback_minutes
+
     metrics = volatility_metrics(ohlcv, lookback, settings.compression_lookback_minutes)
     score = score_volatility(metrics, spread_bps, settings)
-    metrics = {**metrics, **{k: v for k, v in score.items() if isinstance(v, (int, float))}, "spread_bps": spread_bps}
+    shock = score_volume_shock(metrics, spread_bps, settings)
+    metrics = {
+        **metrics,
+        **{k: v for k, v in score.items() if isinstance(v, (int, float))},
+        **{k: v for k, v in shock.items() if isinstance(v, (int, float, bool))},
+        "spread_bps": spread_bps,
+        "mode": "volume_shock" if is_shock else "normal_sniper",
+    }
 
-    ok, reason = validate_market_for_event(settings, metrics, spread_bps)
-    if not ok:
-        raise RuntimeError(reason)
-    if event.provider in {"volatility_scanner", "manual_volatility"} and float(score["volatility_score"]) < settings.notify_score:
-        raise RuntimeError(f"volatility score too low: {score['volatility_score']}")
+    if is_shock:
+        ok, reason = validate_volume_shock(settings, metrics, spread_bps)
+        if not ok:
+            raise RuntimeError(reason)
+        buffer = compute_volume_shock_entry_buffer(settings, metrics, metrics["last"])
+        stop_distance = compute_volume_shock_stop_distance(settings, metrics, metrics["last"])
+    else:
+        ok, reason = validate_market_for_event(settings, metrics, spread_bps)
+        if not ok:
+            raise RuntimeError(reason)
+        if event.provider in {"volatility_scanner", "manual_volatility"} and float(score["volatility_score"]) < settings.notify_score:
+            raise RuntimeError(f"volatility score too low: {score['volatility_score']}")
+        buffer = max(settings.min_entry_buffer_usd, metrics["atr14"] * settings.entry_buffer_atr)
+        stop_distance = compute_stop_distance(settings, metrics["atr14"], metrics["range"])
 
-    buffer = max(settings.min_entry_buffer_usd, metrics["atr14"] * settings.entry_buffer_atr)
-    stop_distance = compute_stop_distance(settings, metrics["atr14"], metrics["range"])
     live_balance = await fetch_balance_usdt(exchange)
     risk = compute_order_size(settings, metrics["last"], stop_distance, live_balance)
     if not risk.allowed:
@@ -163,7 +270,7 @@ async def build_armed_plan(exchange, settings: BotSettings, event: NewsEvent) ->
     uid = uuid.uuid4().hex[:12]
     return ArmedPlan(
         event=event,
-        metrics={**metrics, "entry_buffer": buffer, "volatility_score": float(score["volatility_score"])},
+        metrics={**metrics, "entry_buffer": buffer, "volatility_score": float(score["volatility_score"]), "volume_shock_score": float(shock.get("volume_shock_score") or 0)},
         buy_trigger=buy_trigger,
         sell_trigger=sell_trigger,
         stop_distance=stop_distance,
@@ -188,6 +295,7 @@ async def place_armed_orders(exchange, settings: BotSettings, plan: ArmedPlan) -
         trigger_price=plan.buy_trigger,
         client_oid=plan.buy_client_oid,
         hedge_mode=settings.hedge_mode,
+        isolated=settings.isolated_margin,
     )
     sell = await place_trigger_entry(
         exchange=exchange,
@@ -197,11 +305,12 @@ async def place_armed_orders(exchange, settings: BotSettings, plan: ArmedPlan) -
         trigger_price=plan.sell_trigger,
         client_oid=plan.sell_client_oid,
         hedge_mode=settings.hedge_mode,
+        isolated=settings.isolated_margin,
     )
     plan.buy_order_id = str(buy.get("id") or buy.get("orderId") or plan.buy_client_oid)
     plan.sell_order_id = str(sell.get("id") or sell.get("orderId") or plan.sell_client_oid)
 
-    strategy_name = "volatility_hunter" if plan.event.provider in {"volatility_scanner", "manual_volatility"} else "news_volatility_sniper"
+    strategy_name = "volume_shock_runner" if plan.event.provider == "volume_shock" else "volatility_hunter" if plan.event.provider in {"volatility_scanner", "manual_volatility"} else "news_volatility_sniper"
     db.create_trade({
         "client_oid": plan.buy_client_oid,
         "exchange_order_id": plan.buy_order_id,
@@ -250,13 +359,35 @@ def infer_filled(order: Dict[str, Any]) -> bool:
 
 
 async def wait_for_breakout(exchange, settings: BotSettings, plan: ArmedPlan) -> Optional[str]:
-    post_wait = settings.auto_post_wait_seconds if plan.event.provider in {"volatility_scanner", "manual_volatility"} else settings.post_event_wait_seconds
+    post_wait = settings.volume_shock_order_life_seconds if plan.event.provider == "volume_shock" else settings.auto_post_wait_seconds if plan.event.provider in {"volatility_scanner", "manual_volatility"} else settings.post_event_wait_seconds
     deadline = plan.event.event_time_utc + timedelta(seconds=post_wait)
-    mode = BotMode.VOLATILITY_ARMED.value if plan.event.provider in {"volatility_scanner", "manual_volatility"} else BotMode.CALENDAR_ARMED.value
+    mode = BotMode.VOLATILITY_ARMED.value if plan.event.provider in VOLATILITY_PROVIDERS else BotMode.CALENDAR_ARMED.value
     db.set_runtime_state(mode, True, f"armed traps: {plan.event.title}")
     symbol = ccxt_symbol(settings.symbol)
     while utc_now() <= deadline and not engine_stop.is_set():
         try:
+            # Bitget V2 plan orders execute into a real futures position.
+            # Fetching them via generic CCXT fetch_order is not always reliable,
+            # so the safest live confirmation is: did the configured symbol now
+            # have a position? Private WS also sees it, but REST fallback is exact.
+            pos = await fetch_symbol_position(exchange, settings.symbol)
+            if float(pos.get("amount") or 0) > 0 and pos.get("direction") in ("long", "short"):
+                direction = str(pos.get("direction"))
+                if direction == "long":
+                    await cancel_safely(exchange, plan.sell_order_id, settings.symbol)
+                    px = pos.get("entry") or await get_last_price(exchange, settings.symbol)
+                    db.update_trade_by_client_oid(plan.buy_client_oid, {"status": "active", "execution_price": px})
+                    db.update_trade_by_client_oid(plan.sell_client_oid, {"status": "cancelled"})
+                    db.log_event("warning", "breakout_position_detected", "Long position detected after trigger trap", {"symbol": settings.symbol, "amount": pos.get("amount"), "entry": px})
+                    return "long"
+                else:
+                    await cancel_safely(exchange, plan.buy_order_id, settings.symbol)
+                    px = pos.get("entry") or await get_last_price(exchange, settings.symbol)
+                    db.update_trade_by_client_oid(plan.sell_client_oid, {"status": "active", "execution_price": px})
+                    db.update_trade_by_client_oid(plan.buy_client_oid, {"status": "cancelled"})
+                    db.log_event("warning", "breakout_position_detected", "Short position detected after trigger trap", {"symbol": settings.symbol, "amount": pos.get("amount"), "entry": px})
+                    return "short"
+
             buy = await exchange.fetch_order(plan.buy_order_id, symbol)
             sell = await exchange.fetch_order(plan.sell_order_id, symbol)
             buy_filled = infer_filled(buy)
@@ -357,10 +488,10 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
     remaining = plan.amount
     tp1_done = False
     trailing_active = False
+    stop_price = entry - plan.stop_distance if direction == "long" else entry + plan.stop_distance
     last_stop_sent = stop_price
     last_stop_update_at = 0.0
     current_sl_order_id: Optional[str] = None
-    stop_price = entry - plan.stop_distance if direction == "long" else entry + plan.stop_distance
     tp1_price = entry + plan.stop_distance * settings.tp1_r if direction == "long" else entry - plan.stop_distance * settings.tp1_r
     tp2_price = entry + plan.stop_distance * settings.tp2_r if direction == "long" else entry - plan.stop_distance * settings.tp2_r
     best_price = entry
@@ -464,6 +595,10 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
                     remaining = order_amount_precision(exchange, settings.symbol, remaining - close_amount)
                     tp1_done = True
                     stop_price = entry
+                    # After partial close, replace full-size SL with remaining-size SL at breakeven.
+                    current_sl_order_id = await update_exchange_stop(exchange, settings, direction, remaining, stop_price, current_sl_order_id)
+                    last_stop_sent = stop_price
+                    last_stop_update_at = time.time()
                     db.log_event("info", "tp1", "TP1 partial profit taken; stop moved to breakeven", {"price": price, "pnl": pnl, "remaining": remaining})
 
             exit_by_tp2 = bool(settings.tp2_enabled and hit_tp2)
@@ -498,7 +633,7 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
 
 
 async def prepare_and_trade_event(settings: BotSettings, event: NewsEvent) -> None:
-    mode = BotMode.VOLATILITY_ARMED.value if event.provider in {"volatility_scanner", "manual_volatility"} else BotMode.CALENDAR_ARMED.value
+    mode = BotMode.VOLATILITY_ARMED.value if event.provider in VOLATILITY_PROVIDERS else BotMode.CALENDAR_ARMED.value
     db.upsert_news_event(event)
     db.mark_event_status(event.provider_id, "arming", "Preparing trigger traps")
     exchange = await get_exchange()
@@ -529,42 +664,71 @@ async def prepare_and_trade_event(settings: BotSettings, event: NewsEvent) -> No
 
 
 async def maybe_auto_arm_volatility(settings: BotSettings) -> bool:
-    global _last_vol_arm_at, _last_hot_log_at
+    global _last_vol_arm_at, _last_shock_arm_at, _last_hot_log_at
     if not settings.volatility_auto_enabled:
         return False
-    if _last_vol_arm_at and (utc_now() - _last_vol_arm_at).total_seconds() < settings.volatility_cooldown_minutes * 60:
-        return False
 
-    scan = await analyze_markets(settings) if settings.scan_symbols else {"best": await analyze_market(settings.symbol, settings), "markets": []}
+    scan = await analyze_markets(settings) if settings.scan_symbols else {"best": await analyze_market(settings.symbol, settings), "best_shock": {}, "markets": []}
     market = scan.get("best") or {}
     selected_symbol = market.get("symbol") or settings.symbol
     score = float(market.get("volatility_score") or 0)
     state = str(market.get("state") or "COLD")
-    db.set_runtime_state(BotMode.VOLATILITY_SCAN.value, True, f"best {selected_symbol} score {score:.1f} / {state}")
 
-    if score >= settings.notify_score:
+    # V8.2: fast sudden volume mode. It does NOT bypass risk limits, live guards, SL or trailing.
+    # It only bypasses the normal full score=88 requirement when abnormal volume/body impulse is present.
+    shock_market = scan.get("best_shock") or {}
+    shock_symbol = shock_market.get("symbol") or selected_symbol
+    shock_score = float(shock_market.get("volume_shock_score") or 0)
+    shock_valid = bool(shock_market.get("volume_shock_valid") or shock_market.get("volume_shock_should_arm"))
+
+    reason = f"best {selected_symbol} score {score:.1f} / {state}"
+    if settings.volume_shock_enabled:
+        reason += f" | shock {shock_symbol} {shock_score:.1f}"
+    db.set_runtime_state(BotMode.VOLATILITY_SCAN.value, True, reason)
+
+    if score >= settings.notify_score or shock_score >= settings.notify_score:
         if not _last_hot_log_at or (utc_now() - _last_hot_log_at).total_seconds() > 60:
-            db.log_event("info", "multi_symbol_volatility_watch", f"Best market {selected_symbol} score {score:.1f}: {state}", {"best": market, "top": (scan.get("markets") or [])[:5]})
+            db.log_event("info", "multi_symbol_volatility_watch", f"Best normal {selected_symbol} score {score:.1f}; best shock {shock_symbol} score {shock_score:.1f}", {"best": market, "best_shock": shock_market, "top": (scan.get("markets") or [])[:5]})
             _last_hot_log_at = utc_now()
 
+    if settings.volume_shock_enabled and shock_valid:
+        if _last_shock_arm_at and (utc_now() - _last_shock_arm_at).total_seconds() < settings.volume_shock_cooldown_minutes * 60:
+            db.log_event("info", "volume_shock_cooldown", "Volume shock detected but cooldown is active", {"market": shock_market})
+        else:
+            ok, limit_reason = daily_limits_ok(settings, db.todays_pnl(), db.todays_trade_count(), db.consecutive_losses())
+            if not ok:
+                db.log_event("warning", "volume_shock_blocked", limit_reason, shock_market)
+                return False
+            shock_settings = settings.model_copy(update={"symbol": shock_symbol}) if settings.trade_selected_symbol and shock_symbol != settings.symbol else settings
+            event = synthetic_event(
+                "volume_shock",
+                0,
+                f"VOLUME SHOCK {shock_symbol} shock={shock_score:.1f}",
+                raw={"market": shock_market, "scan": scan},
+            )
+            _last_shock_arm_at = utc_now()
+            await prepare_and_trade_event(shock_settings, event)
+            return True
+
+    if _last_vol_arm_at and (utc_now() - _last_vol_arm_at).total_seconds() < settings.volatility_cooldown_minutes * 60:
+        return False
+
     if score >= settings.auto_arm_score and market.get("valid_for_sniper"):
-        ok, reason = daily_limits_ok(settings, db.todays_pnl(), db.todays_trade_count(), db.consecutive_losses())
+        ok, limit_reason = daily_limits_ok(settings, db.todays_pnl(), db.todays_trade_count(), db.consecutive_losses())
         if not ok:
-            db.log_event("warning", "auto_arm_blocked", reason, market)
+            db.log_event("warning", "auto_arm_blocked", limit_reason, market)
             return False
-        if settings.trade_selected_symbol and selected_symbol != settings.symbol:
-            settings = settings.model_copy(update={"symbol": selected_symbol})
+        normal_settings = settings.model_copy(update={"symbol": selected_symbol}) if settings.trade_selected_symbol and selected_symbol != settings.symbol else settings
         event = synthetic_event(
             "volatility_scanner",
-            settings.auto_arm_delay_seconds,
+            normal_settings.auto_arm_delay_seconds,
             f"AUTO VOLATILITY HUNT {selected_symbol} score={score:.1f}",
             raw={"market": market, "scan": scan},
         )
         _last_vol_arm_at = utc_now()
-        await prepare_and_trade_event(settings, event)
+        await prepare_and_trade_event(normal_settings, event)
         return True
     return False
-
 
 async def engine_loop() -> None:
     db.set_runtime_state(BotMode.HYBRID_SCAN.value, True, "hybrid engine started")

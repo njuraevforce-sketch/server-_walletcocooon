@@ -136,6 +136,8 @@ async def _private_loop(symbols: List[str], reconnect_seconds: float):
         return
     args = [
         {"instType": INST_TYPE, "channel": "orders", "instId": "default"},
+        # Trigger/plan orders. Important because the bot uses trigger traps.
+        {"instType": INST_TYPE, "channel": "orders-algo", "instId": "default"},
         {"instType": INST_TYPE, "channel": "positions", "instId": "default"},
         {"instType": INST_TYPE, "channel": "account", "instId": "default"},
     ]
@@ -145,10 +147,20 @@ async def _private_loop(symbols: List[str], reconnect_seconds: float):
                 ts = str(int(time.time()))
                 await ws.send(json.dumps({"op": "login", "args": [{"apiKey": key, "passphrase": passphrase, "timestamp": ts, "sign": _sign(ts, secret)}]}))
                 login_msg = await asyncio.wait_for(ws.recv(), timeout=10)
-                if '"event":"login"' not in login_msg or '"code":"0"' not in login_msg:
+                try:
+                    login_data = json.loads(login_msg)
+                except Exception:
+                    login_data = {}
+                # Bitget docs show successful login as {"event":"login","code":"0"},
+                # but in live responses code can arrive as numeric 0 and can include connId.
+                # Treat both string "0" and integer 0 as success.
+                login_ok = login_data.get("event") == "login" and str(login_data.get("code")) == "0"
+                if not login_ok:
                     raise RuntimeError(f"login failed: {login_msg}")
+                _state.last_error = ""
                 await ws.send(json.dumps({"op": "subscribe", "args": args}))
                 _state.private_connected = True
+                _state.private_last_message_ts = time.time()
                 hb = asyncio.create_task(_heartbeat(ws))
                 try:
                     async for msg in ws:
@@ -163,7 +175,7 @@ async def _private_loop(symbols: List[str], reconnect_seconds: float):
                         arg = data.get("arg") or {}
                         ch = arg.get("channel")
                         payload = data.get("data") or []
-                        if ch == "orders" and isinstance(payload, list):
+                        if ch in ("orders", "orders-algo") and isinstance(payload, list):
                             _state.orders = (payload + _state.orders)[:100]
                         elif ch == "positions" and isinstance(payload, list):
                             _state.positions = payload

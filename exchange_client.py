@@ -6,6 +6,7 @@ import json
 import base64
 import hashlib
 import hmac
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -41,8 +42,27 @@ MARGIN_COIN = os.environ.get("BITGET_MARGIN_COIN", "USDT")
 
 
 def _fmt_num(value: float) -> str:
-    text = f"{float(value):.12f}".rstrip("0").rstrip(".")
-    return text if text else "0"
+    """Format numbers for Bitget without Python float noise.
+
+    Bitget validates price scale strictly. A value that is logically 77173.7
+    can become 77173.699999999997 after converting CCXT precision strings to
+    float. Sending that raw value causes Bitget 40808 checkBDScale errors.
+    We round to a safe 8-decimal string and trim trailing zeros. BTC/ETH/SOL
+    USDT futures use fewer decimals than this, while order sizes still keep
+    enough precision.
+    """
+    try:
+        d = Decimal(str(value))
+        if not d.is_finite():
+            return "0"
+        d = d.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
+        text = format(d, "f").rstrip("0").rstrip(".")
+        if text in ("", "-0"):
+            return "0"
+        return text
+    except (InvalidOperation, ValueError, TypeError):
+        text = f"{float(value):.8f}".rstrip("0").rstrip(".")
+        return text if text and text != "-0" else "0"
 
 
 def _api_creds() -> Tuple[str, str, str]:

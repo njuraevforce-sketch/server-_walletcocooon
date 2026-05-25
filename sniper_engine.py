@@ -355,50 +355,95 @@ async def analyze_markets(settings: BotSettings) -> Dict[str, Any]:
 async def build_armed_plan(exchange, settings: BotSettings, event: NewsEvent) -> ArmedPlan:
     settings = with_symbol_profile(settings, settings.symbol)
     await configure_symbol(exchange, settings.symbol, settings.leverage, settings.isolated_margin)
-    ohlcv = await fetch_ohlcv(exchange, settings.symbol, settings.timeframe, limit=160)
-    spread_bps = await get_spread_bps(exchange, settings.symbol)
     is_shock = event.provider == "volume_shock"
-    if is_shock:
-        lookback = max(1, int(sget(settings, "volume_shock_lookback_minutes")))
-    elif event.provider in VOLATILITY_PROVIDERS:
-        lookback = settings.volatility_lookback_minutes
-    else:
-        lookback = settings.range_lookback_minutes
 
-    metrics = volatility_metrics(ohlcv, lookback, settings.compression_lookback_minutes)
-    score = score_volatility(metrics, spread_bps, settings)
-    shock = score_volume_shock(metrics, spread_bps, settings)
-    metrics = {
-        **metrics,
-        **{k: v for k, v in score.items() if isinstance(v, (int, float))},
-        **{k: v for k, v in shock.items() if isinstance(v, (int, float, bool))},
-        "spread_bps": spread_bps,
-        "mode": "volume_shock" if is_shock else "normal_sniper",
-    }
-
+    # V8.3.8: for volume shock, do not throw away the scan signal and re-fetch 1m OHLCV.
+    # The previous flow detected SHOCK_ARM, then build_armed_plan recalculated the candle
+    # again; on SOL/ETH/BTC fast moves the impulse often died before traps were placed.
+    # Use the already validated scan snapshot for volume_shock only. Normal sniper/news
+    # still uses the old fresh-OHLCV validation path.
+    snapshot_used = False
+    snapshot = {}
     if is_shock:
+        try:
+            raw = event.raw or {}
+            candidate = raw.get("market") if isinstance(raw, dict) else None
+            if isinstance(candidate, dict) and str(candidate.get("symbol") or settings.symbol) == str(settings.symbol):
+                needed = ("high", "low", "last", "atr14", "range", "volume_spike", "range_expansion", "last_body_atr", "last_wick_ratio", "last_direction", "spread_bps")
+                if all(candidate.get(k) is not None for k in needed):
+                    snapshot = candidate
+                    snapshot_used = True
+        except Exception:
+            snapshot = {}
+            snapshot_used = False
+
+    if is_shock and snapshot_used:
+        spread_bps = float(snapshot.get("spread_bps") or 999.0)
+        metrics: Dict[str, Any] = {}
+        # Copy numeric market fields from the scan snapshot. Keep only simple values so
+        # the plan meta remains JSON-safe and the risk/trigger math is deterministic.
+        for key, value in snapshot.items():
+            if isinstance(value, (int, float, bool)):
+                metrics[key] = value
+        shock = score_volume_shock(metrics, spread_bps, settings)
+        metrics = {
+            **metrics,
+            **{k: v for k, v in shock.items() if isinstance(v, (int, float, bool))},
+            "spread_bps": spread_bps,
+            "mode": "volume_shock_snapshot",
+            "snapshot_used": True,
+        }
         ok, reason = validate_volume_shock(settings, metrics, spread_bps)
         if not ok:
-            raise RuntimeError(reason)
-        buffer = compute_volume_shock_entry_buffer(settings, metrics, metrics["last"])
-        stop_distance = compute_volume_shock_stop_distance(settings, metrics, metrics["last"])
+            raise RuntimeError(f"snapshot rejected: {reason}")
+        buffer = compute_volume_shock_entry_buffer(settings, metrics, float(metrics["last"]))
+        stop_distance = compute_volume_shock_stop_distance(settings, metrics, float(metrics["last"]))
+        score = {"volatility_score": float(snapshot.get("volatility_score") or 0)}
     else:
-        ok, reason = validate_market_for_event(settings, metrics, spread_bps)
-        if not ok:
-            raise RuntimeError(reason)
-        if event.provider in {"volatility_scanner", "manual_volatility"} and float(score["volatility_score"]) < settings.notify_score:
-            raise RuntimeError(f"volatility score too low: {score['volatility_score']}")
-        buffer = max(settings.min_entry_buffer_usd, metrics["atr14"] * settings.entry_buffer_atr)
-        stop_distance = compute_stop_distance(settings, metrics["atr14"], metrics["range"])
+        ohlcv = await fetch_ohlcv(exchange, settings.symbol, settings.timeframe, limit=160)
+        spread_bps = await get_spread_bps(exchange, settings.symbol)
+        if is_shock:
+            lookback = max(1, int(sget(settings, "volume_shock_lookback_minutes")))
+        elif event.provider in VOLATILITY_PROVIDERS:
+            lookback = settings.volatility_lookback_minutes
+        else:
+            lookback = settings.range_lookback_minutes
+
+        metrics = volatility_metrics(ohlcv, lookback, settings.compression_lookback_minutes)
+        score = score_volatility(metrics, spread_bps, settings)
+        shock = score_volume_shock(metrics, spread_bps, settings)
+        metrics = {
+            **metrics,
+            **{k: v for k, v in score.items() if isinstance(v, (int, float))},
+            **{k: v for k, v in shock.items() if isinstance(v, (int, float, bool))},
+            "spread_bps": spread_bps,
+            "mode": "volume_shock" if is_shock else "normal_sniper",
+            "snapshot_used": False,
+        }
+
+        if is_shock:
+            ok, reason = validate_volume_shock(settings, metrics, spread_bps)
+            if not ok:
+                raise RuntimeError(reason)
+            buffer = compute_volume_shock_entry_buffer(settings, metrics, metrics["last"])
+            stop_distance = compute_volume_shock_stop_distance(settings, metrics, metrics["last"])
+        else:
+            ok, reason = validate_market_for_event(settings, metrics, spread_bps)
+            if not ok:
+                raise RuntimeError(reason)
+            if event.provider in {"volatility_scanner", "manual_volatility"} and float(score["volatility_score"]) < settings.notify_score:
+                raise RuntimeError(f"volatility score too low: {score['volatility_score']}")
+            buffer = max(settings.min_entry_buffer_usd, metrics["atr14"] * settings.entry_buffer_atr)
+            stop_distance = compute_stop_distance(settings, metrics["atr14"], metrics["range"])
 
     live_balance = await fetch_balance_usdt(exchange)
-    risk = compute_order_size(settings, metrics["last"], stop_distance, live_balance)
+    risk = compute_order_size(settings, float(metrics["last"]), stop_distance, live_balance)
     if not risk.allowed:
         raise RuntimeError(risk.reason)
 
     amount = order_amount_precision(exchange, settings.symbol, risk.amount)
-    buy_trigger = price_precision(exchange, settings.symbol, metrics["high"] + buffer)
-    sell_trigger = price_precision(exchange, settings.symbol, metrics["low"] - buffer)
+    buy_trigger = price_precision(exchange, settings.symbol, float(metrics["high"]) + buffer)
+    sell_trigger = price_precision(exchange, settings.symbol, float(metrics["low"]) - buffer)
     buy_stop_loss = price_precision(exchange, settings.symbol, buy_trigger - stop_distance)
     sell_stop_loss = price_precision(exchange, settings.symbol, sell_trigger + stop_distance)
 
@@ -408,8 +453,8 @@ async def build_armed_plan(exchange, settings: BotSettings, event: NewsEvent) ->
         metrics={
             **metrics,
             "entry_buffer": buffer,
-            "volatility_score": float(score["volatility_score"]),
-            "volume_shock_score": float(shock.get("volume_shock_score") or 0),
+            "volatility_score": float(score.get("volatility_score") or 0),
+            "volume_shock_score": float(metrics.get("volume_shock_score") or 0),
             "symbol_profile": base_symbol(settings.symbol),
             "buy_stop_loss": buy_stop_loss,
             "sell_stop_loss": sell_stop_loss,
@@ -425,7 +470,6 @@ async def build_armed_plan(exchange, settings: BotSettings, event: NewsEvent) ->
         buy_client_oid=f"vhs-buy-{uid}",
         sell_client_oid=f"vhs-sell-{uid}",
     )
-
 
 async def place_armed_orders(exchange, settings: BotSettings, plan: ArmedPlan) -> ArmedPlan:
     live_allowed, live_reason = live_trading_allowed(settings)
@@ -497,6 +541,9 @@ async def place_armed_orders(exchange, settings: BotSettings, plan: ArmedPlan) -
         "amount": plan.amount,
         "risk_usd": plan.risk_usd,
         "score": plan.metrics.get("volatility_score"),
+        "volume_shock_score": plan.metrics.get("volume_shock_score"),
+        "snapshot_used": plan.metrics.get("snapshot_used"),
+        "mode": plan.metrics.get("mode"),
     })
     return plan
 
@@ -664,6 +711,9 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
         "exchange_protection": bool(has_exchange_guard),
         "sl_source": "tpsl_order" if last_protection.get("exchange_sl") else "preset_trigger_order",
         "score": plan.metrics.get("volatility_score"),
+        "volume_shock_score": plan.metrics.get("volume_shock_score"),
+        "snapshot_used": plan.metrics.get("snapshot_used"),
+        "mode": plan.metrics.get("mode"),
     })
 
     realized = 0.0

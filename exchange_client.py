@@ -166,35 +166,100 @@ async def bitget_place_plan_order(
     }
 
 
-async def bitget_place_tpsl_order(symbol: str, direction: str, amount: float, trigger_price: float, kind: str, client_oid: str) -> Dict[str, Any]:
-    plan_type = "loss_plan" if kind == "stop_loss" else "profit_plan"
-    # One-way mode holdSide: buy = long position, sell = short position.
-    hold_side = "buy" if direction == "long" else "sell"
+async def bitget_place_tpsl_order(symbol: str, direction: str, amount: float, trigger_price: float, kind: str, client_oid: str, hedge_mode: bool = False) -> Dict[str, Any]:
+    """Place/modify position TP/SL using Bitget V2 position TPSL endpoint.
+
+    The old /place-tpsl-order payload can be rejected by Bitget with 43011
+    delegateType errors on some one-way accounts. The position TPSL endpoint is
+    the correct endpoint for protecting an already opened position.
+    """
+    is_sl = kind == "stop_loss"
+    # Bitget docs: hedge holdSide is long/short; one-way holdSide is buy/sell.
+    if hedge_mode:
+        hold_side = "long" if direction == "long" else "short"
+    else:
+        hold_side = "buy" if direction == "long" else "sell"
+
     payload = {
         "marginCoin": MARGIN_COIN,
         "productType": PRODUCT_TYPE,
         "symbol": plain_symbol(symbol),
-        "planType": plan_type,
-        "triggerPrice": _fmt_num(trigger_price),
-        "triggerType": "fill_price",
-        "executePrice": "0",
         "holdSide": hold_side,
-        "size": _fmt_num(amount),
-        "rangeRate": "",
-        "clientOid": client_oid,
     }
-    data = await bitget_private_request("POST", "/api/v2/mix/order/place-tpsl-order", payload)
-    out = data.get("data") or {}
+    if is_sl:
+        payload.update({
+            "stopLossTriggerPrice": _fmt_num(trigger_price),
+            "stopLossTriggerType": "fill_price",
+            "stopLossExecutePrice": "0",
+            "stopLossSize": _fmt_num(amount),
+            "stopLossClientOid": client_oid,
+        })
+    else:
+        payload.update({
+            "stopSurplusTriggerPrice": _fmt_num(trigger_price),
+            "stopSurplusTriggerType": "fill_price",
+            "stopSurplusExecutePrice": "0",
+            "stopSurplusSize": _fmt_num(amount),
+            "stopSurplusClientOid": client_oid,
+        })
+
+    data = await bitget_private_request("POST", "/api/v2/mix/order/place-pos-tpsl", payload)
+    raw = data.get("data") or []
+    out = raw[0] if isinstance(raw, list) and raw else raw if isinstance(raw, dict) else {}
+    oid = str(out.get("orderId") or client_oid)
     return {
-        "id": str(out.get("orderId") or client_oid),
+        "id": oid,
         "orderId": str(out.get("orderId") or ""),
-        "clientOid": str(out.get("clientOid") or client_oid),
+        "clientOid": str(out.get("stopLossClientOid") or out.get("stopSurplusClientOid") or client_oid),
         "status": "open",
         "info": data,
         "triggerPrice": trigger_price,
         "side": "sell" if direction == "long" else "buy",
         "amount": amount,
-        "type": f"bitget_v2_{plan_type}",
+        "type": "bitget_v2_pos_loss" if is_sl else "bitget_v2_pos_profit",
+    }
+
+
+async def bitget_place_order(
+    symbol: str,
+    side: str,
+    amount: float,
+    client_oid: str,
+    isolated: bool = True,
+    reduce_only: bool = False,
+    hedge_mode: bool = False,
+    trade_side: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Direct Bitget V2 market order.
+
+    Used for emergency/TP/timeout close because CCXT can send Bitget a legacy
+    unilateral/hedge parameter combination and Bitget rejects it with 40774.
+    """
+    payload: Dict[str, Any] = {
+        "symbol": plain_symbol(symbol),
+        "productType": PRODUCT_TYPE,
+        "marginMode": "isolated" if isolated else "crossed",
+        "marginCoin": MARGIN_COIN,
+        "size": _fmt_num(amount),
+        "side": side,
+        "orderType": "market",
+        "clientOid": client_oid,
+    }
+    if reduce_only:
+        payload["reduceOnly"] = "YES"
+    if hedge_mode and trade_side:
+        payload["tradeSide"] = trade_side
+    data = await bitget_private_request("POST", "/api/v2/mix/order/place-order", payload)
+    out = data.get("data") or {}
+    return {
+        "id": str(out.get("orderId") or client_oid),
+        "orderId": str(out.get("orderId") or ""),
+        "clientOid": str(out.get("clientOid") or client_oid),
+        "status": "closed" if reduce_only else "open",
+        "info": data,
+        "side": side,
+        "amount": amount,
+        "type": "bitget_v2_market_reduce" if reduce_only else "bitget_v2_market",
     }
 
 
@@ -350,12 +415,34 @@ async def cancel_all_safely(exchange, symbol: str) -> None:
 
 
 async def close_position_market(exchange, symbol: str, side_to_close: str, amount: float, pos_side: Optional[str] = None) -> Dict[str, Any]:
-    # side_to_close: 'sell' to close long, 'buy' to close short.
-    params: Dict[str, Any] = {"reduceOnly": True}
-    if pos_side:
-        params["positionSide"] = pos_side
-        params["posSide"] = pos_side
-    return await exchange.create_order(ccxt_symbol(symbol), "market", side_to_close, amount, None, params)
+    # side_to_close: one-way mode action: 'sell' closes long, 'buy' closes short.
+    # Do NOT use CCXT here. On Bitget one-way accounts CCXT can produce:
+    # 40774 "The order type for unilateral position must also be the unilateral position type".
+    amount = float(amount or 0)
+    if amount <= 0:
+        return {"status": "skipped", "reason": "amount <= 0"}
+
+    hedge_mode = bool(pos_side)
+    if hedge_mode:
+        # Bitget V2 hedge mode uses side as position direction + tradeSide=close.
+        side = "buy" if str(pos_side).lower() in ("long", "buy") else "sell"
+        trade_side = "close"
+        reduce_only = False
+    else:
+        side = side_to_close
+        trade_side = None
+        reduce_only = True
+
+    return await bitget_place_order(
+        symbol=symbol,
+        side=side,
+        amount=amount,
+        client_oid=f"vhs-close-{int(time.time() * 1000)}",
+        isolated=True,
+        reduce_only=reduce_only,
+        hedge_mode=hedge_mode,
+        trade_side=trade_side,
+    )
 
 
 async def place_trigger_entry(exchange, symbol: str, direction: str, amount: float, trigger_price: float, client_oid: str, hedge_mode: bool, isolated: bool = True, stop_loss_price: Optional[float] = None) -> Dict[str, Any]:
@@ -368,7 +455,7 @@ async def place_trigger_entry(exchange, symbol: str, direction: str, amount: flo
 
 async def place_reduce_trigger(exchange, symbol: str, direction: str, amount: float, trigger_price: float, kind: str, client_oid: str, hedge_mode: bool) -> Dict[str, Any]:
     # Use Bitget V2 TPSL plan orders directly for exchange-side protection.
-    return await bitget_place_tpsl_order(symbol, direction, amount, trigger_price, kind, client_oid)
+    return await bitget_place_tpsl_order(symbol, direction, amount, trigger_price, kind, client_oid, hedge_mode=hedge_mode)
 
 
 async def get_last_price(exchange, symbol: str) -> float:

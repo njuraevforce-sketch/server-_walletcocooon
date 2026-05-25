@@ -60,16 +60,106 @@ VOLUME_SHOCK_DEFAULTS: Dict[str, Any] = {
     "volume_shock_cooldown_minutes": 10,
 }
 
-def sget(settings: BotSettings, name: str, default: Any = None) -> Any:
-    """Read new V8.2+ settings safely even if Railway is running an older BotSettings model.
 
-    This prevents /api/volatility and the engine loop from crashing with:
-    'BotSettings' object has no attribute 'volume_shock_*'
+SYMBOL_PROFILES: Dict[str, Dict[str, Any]] = {
+    # BTC keeps the global panel settings. The panel values were originally tuned around BTC-sized ranges.
+    "BTC": {},
+    # ETH needs dollar thresholds around single-digit moves, not BTC's 80/120 USD filters.
+    "ETH": {
+        "min_pre_range_usd": 3.0,
+        "max_pre_range_usd": 90.0,
+        "min_entry_buffer_usd": 0.70,
+        "min_stop_usd": 4.0,
+        "max_stop_usd": 55.0,
+        "trailing_min_step_usd": 0.40,
+        "max_spread_bps": 12.0,
+        "volume_shock_min_score": 80.0,
+        "volume_shock_min_volume_spike": 2.2,
+        "volume_shock_min_body_atr": 0.70,
+        "volume_shock_min_range_expansion": 0.65,
+        "volume_shock_max_wick_ratio": 0.50,
+        "volume_shock_min_stop_bps": 18.0,
+        "volume_shock_max_stop_bps": 260.0,
+        "volume_shock_entry_buffer_atr": 0.12,
+        "volume_shock_min_entry_buffer_bps": 1.5,
+        "volume_shock_max_entry_buffer_bps": 25.0,
+        "volume_shock_order_life_seconds": 25,
+        "volume_shock_cooldown_minutes": 10,
+    },
+    # SOL needs cent-sized thresholds. BTC/ETH dollar settings would either block it or set unusable stops.
+    "SOL": {
+        "min_pre_range_usd": 0.25,
+        "max_pre_range_usd": 8.0,
+        "min_entry_buffer_usd": 0.05,
+        "min_stop_usd": 0.35,
+        "max_stop_usd": 4.0,
+        "trailing_min_step_usd": 0.05,
+        "max_spread_bps": 18.0,
+        "volume_shock_min_score": 80.0,
+        "volume_shock_min_volume_spike": 2.0,
+        "volume_shock_min_body_atr": 0.70,
+        "volume_shock_min_range_expansion": 0.65,
+        "volume_shock_max_wick_ratio": 0.50,
+        "volume_shock_min_stop_bps": 35.0,
+        "volume_shock_max_stop_bps": 470.0,
+        "volume_shock_entry_buffer_atr": 0.12,
+        "volume_shock_min_entry_buffer_bps": 5.0,
+        "volume_shock_max_entry_buffer_bps": 35.0,
+        "volume_shock_order_life_seconds": 25,
+        "volume_shock_cooldown_minutes": 10,
+    },
+}
+
+
+def base_symbol(symbol: str) -> str:
+    s = str(symbol or "BTC").upper().replace(":USDT", "").replace("/", "")
+    return s[:-4] if s.endswith("USDT") else s
+
+
+def profile_overrides_for_symbol(symbol: str) -> Dict[str, Any]:
+    return dict(SYMBOL_PROFILES.get(base_symbol(symbol), {}))
+
+
+def with_symbol_profile(settings: BotSettings, symbol: str) -> BotSettings:
+    """Return a copy of settings with BTC/ETH/SOL-safe thresholds for the selected symbol.
+
+    Global panel settings stay untouched in Supabase. The engine applies this copy only
+    while analyzing/trading that symbol, so BTC, ETH and SOL do not share the same
+    dollar range/stop/buffer thresholds.
     """
+    updates: Dict[str, Any] = {"symbol": symbol}
+    for key, value in profile_overrides_for_symbol(symbol).items():
+        # Only copy fields that really exist in BotSettings. New volume_shock_* values
+        # are read by sget() because older BotSettings may not define them.
+        if hasattr(settings, key):
+            updates[key] = value
+    try:
+        return settings.model_copy(update=updates)
+    except Exception:
+        # Pydantic v1 fallback, just in case Railway has a different pydantic.
+        data = settings.model_dump() if hasattr(settings, "model_dump") else dict(settings)
+        data.update(updates)
+        return BotSettings(**data)
+
+
+def sget(settings: BotSettings, name: str, default: Any = None) -> Any:
+    """Read settings safely and apply per-symbol overrides.
+
+    Priority:
+    1) Real BotSettings field if it exists and is not None.
+    2) BTC/ETH/SOL profile override for new/non-model fields.
+    3) Global hard default.
+    """
+    # For normal BotSettings fields, a profiled settings copy already contains
+    # ETH/SOL overrides. For new fields that older models do not have, use the
+    # profile table directly.
     if hasattr(settings, name):
         value = getattr(settings, name)
         if value is not None:
             return value
+    profile = profile_overrides_for_symbol(getattr(settings, "symbol", "BTC/USDT"))
+    if name in profile:
+        return profile[name]
     return VOLUME_SHOCK_DEFAULTS.get(name, default)
 
 
@@ -86,6 +176,8 @@ class ArmedPlan:
     notional: float
     buy_order_id: Optional[str] = None
     sell_order_id: Optional[str] = None
+    buy_stop_loss: Optional[float] = None
+    sell_stop_loss: Optional[float] = None
     buy_client_oid: str = ""
     sell_client_oid: str = ""
 
@@ -204,20 +296,25 @@ async def sync_calendar(settings: BotSettings) -> List[NewsEvent]:
 
 
 async def analyze_market(symbol: str, settings: BotSettings) -> Dict[str, Any]:
+    effective = with_symbol_profile(settings, symbol)
     exchange = await get_exchange()
     try:
-        ohlcv = await fetch_ohlcv(exchange, symbol, settings.timeframe, limit=160)
-        spread_bps = await get_spread_bps(exchange, symbol)
-        metrics = volatility_metrics(ohlcv, settings.volatility_lookback_minutes, settings.compression_lookback_minutes)
-        event_valid, event_reason = validate_market_for_event(settings, metrics, spread_bps)
-        score = score_volatility(metrics, spread_bps, settings)
-        shock = score_volume_shock(metrics, spread_bps, settings)
+        ohlcv = await fetch_ohlcv(exchange, effective.symbol, effective.timeframe, limit=160)
+        spread_bps = await get_spread_bps(exchange, effective.symbol)
+        metrics = volatility_metrics(ohlcv, effective.volatility_lookback_minutes, effective.compression_lookback_minutes)
+        event_valid, event_reason = validate_market_for_event(effective, metrics, spread_bps)
+        score = score_volatility(metrics, spread_bps, effective)
+        shock = score_volume_shock(metrics, spread_bps, effective)
         return {
             "valid_for_sniper": bool(event_valid),
             "valid_for_news_sniper": bool(event_valid),
             "event_reason": event_reason,
             "reason": score["reason"],
             "spread_bps": spread_bps,
+            "symbol_profile": base_symbol(effective.symbol),
+            "effective_min_pre_range_usd": getattr(effective, "min_pre_range_usd", None),
+            "effective_min_stop_usd": getattr(effective, "min_stop_usd", None),
+            "effective_min_entry_buffer_usd": getattr(effective, "min_entry_buffer_usd", None),
             **metrics,
             **score,
             **shock,
@@ -253,6 +350,7 @@ async def analyze_markets(settings: BotSettings) -> Dict[str, Any]:
     return {"symbols": symbols, "best": best, "best_shock": best_shock, "markets": markets_sorted}
 
 async def build_armed_plan(exchange, settings: BotSettings, event: NewsEvent) -> ArmedPlan:
+    settings = with_symbol_profile(settings, settings.symbol)
     await configure_symbol(exchange, settings.symbol, settings.leverage, settings.isolated_margin)
     ohlcv = await fetch_ohlcv(exchange, settings.symbol, settings.timeframe, limit=160)
     spread_bps = await get_spread_bps(exchange, settings.symbol)
@@ -298,17 +396,29 @@ async def build_armed_plan(exchange, settings: BotSettings, event: NewsEvent) ->
     amount = order_amount_precision(exchange, settings.symbol, risk.amount)
     buy_trigger = price_precision(exchange, settings.symbol, metrics["high"] + buffer)
     sell_trigger = price_precision(exchange, settings.symbol, metrics["low"] - buffer)
+    buy_stop_loss = price_precision(exchange, settings.symbol, buy_trigger - stop_distance)
+    sell_stop_loss = price_precision(exchange, settings.symbol, sell_trigger + stop_distance)
 
     uid = uuid.uuid4().hex[:12]
     return ArmedPlan(
         event=event,
-        metrics={**metrics, "entry_buffer": buffer, "volatility_score": float(score["volatility_score"]), "volume_shock_score": float(shock.get("volume_shock_score") or 0)},
+        metrics={
+            **metrics,
+            "entry_buffer": buffer,
+            "volatility_score": float(score["volatility_score"]),
+            "volume_shock_score": float(shock.get("volume_shock_score") or 0),
+            "symbol_profile": base_symbol(settings.symbol),
+            "buy_stop_loss": buy_stop_loss,
+            "sell_stop_loss": sell_stop_loss,
+        },
         buy_trigger=buy_trigger,
         sell_trigger=sell_trigger,
         stop_distance=stop_distance,
         amount=amount,
         risk_usd=risk.risk_usd,
         notional=risk.notional,
+        buy_stop_loss=buy_stop_loss,
+        sell_stop_loss=sell_stop_loss,
         buy_client_oid=f"vhs-buy-{uid}",
         sell_client_oid=f"vhs-sell-{uid}",
     )
@@ -328,6 +438,7 @@ async def place_armed_orders(exchange, settings: BotSettings, plan: ArmedPlan) -
         client_oid=plan.buy_client_oid,
         hedge_mode=settings.hedge_mode,
         isolated=settings.isolated_margin,
+        stop_loss_price=plan.buy_stop_loss,
     )
     sell = await place_trigger_entry(
         exchange=exchange,
@@ -338,6 +449,7 @@ async def place_armed_orders(exchange, settings: BotSettings, plan: ArmedPlan) -
         client_oid=plan.sell_client_oid,
         hedge_mode=settings.hedge_mode,
         isolated=settings.isolated_margin,
+        stop_loss_price=plan.sell_stop_loss,
     )
     plan.buy_order_id = str(buy.get("id") or buy.get("orderId") or plan.buy_client_oid)
     plan.sell_order_id = str(sell.get("id") or sell.get("orderId") or plan.sell_client_oid)
@@ -355,7 +467,7 @@ async def place_armed_orders(exchange, settings: BotSettings, plan: ArmedPlan) -
         "trigger_price": plan.buy_trigger,
         "amount": plan.amount,
         "risk_usd": plan.risk_usd,
-        "meta": {"plan": plan.metrics, "paired_oid": plan.sell_client_oid},
+        "meta": {"plan": plan.metrics, "paired_oid": plan.sell_client_oid, "preset_sl": plan.buy_stop_loss},
     })
     db.create_trade({
         "client_oid": plan.sell_client_oid,
@@ -369,7 +481,7 @@ async def place_armed_orders(exchange, settings: BotSettings, plan: ArmedPlan) -
         "trigger_price": plan.sell_trigger,
         "amount": plan.amount,
         "risk_usd": plan.risk_usd,
-        "meta": {"plan": plan.metrics, "paired_oid": plan.buy_client_oid},
+        "meta": {"plan": plan.metrics, "paired_oid": plan.buy_client_oid, "preset_sl": plan.sell_stop_loss},
     })
     db.log_event("warning", "orders_armed", "LIVE trigger traps placed", {
         "event": plan.event.title,
@@ -377,6 +489,8 @@ async def place_armed_orders(exchange, settings: BotSettings, plan: ArmedPlan) -
         "time": plan.event.event_time_utc.isoformat(),
         "buy_trigger": plan.buy_trigger,
         "sell_trigger": plan.sell_trigger,
+        "buy_stop_loss": plan.buy_stop_loss,
+        "sell_stop_loss": plan.sell_stop_loss,
         "amount": plan.amount,
         "risk_usd": plan.risk_usd,
         "score": plan.metrics.get("volatility_score"),
@@ -395,13 +509,12 @@ async def wait_for_breakout(exchange, settings: BotSettings, plan: ArmedPlan) ->
     deadline = plan.event.event_time_utc + timedelta(seconds=post_wait)
     mode = BotMode.VOLATILITY_ARMED.value if plan.event.provider in VOLATILITY_PROVIDERS else BotMode.CALENDAR_ARMED.value
     db.set_runtime_state(mode, True, f"armed traps: {plan.event.title}")
-    symbol = ccxt_symbol(settings.symbol)
+
+    # Bitget V2 trigger plan orders are not normal orders. Checking them through
+    # CCXT fetch_order causes 40109 spam. The reliable live signal is the actual
+    # futures position, via private WS/REST fetch_positions fallback.
     while utc_now() <= deadline and not engine_stop.is_set():
         try:
-            # Bitget V2 plan orders execute into a real futures position.
-            # Fetching them via generic CCXT fetch_order is not always reliable,
-            # so the safest live confirmation is: did the configured symbol now
-            # have a position? Private WS also sees it, but REST fallback is exact.
             pos = await fetch_symbol_position(exchange, settings.symbol)
             if float(pos.get("amount") or 0) > 0 and pos.get("direction") in ("long", "short"):
                 direction = str(pos.get("direction"))
@@ -410,49 +523,17 @@ async def wait_for_breakout(exchange, settings: BotSettings, plan: ArmedPlan) ->
                     px = pos.get("entry") or await get_last_price(exchange, settings.symbol)
                     db.update_trade_by_client_oid(plan.buy_client_oid, {"status": "active", "execution_price": px})
                     db.update_trade_by_client_oid(plan.sell_client_oid, {"status": "cancelled"})
-                    db.log_event("warning", "breakout_position_detected", "Long position detected after trigger trap", {"symbol": settings.symbol, "amount": pos.get("amount"), "entry": px})
+                    db.log_event("warning", "breakout_position_detected", "Long position detected after trigger trap", {"symbol": settings.symbol, "amount": pos.get("amount"), "entry": px, "preset_sl": plan.buy_stop_loss})
                     return "long"
                 else:
                     await cancel_safely(exchange, plan.buy_order_id, settings.symbol)
                     px = pos.get("entry") or await get_last_price(exchange, settings.symbol)
                     db.update_trade_by_client_oid(plan.sell_client_oid, {"status": "active", "execution_price": px})
                     db.update_trade_by_client_oid(plan.buy_client_oid, {"status": "cancelled"})
-                    db.log_event("warning", "breakout_position_detected", "Short position detected after trigger trap", {"symbol": settings.symbol, "amount": pos.get("amount"), "entry": px})
+                    db.log_event("warning", "breakout_position_detected", "Short position detected after trigger trap", {"symbol": settings.symbol, "amount": pos.get("amount"), "entry": px, "preset_sl": plan.sell_stop_loss})
                     return "short"
-
-            buy = await exchange.fetch_order(plan.buy_order_id, symbol)
-            sell = await exchange.fetch_order(plan.sell_order_id, symbol)
-            buy_filled = infer_filled(buy)
-            sell_filled = infer_filled(sell)
-            if buy_filled and sell_filled:
-                db.log_event("critical", "double_fill_detected", "Both breakout traps filled; emergency flatten started", {
-                    "buy_order_id": plan.buy_order_id,
-                    "sell_order_id": plan.sell_order_id,
-                    "buy": buy,
-                    "sell": sell,
-                })
-                db.update_trade_by_client_oid(plan.buy_client_oid, {"status": "double_filled"})
-                db.update_trade_by_client_oid(plan.sell_client_oid, {"status": "double_filled"})
-                if settings.double_fill_emergency_flatten:
-                    try:
-                        await cancel_all_safely(exchange, settings.symbol)
-                        await flatten_symbol_positions(exchange, settings.symbol, settings.hedge_mode)
-                        db.log_event("critical", "double_fill_flattened", "Emergency flatten attempted after double fill", {})
-                    except Exception as inner:
-                        db.log_event("critical", "double_fill_flatten_failed", f"Emergency flatten failed after double fill: {inner}", {})
-                return None
-            if buy_filled:
-                await cancel_safely(exchange, plan.sell_order_id, settings.symbol)
-                db.update_trade_by_client_oid(plan.buy_client_oid, {"status": "active", "execution_price": buy.get("average") or buy.get("price")})
-                db.update_trade_by_client_oid(plan.sell_client_oid, {"status": "cancelled"})
-                return "long"
-            if sell_filled:
-                await cancel_safely(exchange, plan.buy_order_id, settings.symbol)
-                db.update_trade_by_client_oid(plan.sell_client_oid, {"status": "active", "execution_price": sell.get("average") or sell.get("price")})
-                db.update_trade_by_client_oid(plan.buy_client_oid, {"status": "cancelled"})
-                return "short"
         except Exception as e:
-            db.log_event("error", "watch_orders", f"Order watch error: {e}", {})
+            db.log_event("error", "watch_position", f"Position watch error: {e}", {})
         await asyncio.sleep(settings.order_watch_interval_seconds)
 
     await cancel_safely(exchange, plan.buy_order_id, settings.symbol)
@@ -524,16 +605,20 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
     last_stop_sent = stop_price
     last_stop_update_at = 0.0
     current_sl_order_id: Optional[str] = None
+    preset_sl_price = plan.buy_stop_loss if direction == "long" else plan.sell_stop_loss
     tp1_price = entry + plan.stop_distance * settings.tp1_r if direction == "long" else entry - plan.stop_distance * settings.tp1_r
     tp2_price = entry + plan.stop_distance * settings.tp2_r if direction == "long" else entry - plan.stop_distance * settings.tp2_r
     best_price = entry
     started = time.time()
     last_protection = await attach_exchange_protection(exchange, settings, direction, remaining, entry, plan.stop_distance)
     current_sl_order_id = last_protection.get("exchange_sl_id")
+    has_exchange_guard = bool(last_protection.get("exchange_sl")) or bool(preset_sl_price)
+    if bool(preset_sl_price) and not last_protection.get("exchange_sl"):
+        db.log_event("warning", "preset_sl_guard_active", "Position protected by stop-loss preset on trigger order", {"direction": direction, "preset_sl": preset_sl_price})
 
     # V7 live guard: if the exchange did not confirm a real SL, do not keep the position alive.
     # Manual polling is a backup, not a substitute for an exchange-side stop during news volatility.
-    if settings.hard_exchange_sl_required and not last_protection.get("exchange_sl"):
+    if settings.hard_exchange_sl_required and not has_exchange_guard:
         active_oid = plan.buy_client_oid if direction == "long" else plan.sell_client_oid
         msg = "Exchange-side SL was not confirmed; position will be flattened immediately"
         db.log_event("critical", "no_exchange_sl_flatten", msg, {
@@ -573,13 +658,27 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
         "sl": stop_price,
         "tp1": tp1_price,
         "tp2": tp2_price,
-        "exchange_protection": bool(last_protection.get("exchange_sl")),
+        "exchange_protection": bool(has_exchange_guard),
+        "sl_source": "tpsl_order" if last_protection.get("exchange_sl") else "preset_trigger_order",
         "score": plan.metrics.get("volatility_score"),
     })
 
     realized = 0.0
     try:
         while not engine_stop.is_set():
+            live_pos = await fetch_symbol_position(exchange, settings.symbol)
+            if float(live_pos.get("amount") or 0) <= 0:
+                active_oid = plan.buy_client_oid if direction == "long" else plan.sell_client_oid
+                px = await get_last_price(exchange, settings.symbol)
+                db.update_trade_by_client_oid(active_oid, {
+                    "status": "closed",
+                    "close_price": px,
+                    "close_reason": "external_or_manual_close",
+                    "meta": {"entry": entry, "last": px, "manual_or_exchange_closed": True, "score": plan.metrics.get("volatility_score")},
+                })
+                db.log_event("warning", "position_closed_externally", "Position is no longer open on exchange; marked closed in database", {"direction": direction, "price": px})
+                break
+
             price = await get_last_price(exchange, settings.symbol)
             if direction == "long":
                 r = (price - entry) / plan.stop_distance
@@ -731,7 +830,7 @@ async def maybe_auto_arm_volatility(settings: BotSettings) -> bool:
             if not ok:
                 db.log_event("warning", "volume_shock_blocked", limit_reason, shock_market)
                 return False
-            shock_settings = settings.model_copy(update={"symbol": shock_symbol}) if settings.trade_selected_symbol and shock_symbol != settings.symbol else settings
+            shock_settings = with_symbol_profile(settings, shock_symbol if settings.trade_selected_symbol else settings.symbol)
             event = synthetic_event(
                 "volume_shock",
                 0,
@@ -750,7 +849,7 @@ async def maybe_auto_arm_volatility(settings: BotSettings) -> bool:
         if not ok:
             db.log_event("warning", "auto_arm_blocked", limit_reason, market)
             return False
-        normal_settings = settings.model_copy(update={"symbol": selected_symbol}) if settings.trade_selected_symbol and selected_symbol != settings.symbol else settings
+        normal_settings = with_symbol_profile(settings, selected_symbol if settings.trade_selected_symbol else settings.symbol)
         event = synthetic_event(
             "volatility_scanner",
             normal_settings.auto_arm_delay_seconds,
@@ -836,22 +935,28 @@ async def stop_engine() -> Dict[str, Any]:
     global engine_task, engine_stop
     engine_stop.set()
     settings = db.get_settings()
+    symbols = list(dict.fromkeys([str(x).strip() for x in (settings.scan_symbols or [settings.symbol]) if str(x).strip()]))
     exchange = await get_exchange()
+    results: Dict[str, Any] = {}
     try:
-        await cancel_all_safely(exchange, settings.symbol)
-        if settings.kill_switch_closes_positions:
+        for sym in symbols:
             try:
-                await flatten_symbol_positions(exchange, settings.symbol, settings.hedge_mode)
-                db.log_event("warning", "kill_switch_flatten", "Kill switch attempted to flatten open symbol positions", {"symbol": settings.symbol})
+                await cancel_all_safely(exchange, sym)
+                results[sym] = {"orders_cancelled": True, "flattened": False}
+                if settings.kill_switch_closes_positions:
+                    await flatten_symbol_positions(exchange, sym, settings.hedge_mode)
+                    results[sym]["flattened"] = True
+                    db.log_event("warning", "kill_switch_flatten", "Kill switch attempted to flatten open symbol positions", {"symbol": sym})
             except Exception as e:
-                db.log_event("critical", "kill_switch_flatten_failed", f"Kill switch flatten failed: {e}", {"symbol": settings.symbol})
+                results[sym] = {"error": str(e)}
+                db.log_event("critical", "kill_switch_symbol_failed", f"Kill switch failed for {sym}: {e}", {"symbol": sym})
     finally:
         await exchange.close()
     if engine_task:
         engine_task.cancel()
     await bitget_ws.stop()
-    db.set_runtime_state(BotMode.OFF.value, False, "manual stop; all orders cancellation attempted")
-    return {"status": "stopped", "message": "Engine stopped and open orders cancellation attempted."}
+    db.set_runtime_state(BotMode.OFF.value, False, "manual stop; scan-symbol orders cancellation attempted")
+    return {"status": "stopped", "message": "Engine stopped and scan-symbol order cancellation attempted.", "symbols": results}
 
 
 async def manual_arm(provider_id: str) -> Dict[str, Any]:

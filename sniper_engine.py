@@ -62,8 +62,11 @@ VOLUME_SHOCK_DEFAULTS: Dict[str, Any] = {
 
 
 SYMBOL_PROFILES: Dict[str, Dict[str, Any]] = {
-    # BTC keeps the global panel settings. The panel values were originally tuned around BTC-sized ranges.
-    "BTC": {},
+    # BTC keeps BTC-sized ranges, but allows a slightly larger chase candle than ETH/SOL.
+    # The previous global 1.8 ATR blocked a valid BTC arm at 1.85 ATR.
+    "BTC": {
+        "max_chase_candle_atr": 1.95,
+    },
     # ETH needs dollar thresholds around single-digit moves, not BTC's 80/120 USD filters.
     "ETH": {
         "min_pre_range_usd": 3.0,
@@ -763,11 +766,18 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
                 db.log_event("critical", "emergency_flatten_failed", f"Emergency flatten failed: {inner}", {})
 
 
-async def prepare_and_trade_event(settings: BotSettings, event: NewsEvent) -> None:
+async def prepare_and_trade_event(settings: BotSettings, event: NewsEvent) -> bool:
+    """Prepare traps and manage the trade.
+
+    Returns True only after LIVE trigger traps were actually placed on the exchange.
+    This is important: auto-arm cooldown must not start after build/validation failures,
+    otherwise the scanner blocks itself while no order was ever armed.
+    """
     mode = BotMode.VOLATILITY_ARMED.value if event.provider in VOLATILITY_PROVIDERS else BotMode.CALENDAR_ARMED.value
     db.upsert_news_event(event)
     db.mark_event_status(event.provider_id, "arming", "Preparing trigger traps")
     exchange = await get_exchange()
+    armed = False
     try:
         ok, reason = daily_limits_ok(settings, db.todays_pnl(), db.todays_trade_count(), db.consecutive_losses())
         if not ok:
@@ -775,6 +785,7 @@ async def prepare_and_trade_event(settings: BotSettings, event: NewsEvent) -> No
 
         plan = await build_armed_plan(exchange, settings, event)
         await place_armed_orders(exchange, settings, plan)
+        armed = True
         direction = await wait_for_breakout(exchange, settings, plan)
         if direction:
             await manage_position(exchange, settings, plan, direction)
@@ -782,7 +793,7 @@ async def prepare_and_trade_event(settings: BotSettings, event: NewsEvent) -> No
         else:
             db.mark_event_status(event.provider_id, "no_trade", "No breakout in allowed window")
     except Exception as e:
-        db.log_event("error", "trade_failed", f"Trade failed: {e}", {"event": event.model_dump(mode="json")})
+        db.log_event("error", "trade_failed", f"Trade failed: {e}", {"event": event.model_dump(mode="json"), "armed": armed})
         db.mark_event_status(event.provider_id, "failed", str(e))
         try:
             await cancel_all_safely(exchange, settings.symbol)
@@ -792,6 +803,7 @@ async def prepare_and_trade_event(settings: BotSettings, event: NewsEvent) -> No
         await exchange.close()
         if not engine_stop.is_set():
             db.set_runtime_state(mode, True, "waiting for next opportunity")
+    return armed
 
 
 async def maybe_auto_arm_volatility(settings: BotSettings) -> bool:
@@ -837,9 +849,13 @@ async def maybe_auto_arm_volatility(settings: BotSettings) -> bool:
                 f"VOLUME SHOCK {shock_symbol} shock={shock_score:.1f}",
                 raw={"market": shock_market, "scan": scan},
             )
-            _last_shock_arm_at = utc_now()
-            await prepare_and_trade_event(shock_settings, event)
-            return True
+            armed = await prepare_and_trade_event(shock_settings, event)
+            if armed:
+                _last_shock_arm_at = utc_now()
+                db.log_event("info", "volume_shock_cooldown_started", "Volume shock cooldown started after successful orders_armed", {"symbol": shock_settings.symbol, "score": shock_score})
+                return True
+            db.log_event("info", "volume_shock_no_cooldown", "Volume shock attempt failed before orders_armed; cooldown not started", {"symbol": shock_settings.symbol, "score": shock_score})
+            return False
 
     if _last_vol_arm_at and (utc_now() - _last_vol_arm_at).total_seconds() < settings.volatility_cooldown_minutes * 60:
         return False
@@ -856,9 +872,13 @@ async def maybe_auto_arm_volatility(settings: BotSettings) -> bool:
             f"AUTO VOLATILITY HUNT {selected_symbol} score={score:.1f}",
             raw={"market": market, "scan": scan},
         )
-        _last_vol_arm_at = utc_now()
-        await prepare_and_trade_event(normal_settings, event)
-        return True
+        armed = await prepare_and_trade_event(normal_settings, event)
+        if armed:
+            _last_vol_arm_at = utc_now()
+            db.log_event("info", "volatility_cooldown_started", "Volatility cooldown started after successful orders_armed", {"symbol": normal_settings.symbol, "score": score})
+            return True
+        db.log_event("info", "volatility_no_cooldown", "Volatility attempt failed before orders_armed; cooldown not started", {"symbol": normal_settings.symbol, "score": score})
+        return False
     return False
 
 async def engine_loop() -> None:

@@ -125,9 +125,28 @@ def todays_pnl() -> float:
 
 
 def todays_trade_count() -> int:
+    """Count only real executed entries for daily trade limits.
+
+    Trigger traps create two rows in trades_log before any position exists.
+    Expired/cancelled traps must not consume max_trades_per_day.
+    A real trade is counted only when the entry was actually filled and
+    execution_price is present.
+    """
     start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    res = supabase.table("trades_log").select("id", count="exact").gte("created_at", start).execute()
-    return int(res.count or 0)
+    res = (
+        supabase.table("trades_log")
+        .select("id,execution_price,status")
+        .gte("created_at", start)
+        .execute()
+    )
+    count = 0
+    for row in res.data or []:
+        status = str(row.get("status") or "").lower()
+        if status in {"armed", "expired", "cancelled"}:
+            continue
+        if row.get("execution_price") is not None:
+            count += 1
+    return count
 
 
 def consecutive_losses(limit: int = 10) -> int:

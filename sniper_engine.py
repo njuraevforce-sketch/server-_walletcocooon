@@ -595,33 +595,74 @@ async def wait_for_breakout(exchange, settings: BotSettings, plan: ArmedPlan) ->
 
 
 async def attach_exchange_protection(exchange, settings: BotSettings, direction: str, amount: float, entry: float, stop_distance: float) -> Dict[str, Any]:
+    """Attach real exchange-side protection immediately after a trap fill.
+
+    V8.3.9 change:
+    - SL stays exchange-side, as before.
+    - TP1 is now also placed exchange-side immediately for the configured partial size.
+      Before this, TP1 was only a local polling rule inside manage_position(), so Bitget UI
+      did not show a TP order and a Railway lag/restart could miss the take-profit.
+    - TP2 remains optional and disabled unless settings.tp2_enabled is true.
+    """
     if direction == "long":
         sl = price_precision(exchange, settings.symbol, entry - stop_distance)
+        tp1 = price_precision(exchange, settings.symbol, entry + stop_distance * settings.tp1_r)
         tp2 = price_precision(exchange, settings.symbol, entry + stop_distance * settings.tp2_r)
     else:
         sl = price_precision(exchange, settings.symbol, entry + stop_distance)
+        tp1 = price_precision(exchange, settings.symbol, entry - stop_distance * settings.tp1_r)
         tp2 = price_precision(exchange, settings.symbol, entry - stop_distance * settings.tp2_r)
 
-    out: Dict[str, Any] = {"sl": sl, "tp2": tp2, "exchange_sl": None, "exchange_tp2": None}
+    tp1_amount = 0.0
+    if settings.tp1_enabled and settings.tp1_close_pct > 0:
+        tp1_amount = order_amount_precision(exchange, settings.symbol, amount * settings.tp1_close_pct)
+
+    out: Dict[str, Any] = {
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp1_amount": tp1_amount,
+        "exchange_sl": None,
+        "exchange_tp1": None,
+        "exchange_tp2": None,
+    }
     try:
-        out["exchange_sl"] = await place_reduce_trigger(exchange, settings.symbol, direction, amount, sl, "stop_loss", f"vhs-sl-{uuid.uuid4().hex[:10]}", settings.hedge_mode)
+        out["exchange_sl"] = await place_reduce_trigger(
+            exchange, settings.symbol, direction, amount, sl, "stop_loss", f"vhs-sl-{uuid.uuid4().hex[:10]}", settings.hedge_mode
+        )
         out["exchange_sl_id"] = extract_order_id(out["exchange_sl"])
     except Exception as e:
         db.log_event("error", "protect_sl_failed", f"Exchange SL failed; manual guard active: {e}", {"sl": sl})
+
+    if tp1_amount > 0:
+        try:
+            out["exchange_tp1"] = await place_reduce_trigger(
+                exchange, settings.symbol, direction, tp1_amount, tp1, "take_profit", f"vhs-tp1-{uuid.uuid4().hex[:10]}", settings.hedge_mode
+            )
+            out["exchange_tp1_id"] = extract_order_id(out["exchange_tp1"])
+            db.log_event("info", "exchange_tp1_placed", "Exchange TP1 reduce trigger placed", {"tp1": tp1, "amount": tp1_amount})
+        except Exception as e:
+            db.log_event("error", "protect_tp1_failed", f"Exchange TP1 failed; local TP1 fallback active: {e}", {"tp1": tp1, "amount": tp1_amount})
+
     if settings.tp2_enabled:
         try:
-            out["exchange_tp2"] = await place_reduce_trigger(exchange, settings.symbol, direction, amount, tp2, "take_profit", f"vhs-tp-{uuid.uuid4().hex[:10]}", settings.hedge_mode)
+            out["exchange_tp2"] = await place_reduce_trigger(
+                exchange, settings.symbol, direction, amount, tp2, "take_profit", f"vhs-tp2-{uuid.uuid4().hex[:10]}", settings.hedge_mode
+            )
+            out["exchange_tp2_id"] = extract_order_id(out["exchange_tp2"])
         except Exception as e:
-            db.log_event("error", "protect_tp_failed", f"Exchange TP failed; manual guard active: {e}", {"tp2": tp2})
+            db.log_event("error", "protect_tp2_failed", f"Exchange TP2 failed; manual guard active: {e}", {"tp2": tp2})
 
-    # V7: TP without SL is dangerous. If SL failed, remove TP so the bot does not leave
-    # a one-sided orphan protection order after emergency flatten.
-    if not out.get("exchange_sl") and out.get("exchange_tp2") and settings.cancel_tp_if_sl_fails:
-        try:
-            await cancel_safely(exchange, str(out["exchange_tp2"].get("id") or out["exchange_tp2"].get("orderId")), settings.symbol)
-            db.log_event("warning", "orphan_tp_cancelled", "TP cancelled because exchange SL was not confirmed", {"tp2": tp2})
-        except Exception as e:
-            db.log_event("error", "orphan_tp_cancel_failed", f"Could not cancel TP after SL failure: {e}", {})
+    # TP without SL is dangerous. If SL failed, remove any exchange TP so the bot does
+    # not leave one-sided orphan protection orders after emergency flatten.
+    if not out.get("exchange_sl") and settings.cancel_tp_if_sl_fails:
+        for key, label in (("exchange_tp1", "TP1"), ("exchange_tp2", "TP2")):
+            if out.get(key):
+                try:
+                    await cancel_safely(exchange, str(out[key].get("id") or out[key].get("orderId")), settings.symbol)
+                    db.log_event("warning", "orphan_tp_cancelled", f"{label} cancelled because exchange SL was not confirmed", {"tp1": tp1, "tp2": tp2})
+                except Exception as e:
+                    db.log_event("error", "orphan_tp_cancel_failed", f"Could not cancel {label} after SL failure: {e}", {})
     return out
 
 
@@ -662,6 +703,8 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
     started = time.time()
     last_protection = await attach_exchange_protection(exchange, settings, direction, remaining, entry, plan.stop_distance)
     current_sl_order_id = last_protection.get("exchange_sl_id")
+    current_tp1_order_id = last_protection.get("exchange_tp1_id")
+    current_tp2_order_id = last_protection.get("exchange_tp2_id")
     has_exchange_guard = bool(last_protection.get("exchange_sl")) or bool(preset_sl_price)
     if bool(preset_sl_price) and not last_protection.get("exchange_sl"):
         db.log_event("warning", "preset_sl_guard_active", "Position protected by stop-loss preset on trigger order", {"direction": direction, "preset_sl": preset_sl_price})
@@ -710,6 +753,10 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
         "tp2": tp2_price,
         "exchange_protection": bool(has_exchange_guard),
         "sl_source": "tpsl_order" if last_protection.get("exchange_sl") else "preset_trigger_order",
+        "tp1": tp1_price,
+        "tp1_amount": last_protection.get("tp1_amount"),
+        "tp1_source": "exchange_reduce_trigger" if last_protection.get("exchange_tp1") else "local_fallback",
+        "exchange_tp1": bool(last_protection.get("exchange_tp1")),
         "score": plan.metrics.get("volatility_score"),
         "volume_shock_score": plan.metrics.get("volume_shock_score"),
         "snapshot_used": plan.metrics.get("snapshot_used"),
@@ -720,7 +767,8 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
     try:
         while not engine_stop.is_set():
             live_pos = await fetch_symbol_position(exchange, settings.symbol)
-            if float(live_pos.get("amount") or 0) <= 0:
+            live_amount = float(live_pos.get("amount") or 0)
+            if live_amount <= 0:
                 active_oid = plan.buy_client_oid if direction == "long" else plan.sell_client_oid
                 px = await get_last_price(exchange, settings.symbol)
                 db.update_trade_by_client_oid(active_oid, {
@@ -733,6 +781,22 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
                 break
 
             price = await get_last_price(exchange, settings.symbol)
+
+            # V8.3.9: if exchange TP1 partially reduced the position, detect it from
+            # live position size, then move remaining SL to breakeven. This makes TP1
+            # truly exchange-side while the bot still updates its internal state.
+            if settings.tp1_enabled and not tp1_done and live_amount < remaining:
+                closed_amount = order_amount_precision(exchange, settings.symbol, max(0.0, remaining - live_amount))
+                if closed_amount > 0:
+                    pnl = (price - entry) * closed_amount if direction == "long" else (entry - price) * closed_amount
+                    realized += pnl
+                    remaining = order_amount_precision(exchange, settings.symbol, live_amount)
+                    tp1_done = True
+                    stop_price = entry
+                    current_sl_order_id = await update_exchange_stop(exchange, settings, direction, remaining, stop_price, current_sl_order_id)
+                    last_stop_sent = stop_price
+                    last_stop_update_at = time.time()
+                    db.log_event("info", "tp1_exchange_detected", "Exchange TP1 filled; stop moved to breakeven", {"price": price, "pnl": pnl, "closed_amount": closed_amount, "remaining": remaining, "sl": stop_price})
             if direction == "long":
                 r = (price - entry) / plan.stop_distance
                 best_price = max(best_price, price)
@@ -770,7 +834,7 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
                 last_stop_sent = stop_price
                 last_stop_update_at = time.time()
 
-            if settings.tp1_enabled and settings.tp1_close_pct > 0 and hit_tp1 and not tp1_done:
+            if settings.tp1_enabled and settings.tp1_close_pct > 0 and hit_tp1 and not tp1_done and not current_tp1_order_id:
                 close_amount = order_amount_precision(exchange, settings.symbol, remaining * settings.tp1_close_pct)
                 if close_amount > 0:
                     await close_position_market(exchange, settings.symbol, side_close, close_amount, direction if settings.hedge_mode else None)
@@ -783,11 +847,19 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
                     current_sl_order_id = await update_exchange_stop(exchange, settings, direction, remaining, stop_price, current_sl_order_id)
                     last_stop_sent = stop_price
                     last_stop_update_at = time.time()
-                    db.log_event("info", "tp1", "TP1 partial profit taken; stop moved to breakeven", {"price": price, "pnl": pnl, "remaining": remaining})
+                    db.log_event("info", "tp1_local_fallback", "TP1 partial profit taken by local fallback; stop moved to breakeven", {"price": price, "pnl": pnl, "remaining": remaining})
 
             exit_by_tp2 = bool(settings.tp2_enabled and hit_tp2)
             if hit_stop or exit_by_tp2 or stale_exit or timeout_exit:
                 reason = "trailing_stop" if hit_stop and trailing_active else "stop" if hit_stop else "tp2" if exit_by_tp2 else "stale_exit" if stale_exit else "timeout"
+                # If the bot is closing the remaining position itself, remove any outstanding TP orders first.
+                for oid, label in ((current_tp1_order_id, "TP1"), (current_tp2_order_id, "TP2")):
+                    if oid:
+                        try:
+                            await cancel_safely(exchange, oid, settings.symbol)
+                            db.log_event("info", "exit_tp_cancelled", f"{label} cancelled before final exit", {"order_id": oid, "reason": reason})
+                        except Exception as e:
+                            db.log_event("error", "exit_tp_cancel_failed", f"Could not cancel {label} before final exit: {e}", {"order_id": oid})
                 if remaining > 0:
                     await close_position_market(exchange, settings.symbol, side_close, remaining, direction if settings.hedge_mode else None)
                     pnl = (price - entry) * remaining if direction == "long" else (entry - price) * remaining

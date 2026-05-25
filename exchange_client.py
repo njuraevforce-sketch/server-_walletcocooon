@@ -122,7 +122,9 @@ async def bitget_place_plan_order(
     client_oid: str,
     isolated: bool = True,
     reduce_only: bool = False,
+    stop_loss_price: Optional[float] = None,
 ) -> Dict[str, Any]:
+    stop_loss = _fmt_num(stop_loss_price) if stop_loss_price is not None and float(stop_loss_price) > 0 else ""
     payload = {
         "planType": "normal_plan",
         "symbol": plain_symbol(symbol),
@@ -141,10 +143,12 @@ async def bitget_place_plan_order(
         "reduceOnly": "YES" if reduce_only else "NO",
         "presetStopSurplusPrice": "",
         "stopSurplusTriggerPrice": "",
+        "stopSurplusExecutePrice": "",
         "stopSurplusTriggerType": "",
         "presetStopLossPrice": "",
-        "stopLossTriggerPrice": "",
-        "stopLossTriggerType": "",
+        "stopLossTriggerPrice": stop_loss,
+        "stopLossExecutePrice": "",
+        "stopLossTriggerType": "fill_price" if stop_loss else "",
     }
     data = await bitget_private_request("POST", "/api/v2/mix/order/place-plan-order", payload)
     out = data.get("data") or {}
@@ -155,6 +159,7 @@ async def bitget_place_plan_order(
         "status": "open",
         "info": data,
         "triggerPrice": trigger_price,
+        "presetStopLossPrice": stop_loss_price,
         "side": side,
         "amount": amount,
         "type": "bitget_v2_plan_market",
@@ -353,12 +358,12 @@ async def close_position_market(exchange, symbol: str, side_to_close: str, amoun
     return await exchange.create_order(ccxt_symbol(symbol), "market", side_to_close, amount, None, params)
 
 
-async def place_trigger_entry(exchange, symbol: str, direction: str, amount: float, trigger_price: float, client_oid: str, hedge_mode: bool, isolated: bool = True) -> Dict[str, Any]:
+async def place_trigger_entry(exchange, symbol: str, direction: str, amount: float, trigger_price: float, client_oid: str, hedge_mode: bool, isolated: bool = True, stop_loss_price: Optional[float] = None) -> Dict[str, Any]:
     # Use Bitget V2 plan order directly. CCXT generic trigger orders can send
     # legacy Bitget parameters and cause 43011 delegateType errors.
     side = "buy" if direction == "long" else "sell"
     trade_side = "open"
-    return await bitget_place_plan_order(symbol, side, trade_side, amount, trigger_price, client_oid, isolated=isolated, reduce_only=False)
+    return await bitget_place_plan_order(symbol, side, trade_side, amount, trigger_price, client_oid, isolated=isolated, reduce_only=False, stop_loss_price=stop_loss_price)
 
 
 async def place_reduce_trigger(exchange, symbol: str, direction: str, amount: float, trigger_price: float, kind: str, client_oid: str, hedge_mode: bool) -> Dict[str, Any]:

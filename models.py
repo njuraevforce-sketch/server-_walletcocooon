@@ -155,3 +155,17 @@ class BotSettings(BaseModel):
     kill_switch_closes_positions: bool = True
     max_entry_slippage_bps: float = 35.0
     double_fill_emergency_flatten: bool = True
+
+
+# ---- PAYLOADS ДЛЯ FASTAPI (ТЕПЕРЬ НА МЕСТЕ) ----
+
+class SettingsPayload(BaseModel):
+    settings: Optional[Dict[str, Any]] = None
+
+class ManualEventPayload(BaseModel):
+    provider_id: str
+
+class ManualArmNowPayload(BaseModel):
+    arm_delay_seconds: int = 3
+    post_wait_seconds: int = 75
+    note: str = ""

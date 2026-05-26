@@ -127,7 +127,7 @@ def fire_state(mode: str, is_active: bool, reason: str):
 def base_symbol(symbol: str) -> str:
     s = str(symbol or "BTC").upper().replace(":USDT", "").replace("/", "")
     return s[:-4] if s.endswith("USDT") else s
-
+    
 
 def profile_overrides_for_symbol(symbol: str) -> Dict[str, Any]:
     return dict(SYMBOL_PROFILES.get(base_symbol(symbol), {}))
@@ -284,29 +284,27 @@ async def sync_calendar(settings: BotSettings) -> List[NewsEvent]:
 async def analyze_market(symbol: str, settings: BotSettings) -> Dict[str, Any]:
     effective = with_symbol_profile(settings, symbol)
     exchange = await get_exchange()
-    try:
-        ohlcv = await fetch_ohlcv(exchange, effective.symbol, effective.timeframe, limit=160)
-        spread_bps = await get_spread_bps(exchange, effective.symbol)
-        metrics = volatility_metrics(ohlcv, effective.volatility_lookback_minutes, effective.compression_lookback_minutes)
-        event_valid, event_reason = validate_market_for_event(effective, metrics, spread_bps)
-        score = score_volatility(metrics, spread_bps, effective)
-        shock = score_volume_shock(metrics, spread_bps, effective)
-        return {
-            "valid_for_sniper": bool(event_valid),
-            "valid_for_news_sniper": bool(event_valid),
-            "event_reason": event_reason,
-            "reason": score["reason"],
-            "spread_bps": spread_bps,
-            "symbol_profile": base_symbol(effective.symbol),
-            "effective_min_pre_range_usd": getattr(effective, "min_pre_range_usd", None),
-            "effective_min_stop_usd": getattr(effective, "min_stop_usd", None),
-            "effective_min_entry_buffer_usd": getattr(effective, "min_entry_buffer_usd", None),
-            **metrics,
-            **score,
-            **shock,
-        }
-    finally:
-        await exchange.close()
+    ohlcv = await fetch_ohlcv(exchange, effective.symbol, effective.timeframe, limit=160)
+    spread_bps = await get_spread_bps(exchange, effective.symbol)
+    metrics = volatility_metrics(ohlcv, effective.volatility_lookback_minutes, effective.compression_lookback_minutes)
+    event_valid, event_reason = validate_market_for_event(effective, metrics, spread_bps)
+    score = score_volatility(metrics, spread_bps, effective)
+    shock = score_volume_shock(metrics, spread_bps, effective)
+    
+    return {
+        "valid_for_sniper": bool(event_valid),
+        "valid_for_news_sniper": bool(event_valid),
+        "event_reason": event_reason,
+        "reason": score["reason"],
+        "spread_bps": spread_bps,
+        "symbol_profile": base_symbol(effective.symbol),
+        "effective_min_pre_range_usd": getattr(effective, "min_pre_range_usd", None),
+        "effective_min_stop_usd": getattr(effective, "min_stop_usd", None),
+        "effective_min_entry_buffer_usd": getattr(effective, "min_entry_buffer_usd", None),
+        **metrics,
+        **score,
+        **shock,
+    }
 
 
 async def analyze_markets(settings: BotSettings) -> Dict[str, Any]:
@@ -329,6 +327,7 @@ async def analyze_markets(settings: BotSettings) -> Dict[str, Any]:
     best = markets_sorted[0] if markets_sorted else {}
     best_shock = shock_sorted[0] if shock_sorted else {}
     return {"symbols": symbols, "best": best, "best_shock": best_shock, "markets": markets_sorted}
+
 
 async def build_armed_plan(exchange, settings: BotSettings, event: NewsEvent) -> ArmedPlan:
     settings = with_symbol_profile(settings, settings.symbol)
@@ -441,6 +440,7 @@ async def build_armed_plan(exchange, settings: BotSettings, event: NewsEvent) ->
         buy_client_oid=f"vhs-buy-{uid}",
         sell_client_oid=f"vhs-sell-{uid}",
     )
+
 
 async def place_armed_orders(exchange, settings: BotSettings, plan: ArmedPlan) -> ArmedPlan:
     live_allowed, live_reason = live_trading_allowed(settings)
@@ -653,6 +653,7 @@ async def update_exchange_stop(exchange, settings: BotSettings, direction: str, 
         fire_log("error", "trailing_sl_update_failed", f"Could not update exchange trailing SL: {e}", {"new_stop": new_stop})
         return old_order_id
 
+
 async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, direction: str) -> None:
     fire_state(BotMode.IN_TRADE.value, True, f"{direction} active")
     entry = await get_last_price(exchange, settings.symbol)
@@ -816,13 +817,16 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
             if hit_stop or exit_by_tp2 or stale_exit or timeout_exit:
                 reason = "trailing_stop" if hit_stop and trailing_active else "stop" if hit_stop else "tp2" if exit_by_tp2 else "stale_exit" if stale_exit else "timeout"
                 
-                for oid, label in ((current_tp1_order_id, "TP1"), (current_tp2_order_id, "TP2")):
-                    if oid:
-                        try:
-                            await cancel_safely(exchange, oid, settings.symbol)
-                            fire_log("info", "exit_tp_cancelled", f"{label} cancelled before final exit", {"order_id": oid, "reason": reason})
-                        except Exception as e:
-                            fire_log("error", "exit_tp_cancel_failed", f"Could not cancel {label} before final exit: {e}", {"order_id": oid})
+                # ИСПРАВЛЕНО: Параллельная отмена ордеров для уменьшения задержки
+                cancel_tasks = []
+                if current_tp1_order_id:
+                    cancel_tasks.append(cancel_safely(exchange, current_tp1_order_id, settings.symbol))
+                if current_tp2_order_id:
+                    cancel_tasks.append(cancel_safely(exchange, current_tp2_order_id, settings.symbol))
+                
+                if cancel_tasks:
+                    await asyncio.gather(*cancel_tasks, return_exceptions=True)
+                    fire_log("info", "exit_tp_cancelled", "TP orders cancelled before final exit", {"reason": reason})
                 
                 if remaining > 0:
                     await close_position_market(exchange, settings.symbol, side_close, remaining, direction if settings.hedge_mode else None)
@@ -882,7 +886,6 @@ async def prepare_and_trade_event(settings: BotSettings, event: NewsEvent) -> bo
         except Exception:
             pass
     finally:
-        await exchange.close()
         if not engine_stop.is_set():
             db.set_runtime_state(mode, True, "waiting for next opportunity")
     return armed

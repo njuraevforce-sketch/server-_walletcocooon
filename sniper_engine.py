@@ -28,7 +28,7 @@ from exchange_client import (
     extract_order_id,
     fetch_symbol_position,
 )
-from indicators import pre_event_metrics, volatility_metrics, score_volatility, clamp
+from indicators import pre_event_metrics, volatility_metrics, score_volatility, clamp, orderbook_imbalance
 from models import BotMode, BotSettings, NewsEvent, EventImpact, ManualArmNowPayload
 from risk import compute_order_size, compute_stop_distance, live_trading_allowed, validate_market_for_event, daily_limits_ok
 import bitget_ws
@@ -111,15 +111,12 @@ SYMBOL_PROFILES: Dict[str, Dict[str, Any]] = {
 
 # --- NON-BLOCKING DB HELPERS (FAST LOOP) ---
 def fire_log(level: str, event_type: str, message: str, data: dict = None):
-    """Отправляет лог в БД в фоне, не блокируя торговый цикл."""
     asyncio.create_task(asyncio.to_thread(db.log_event, level, event_type, message, data or {}))
 
 def fire_update_trade(oid: str, payload: dict):
-    """Обновляет трейд в БД в фоне."""
     asyncio.create_task(asyncio.to_thread(db.update_trade_by_client_oid, oid, payload))
 
 def fire_state(mode: str, is_active: bool, reason: str):
-    """Обновляет статус панели в фоне."""
     asyncio.create_task(asyncio.to_thread(db.set_runtime_state, mode, is_active, reason))
 # -------------------------------------------
 
@@ -287,6 +284,13 @@ async def analyze_market(symbol: str, settings: BotSettings) -> Dict[str, Any]:
     ohlcv = await fetch_ohlcv(exchange, effective.symbol, effective.timeframe, limit=160)
     spread_bps = await get_spread_bps(exchange, effective.symbol)
     metrics = volatility_metrics(ohlcv, effective.volatility_lookback_minutes, effective.compression_lookback_minutes)
+    
+    # КВАНТ-ФИЛЬТРЫ: Собираем данные стакана и дельты прямо в сканер
+    ob = bitget_ws.get_orderbook(effective.symbol)
+    imbalance = orderbook_imbalance(ob) if ob else 0.0
+    cvd = bitget_ws.get_cvd(effective.symbol)
+    
+    metrics["adx14"] = metrics.get("adx14", 0.0) # От индикатора
     event_valid, event_reason = validate_market_for_event(effective, metrics, spread_bps)
     score = score_volatility(metrics, spread_bps, effective)
     shock = score_volume_shock(metrics, spread_bps, effective)
@@ -297,6 +301,8 @@ async def analyze_market(symbol: str, settings: BotSettings) -> Dict[str, Any]:
         "event_reason": event_reason,
         "reason": score["reason"],
         "spread_bps": spread_bps,
+        "orderbook_imbalance": round(imbalance, 3),
+        "cvd": round(cvd, 2),
         "symbol_profile": base_symbol(effective.symbol),
         "effective_min_pre_range_usd": getattr(effective, "min_pre_range_usd", None),
         "effective_min_stop_usd": getattr(effective, "min_stop_usd", None),
@@ -349,6 +355,10 @@ async def build_armed_plan(exchange, settings: BotSettings, event: NewsEvent) ->
             snapshot = {}
             snapshot_used = False
 
+    ob = bitget_ws.get_orderbook(settings.symbol)
+    imbalance = orderbook_imbalance(ob) if ob else 0.0
+    cvd = bitget_ws.get_cvd(settings.symbol)
+
     if is_shock and snapshot_used:
         spread_bps = float(snapshot.get("spread_bps") or 999.0)
         metrics: Dict[str, Any] = {}
@@ -360,6 +370,8 @@ async def build_armed_plan(exchange, settings: BotSettings, event: NewsEvent) ->
             **metrics,
             **{k: v for k, v in shock.items() if isinstance(v, (int, float, bool))},
             "spread_bps": spread_bps,
+            "orderbook_imbalance": imbalance,
+            "cvd": cvd,
             "mode": "volume_shock_snapshot",
             "snapshot_used": True,
         }
@@ -387,6 +399,8 @@ async def build_armed_plan(exchange, settings: BotSettings, event: NewsEvent) ->
             **{k: v for k, v in score.items() if isinstance(v, (int, float))},
             **{k: v for k, v in shock.items() if isinstance(v, (int, float, bool))},
             "spread_bps": spread_bps,
+            "orderbook_imbalance": imbalance,
+            "cvd": cvd,
             "mode": "volume_shock" if is_shock else "normal_sniper",
             "snapshot_used": False,
         }
@@ -407,7 +421,9 @@ async def build_armed_plan(exchange, settings: BotSettings, event: NewsEvent) ->
             stop_distance = compute_stop_distance(settings, metrics["atr14"], metrics["range"])
 
     live_balance = await fetch_balance_usdt(exchange)
-    risk = compute_order_size(settings, float(metrics["last"]), stop_distance, live_balance)
+    
+    # Динамический риск: множитель объема от качества сетапа
+    risk = compute_order_size(settings, float(metrics["last"]), stop_distance, live_balance, float(score.get("volatility_score") or 0))
     if not risk.allowed:
         raise RuntimeError(risk.reason)
 
@@ -525,21 +541,49 @@ async def wait_for_breakout(exchange, settings: BotSettings, plan: ArmedPlan) ->
     deadline = plan.event.event_time_utc + timedelta(seconds=post_wait)
     mode = BotMode.VOLATILITY_ARMED.value if plan.event.provider in VOLATILITY_PROVIDERS else BotMode.CALENDAR_ARMED.value
     
-    # Не блокируем цикл записью в БД
     fire_state(mode, True, f"armed traps: {plan.event.title}")
 
     last_rest_check = 0.0
 
     while utc_now() <= deadline and not engine_stop.is_set():
-        # 1. МГНОВЕННАЯ ПРОВЕРКА ЦЕНЫ (из кэша WebSocket)
         px = await get_last_price(exchange, settings.symbol)
         
-        # 2. Локально проверяем, пересекла ли цена триггеры ловушек
-        crossed = px >= plan.buy_trigger or px <= plan.sell_trigger
+        # --- QUANT WALL DEFENSE (Анти-Spoofing Защита) ---
+        # Проверяем стакан в реальном времени. Если цена летит к пробою, а там бетонная стена против нас — отменяем ловушку.
+        ob = bitget_ws.get_orderbook(settings.symbol)
+        imbalance = orderbook_imbalance(ob) if ob else 0.0
+        max_imb = getattr(settings, "max_imbalance_against", 0.35)
+        
+        # Защита Лонга (если до триггера менее 0.15%, но сверху сильная стена Ask)
+        if plan.buy_order_id and px > 0 and (plan.buy_trigger - px) / px < 0.0015:
+            if imbalance < -max_imb:
+                fire_log("warning", "quant_wall_defense", "Proactively cancelled LONG trap due to heavy Ask wall", {"imbalance": imbalance, "trigger": plan.buy_trigger, "price": px})
+                await cancel_safely(exchange, plan.buy_order_id, settings.symbol)
+                plan.buy_order_id = None
+                fire_update_trade(plan.buy_client_oid, {"status": "cancelled", "close_reason": "quant_wall_defense"})
+
+        # Защита Шорта (если до триггера менее 0.15%, но снизу сильная стена Bid)
+        if plan.sell_order_id and px > 0 and (px - plan.sell_trigger) / px < 0.0015:
+            if imbalance > max_imb:
+                fire_log("warning", "quant_wall_defense", "Proactively cancelled SHORT trap due to heavy Bid wall", {"imbalance": imbalance, "trigger": plan.sell_trigger, "price": px})
+                await cancel_safely(exchange, plan.sell_order_id, settings.symbol)
+                plan.sell_order_id = None
+                fire_update_trade(plan.sell_client_oid, {"status": "cancelled", "close_reason": "quant_wall_defense"})
+                
+        # Если обе ловушки отменены из-за стен в стакане — выходим из ожидания
+        if not plan.buy_order_id and not plan.sell_order_id:
+            fire_log("info", "traps_removed", "Both traps were cancelled by Quant defense", {})
+            break
+        # ------------------------------------------------
+        
+        crossed = False
+        if plan.buy_order_id and px >= plan.buy_trigger:
+            crossed = True
+        if plan.sell_order_id and px <= plan.sell_trigger:
+            crossed = True
         
         now_ts = time.time()
         
-        # 3. Дергаем тяжелый REST только если есть пробой ИЛИ раз в 1.5 секунды как страховку
         if crossed or (now_ts - last_rest_check > 1.5):
             try:
                 pos = await fetch_symbol_position(exchange, settings.symbol)
@@ -550,13 +594,15 @@ async def wait_for_breakout(exchange, settings: BotSettings, plan: ArmedPlan) ->
                     entry_px = pos.get("entry") or px
                     
                     if direction == "long":
-                        await cancel_safely(exchange, plan.sell_order_id, settings.symbol)
+                        if plan.sell_order_id:
+                            await cancel_safely(exchange, plan.sell_order_id, settings.symbol)
                         fire_update_trade(plan.buy_client_oid, {"status": "active", "execution_price": entry_px})
                         fire_update_trade(plan.sell_client_oid, {"status": "cancelled"})
                         fire_log("warning", "breakout_position_detected", "Long position detected after trigger trap", {"symbol": settings.symbol, "amount": pos.get("amount"), "entry": entry_px, "preset_sl": plan.buy_stop_loss})
                         return "long"
                     else:
-                        await cancel_safely(exchange, plan.buy_order_id, settings.symbol)
+                        if plan.buy_order_id:
+                            await cancel_safely(exchange, plan.buy_order_id, settings.symbol)
                         fire_update_trade(plan.sell_client_oid, {"status": "active", "execution_price": entry_px})
                         fire_update_trade(plan.buy_client_oid, {"status": "cancelled"})
                         fire_log("warning", "breakout_position_detected", "Short position detected after trigger trap", {"symbol": settings.symbol, "amount": pos.get("amount"), "entry": entry_px, "preset_sl": plan.sell_stop_loss})
@@ -564,13 +610,15 @@ async def wait_for_breakout(exchange, settings: BotSettings, plan: ArmedPlan) ->
             except Exception as e:
                 fire_log("error", "watch_position", f"Position watch error: {e}", {})
                 
-        await asyncio.sleep(0.05) # FAST LOOP: 50 мс
+        await asyncio.sleep(0.05)
 
-    # Если время вышло
-    await cancel_safely(exchange, plan.buy_order_id, settings.symbol)
-    await cancel_safely(exchange, plan.sell_order_id, settings.symbol)
-    fire_update_trade(plan.buy_client_oid, {"status": "expired"})
-    fire_update_trade(plan.sell_client_oid, {"status": "expired"})
+    if plan.buy_order_id:
+        await cancel_safely(exchange, plan.buy_order_id, settings.symbol)
+        fire_update_trade(plan.buy_client_oid, {"status": "expired"})
+    if plan.sell_order_id:
+        await cancel_safely(exchange, plan.sell_order_id, settings.symbol)
+        fire_update_trade(plan.sell_client_oid, {"status": "expired"})
+        
     fire_log("info", "no_breakout", "Window passed without valid breakout; traps cancelled", {"event": plan.event.title})
     return None
 
@@ -728,11 +776,9 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
 
     try:
         while not engine_stop.is_set():
-            # Мгновенная цена из кэша
             price = await get_last_price(exchange, settings.symbol)
             now_ts = time.time()
 
-            # Редкая проверка биржи (защита от rate limits)
             if now_ts - last_sync_time > 2.0:
                 live_pos = await fetch_symbol_position(exchange, settings.symbol)
                 live_amount = float(live_pos.get("amount") or 0)
@@ -749,7 +795,6 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
                 fire_log("warning", "position_closed_externally", "Position is no longer open on exchange; marked closed in database", {"direction": direction, "price": price})
                 break
 
-            # ---- ЛОГИКА TP И ТРЕЙЛИНГА (работает на скорости 50мс) ----
             if settings.tp1_enabled and not tp1_done and live_amount < remaining:
                 closed_amount = order_amount_precision(exchange, settings.symbol, max(0.0, remaining - live_amount))
                 if closed_amount > 0:
@@ -817,7 +862,6 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
             if hit_stop or exit_by_tp2 or stale_exit or timeout_exit:
                 reason = "trailing_stop" if hit_stop and trailing_active else "stop" if hit_stop else "tp2" if exit_by_tp2 else "stale_exit" if stale_exit else "timeout"
                 
-                # ИСПРАВЛЕНО: Параллельная отмена ордеров для уменьшения задержки
                 cancel_tasks = []
                 if current_tp1_order_id:
                     cancel_tasks.append(cancel_safely(exchange, current_tp1_order_id, settings.symbol))
@@ -847,7 +891,7 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
                 fire_log("warning" if net_pnl < 0 else "info", "position_closed", f"Position closed: {reason}", {"net_pnl": net_pnl, "price": price})
                 break
 
-            await asyncio.sleep(0.05) # FAST LOOP: 50 мс
+            await asyncio.sleep(0.05)
     except Exception as e:
         fire_log("error", "manage_position_error", f"Position manager error: {e}", {})
         if settings.emergency_flatten_on_error and remaining > 0:
@@ -919,7 +963,7 @@ async def maybe_auto_arm_volatility(settings: BotSettings) -> bool:
 
     if bool(sget(settings, "volume_shock_enabled")) and shock_valid:
         if _last_shock_arm_at and (utc_now() - _last_shock_arm_at).total_seconds() < sget(settings, "volume_shock_cooldown_minutes") * 60:
-            pass # cooldown
+            pass
         else:
             ok, limit_reason = daily_limits_ok(settings, db.todays_pnl(), db.todays_trade_count(), db.consecutive_losses())
             if not ok:

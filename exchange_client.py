@@ -342,7 +342,14 @@ async def fetch_symbol_position(exchange, symbol: str) -> Dict[str, Any]:
     return {"amount": 0.0, "direction": None, "entry": 0.0, "raw": None}
 
 
+# --- УСТРАНЕНА УТЕЧКА ПАМЯТИ: SINGLETON КЛИЕНТ БИРЖИ ---
+_global_exchange = None
+
 async def get_exchange():
+    global _global_exchange
+    if _global_exchange is not None:
+        return _global_exchange
+
     ex = ccxt.bitget({
         "apiKey": os.environ.get("BITGET_API_KEY"),
         "secret": os.environ.get("BITGET_API_SECRET"),
@@ -356,6 +363,7 @@ async def get_exchange():
     if os.environ.get("EXCHANGE_SANDBOX", "false").lower() == "true":
         ex.set_sandbox_mode(True)
     await ex.load_markets()
+    _global_exchange = ex
     return ex
 
 
@@ -415,17 +423,14 @@ async def cancel_all_safely(exchange, symbol: str) -> None:
 
 
 async def close_position_market(exchange, symbol: str, side_to_close: str, amount: float, pos_side: Optional[str] = None) -> Dict[str, Any]:
-    # side_to_close: one-way mode action: 'sell' closes long, 'buy' closes short.
-    # Do NOT use CCXT here. On Bitget one-way accounts CCXT can produce:
-    # 40774 "The order type for unilateral position must also be the unilateral position type".
     amount = float(amount or 0)
     if amount <= 0:
         return {"status": "skipped", "reason": "amount <= 0"}
 
     hedge_mode = bool(pos_side)
     if hedge_mode:
-        # Bitget V2 hedge mode uses side as position direction + tradeSide=close.
-        side = "buy" if str(pos_side).lower() in ("long", "buy") else "sell"
+        # ИСПРАВЛЕНО: Для закрытия LONG нужно продавать (SELL), для закрытия SHORT - покупать (BUY)
+        side = "sell" if str(pos_side).lower() in ("long", "buy") else "buy"
         trade_side = "close"
         reduce_only = False
     else:
@@ -446,19 +451,21 @@ async def close_position_market(exchange, symbol: str, side_to_close: str, amoun
 
 
 async def place_trigger_entry(exchange, symbol: str, direction: str, amount: float, trigger_price: float, client_oid: str, hedge_mode: bool, isolated: bool = True, stop_loss_price: Optional[float] = None) -> Dict[str, Any]:
-    # Use Bitget V2 plan order directly. CCXT generic trigger orders can send
-    # legacy Bitget parameters and cause 43011 delegateType errors.
     side = "buy" if direction == "long" else "sell"
     trade_side = "open"
     return await bitget_place_plan_order(symbol, side, trade_side, amount, trigger_price, client_oid, isolated=isolated, reduce_only=False, stop_loss_price=stop_loss_price)
 
 
 async def place_reduce_trigger(exchange, symbol: str, direction: str, amount: float, trigger_price: float, kind: str, client_oid: str, hedge_mode: bool) -> Dict[str, Any]:
-    # Use Bitget V2 TPSL plan orders directly for exchange-side protection.
     return await bitget_place_tpsl_order(symbol, direction, amount, trigger_price, kind, client_oid, hedge_mode=hedge_mode)
 
 
+# --- ЗАЩИТА ОТ RATE LIMITS (THROTTLING ДЛЯ REST-ЗАПРОСОВ) ---
+_last_rest_ticker_time = 0.0
+_last_rest_ticker_price = 0.0
+
 async def get_last_price(exchange, symbol: str) -> float:
+    global _last_rest_ticker_time, _last_rest_ticker_price
     try:
         from bitget_ws import get_ticker
         cached = get_ticker(symbol)
@@ -468,8 +475,20 @@ async def get_last_price(exchange, symbol: str) -> float:
                 return float(raw)
     except Exception:
         pass
-    ticker = await exchange.fetch_ticker(ccxt_symbol(symbol))
-    return float(ticker.get("last") or ticker.get("close") or 0)
+
+    now = time.time()
+    if now - _last_rest_ticker_time < 0.5 and _last_rest_ticker_price > 0:
+        return _last_rest_ticker_price
+
+    try:
+        ticker = await exchange.fetch_ticker(ccxt_symbol(symbol))
+        px = float(ticker.get("last") or ticker.get("close") or 0)
+        if px > 0:
+            _last_rest_ticker_price = px
+            _last_rest_ticker_time = now
+        return px
+    except Exception:
+        return _last_rest_ticker_price
 
 
 async def get_spread_bps(exchange, symbol: str) -> float:
@@ -498,9 +517,7 @@ async def fetch_ohlcv(exchange, symbol: str, timeframe: str = "1m", limit: int =
 
 
 async def flatten_symbol_positions(exchange, symbol: str, hedge_mode: bool = False) -> List[Dict[str, Any]]:
-    """Best-effort emergency flatten for the configured symbol only.
-    This is intentionally conservative: it only acts on non-zero positions returned by the exchange.
-    """
+    """Best-effort emergency flatten for the configured symbol only."""
     results: List[Dict[str, Any]] = []
     sym = ccxt_symbol(symbol)
     try:
@@ -524,7 +541,6 @@ async def flatten_symbol_positions(exchange, symbol: str, hedge_mode: bool = Fal
                 continue
             side = str(pos.get("side") or raw.get("holdSide") or raw.get("posSide") or "").lower()
             if not side:
-                # If CCXT gives signed contracts/amount, infer direction.
                 signed = float(pos.get("contracts") or pos.get("amount") or 0)
                 side = "long" if signed > 0 else "short"
             close_side = "sell" if side == "long" else "buy"
@@ -543,4 +559,3 @@ def extract_order_id(order: Optional[Dict[str, Any]]) -> Optional[str]:
     if not order:
         return None
     return str(order.get("id") or order.get("orderId") or order.get("clientOid") or "") or None
-

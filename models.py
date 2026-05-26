@@ -52,13 +52,19 @@ class BotSettings(BaseModel):
     volatility_auto_enabled: bool = True
     manual_arm_enabled: bool = True
     high_impact_only: bool = True
+    
+    # Quant / Order Flow Filters (НОВЫЕ ПАРАМЕТРЫ)
+    min_trend_adx: float = 20.0
+    dynamic_risk_sizing: bool = True
+    max_imbalance_against: float = 0.35
 
-    # Pro V8: multi-symbol scanner and websocket/trailing controls
+    # Multi-pair / Scanner
     scan_symbols: List[str] = Field(default_factory=lambda: ["BTC/USDT", "ETH/USDT", "SOL/USDT"])
     max_symbols_per_scan: int = 8
     multi_scan_concurrency: int = 3
     trade_selected_symbol: bool = True
 
+    # Connections
     ws_enabled: bool = True
     ws_public_enabled: bool = True
     ws_private_enabled: bool = True
@@ -66,41 +72,35 @@ class BotSettings(BaseModel):
     rest_fallback_enabled: bool = True
     rest_fallback_sync_seconds: float = 7.0
 
-    tp1_enabled: bool = True
-    tp2_enabled: bool = False
-    trailing_mode: bool = True
-    exchange_trailing_sl_enabled: bool = True
-    trailing_update_interval_seconds: float = 0.7
-    trailing_min_step_atr: float = 0.15
-    trailing_min_step_usd: float = 8.0
-    fee_buffer_bps: float = 12.0
-
-    # Risk
+    # Risk Management
     account_equity_usd: float = 1000.0
     risk_per_event_pct: float = 0.0025
     max_daily_loss_pct: float = 0.01
     max_event_loss_pct: float = 0.004
     daily_profit_lock_pct: float = 0.025
-    max_notional_usd: float = 1000.0
-    max_trades_per_day: int = 3
-    max_consecutive_losses: int = 2
+    max_notional_usd: float = 500.0
+    max_trades_per_day: int = 100
+    max_consecutive_losses: int = 3
+
+    # Timing
     event_cooldown_minutes: int = 25
     volatility_cooldown_minutes: int = 18
-
-    # Calendar/news arming
     pre_arm_seconds: int = 180
     post_event_wait_seconds: int = 90
+
+    # Filtering
     allowed_countries: List[str] = Field(default_factory=lambda: ["US"])
     allowed_keywords: List[str] = Field(default_factory=lambda: [
         "CPI", "Core CPI", "PPI", "Core PPI", "PCE", "Core PCE",
         "FOMC", "Fed Interest Rate Decision", "Federal Funds Rate", "Fed Chair Powell",
-        "Non Farm Payrolls", "Nonfarm Payrolls", "NFP", "Unemployment Rate", "Initial Jobless Claims",
-        "GDP", "Retail Sales", "ISM", "PMI", "JOLTS",
+        "Non Farm Payrolls", "Nonfarm Payrolls", "NFP",
+        "Unemployment Rate", "Initial Jobless Claims",
+        "GDP", "Retail Sales", "ISM", "PMI", "JOLTS"
     ])
 
-    # Volatility scanner
+    # Volatility Scanner
     scan_interval_seconds: float = 2.0
-    auto_arm_score: float = 82.0
+    auto_arm_score: float = 88.0
     notify_score: float = 70.0
     auto_arm_delay_seconds: int = 5
     auto_post_wait_seconds: int = 75
@@ -109,8 +109,6 @@ class BotSettings(BaseModel):
     min_range_expansion_ratio: float = 1.10
     max_chase_candle_atr: float = 1.80
     max_wick_ratio: float = 0.62
-
-    # Entry logic
     range_lookback_minutes: int = 8
     min_pre_range_usd: float = 80.0
     max_pre_range_usd: float = 950.0
@@ -124,12 +122,23 @@ class BotSettings(BaseModel):
     stop_atr_mult: float = 1.05
     min_stop_usd: float = 120.0
     max_stop_usd: float = 850.0
+    tp1_enabled: bool = True
     tp1_r: float = 1.05
-    tp1_close_pct: float = 0.45
+    tp1_close_pct: float = 0.25
+    tp2_enabled: bool = False
     tp2_r: float = 2.80
     breakeven_after_r: float = 0.75
+    
+    # Trailing Stop
+    trailing_mode: bool = True
+    exchange_trailing_sl_enabled: bool = True
     trailing_start_r: float = 1.15
     trailing_atr_mult: float = 0.85
+    trailing_update_interval_seconds: float = 0.7
+    trailing_min_step_atr: float = 0.15
+    trailing_min_step_usd: float = 8.0
+    fee_buffer_bps: float = 12.0
+
     hard_timeout_seconds: int = 540
     stale_trade_exit_seconds: int = 100
     stale_trade_min_r: float = 0.20
@@ -139,31 +148,10 @@ class BotSettings(BaseModel):
     order_watch_interval_seconds: float = 0.35
     emergency_flatten_on_error: bool = True
 
-    # V7 live guard: real money protection rules
+    # V7/V8 live guard: real money protection rules
     hard_exchange_sl_required: bool = True
     flatten_if_exchange_sl_fails: bool = True
     cancel_tp_if_sl_fails: bool = True
     kill_switch_closes_positions: bool = True
     max_entry_slippage_bps: float = 35.0
     double_fill_emergency_flatten: bool = True
-
-
-class SettingsPayload(BaseModel):
-    settings: Dict[str, Any]
-
-
-class ManualArmNowPayload(BaseModel):
-    arm_delay_seconds: int = 3
-    post_wait_seconds: int = 75
-    note: str = "manual volatility arm"
-
-
-class ManualEventPayload(BaseModel):
-    provider_id: str
-
-
-class AnalyzeResponse(BaseModel):
-    status: str
-    market_state: Dict[str, Any]
-    upcoming_events: List[NewsEvent] = Field(default_factory=list)
-    settings: BotSettings

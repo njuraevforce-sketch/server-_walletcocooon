@@ -14,12 +14,6 @@ import ccxt.async_support as ccxt
 
 
 def ccxt_symbol(symbol: str) -> str:
-    """Return CCXT unified Bitget USDT-margined swap symbol.
-
-    Bitget swap symbols in CCXT are usually formatted like BTC/USDT:USDT.
-    The previous v7 formatter produced BTCUSDT:USDT, which can trigger
-    BadSymbol / market not found errors on preflight and analyze.
-    """
     s = str(symbol or "BTCUSDT").strip().upper()
     if "/" in s and ":" in s:
         return s
@@ -42,15 +36,6 @@ MARGIN_COIN = os.environ.get("BITGET_MARGIN_COIN", "USDT")
 
 
 def _fmt_num(value: float) -> str:
-    """Format numbers for Bitget without Python float noise.
-
-    Bitget validates price scale strictly. A value that is logically 77173.7
-    can become 77173.699999999997 after converting CCXT precision strings to
-    float. Sending that raw value causes Bitget 40808 checkBDScale errors.
-    We round to a safe 8-decimal string and trim trailing zeros. BTC/ETH/SOL
-    USDT futures use fewer decimals than this, while order sizes still keep
-    enough precision.
-    """
     try:
         d = Decimal(str(value))
         if not d.is_finite():
@@ -81,12 +66,6 @@ def _sign_rest(timestamp: str, method: str, path: str, body: str, secret: str) -
 
 
 async def bitget_private_request(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Direct Bitget V2 REST request.
-
-    We use this for futures trigger/TP-SL plan orders because CCXT's generic
-    triggerPrice mapping can send legacy/deprecated parameters to Bitget and
-    Bitget rejects them with 43011 delegateType errors.
-    """
     key, secret, passphrase = _api_creds()
     method_u = method.upper()
     body = json.dumps(payload or {}, separators=(",", ":")) if method_u != "GET" else ""
@@ -167,14 +146,7 @@ async def bitget_place_plan_order(
 
 
 async def bitget_place_tpsl_order(symbol: str, direction: str, amount: float, trigger_price: float, kind: str, client_oid: str, hedge_mode: bool = False) -> Dict[str, Any]:
-    """Place/modify position TP/SL using Bitget V2 position TPSL endpoint.
-
-    The old /place-tpsl-order payload can be rejected by Bitget with 43011
-    delegateType errors on some one-way accounts. The position TPSL endpoint is
-    the correct endpoint for protecting an already opened position.
-    """
     is_sl = kind == "stop_loss"
-    # Bitget docs: hedge holdSide is long/short; one-way holdSide is buy/sell.
     if hedge_mode:
         hold_side = "long" if direction == "long" else "short"
     else:
@@ -186,11 +158,13 @@ async def bitget_place_tpsl_order(symbol: str, direction: str, amount: float, tr
         "symbol": plain_symbol(symbol),
         "holdSide": hold_side,
     }
+    
+    # ИСПРАВЛЕНИЕ: Используем пустую строку "" вместо "0" для ExecutePrice
     if is_sl:
         payload.update({
             "stopLossTriggerPrice": _fmt_num(trigger_price),
             "stopLossTriggerType": "fill_price",
-            "stopLossExecutePrice": "0",
+            "stopLossExecutePrice": "", 
             "stopLossSize": _fmt_num(amount),
             "stopLossClientOid": client_oid,
         })
@@ -198,7 +172,7 @@ async def bitget_place_tpsl_order(symbol: str, direction: str, amount: float, tr
         payload.update({
             "stopSurplusTriggerPrice": _fmt_num(trigger_price),
             "stopSurplusTriggerType": "fill_price",
-            "stopSurplusExecutePrice": "0",
+            "stopSurplusExecutePrice": "", 
             "stopSurplusSize": _fmt_num(amount),
             "stopSurplusClientOid": client_oid,
         })
@@ -230,11 +204,6 @@ async def bitget_place_order(
     hedge_mode: bool = False,
     trade_side: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Direct Bitget V2 market order.
-
-    Used for emergency/TP/timeout close because CCXT can send Bitget a legacy
-    unilateral/hedge parameter combination and Bitget rejects it with 40774.
-    """
     payload: Dict[str, Any] = {
         "symbol": plain_symbol(symbol),
         "productType": PRODUCT_TYPE,
@@ -268,7 +237,6 @@ async def cancel_plan_safely(order_id_or_client_oid: Optional[str], symbol: str)
         return
     item = {"orderId": "", "clientOid": ""}
     oid = str(order_id_or_client_oid)
-    # If it starts with our client prefix, cancel by clientOid. Otherwise try orderId.
     if oid.startswith("vhs-"):
         item["clientOid"] = oid
     else:
@@ -282,7 +250,6 @@ async def cancel_plan_safely(order_id_or_client_oid: Optional[str], symbol: str)
     try:
         await bitget_private_request("POST", "/api/v2/mix/order/cancel-plan-order", payload)
     except Exception:
-        # Try by the other key as fallback.
         alt = {"orderId": "", "clientOid": ""}
         if item["orderId"]:
             alt["clientOid"] = oid
@@ -342,7 +309,6 @@ async def fetch_symbol_position(exchange, symbol: str) -> Dict[str, Any]:
     return {"amount": 0.0, "direction": None, "entry": 0.0, "raw": None}
 
 
-# --- УСТРАНЕНА УТЕЧКА ПАМЯТИ: SINGLETON КЛИЕНТ БИРЖИ ---
 _global_exchange = None
 
 async def get_exchange():
@@ -429,7 +395,6 @@ async def close_position_market(exchange, symbol: str, side_to_close: str, amoun
 
     hedge_mode = bool(pos_side)
     if hedge_mode:
-        # ИСПРАВЛЕНО: Для закрытия LONG нужно продавать (SELL), для закрытия SHORT - покупать (BUY)
         side = "sell" if str(pos_side).lower() in ("long", "buy") else "buy"
         trade_side = "close"
         reduce_only = False
@@ -460,7 +425,6 @@ async def place_reduce_trigger(exchange, symbol: str, direction: str, amount: fl
     return await bitget_place_tpsl_order(symbol, direction, amount, trigger_price, kind, client_oid, hedge_mode=hedge_mode)
 
 
-# --- ЗАЩИТА ОТ RATE LIMITS (THROTTLING ДЛЯ REST-ЗАПРОСОВ) ---
 _last_rest_ticker_time = 0.0
 _last_rest_ticker_price = 0.0
 
@@ -517,7 +481,10 @@ async def fetch_ohlcv(exchange, symbol: str, timeframe: str = "1m", limit: int =
 
 
 async def flatten_symbol_positions(exchange, symbol: str, hedge_mode: bool = False) -> List[Dict[str, Any]]:
-    """Best-effort emergency flatten for the configured symbol only."""
+    """
+    ИСПРАВЛЕНИЕ: Бронебойный Flash Close через родной API Bitget.
+    Он вообще не смотрит на объем, reduceOnly и прочее — он просто убивает позицию по маркету.
+    """
     results: List[Dict[str, Any]] = []
     sym = ccxt_symbol(symbol)
     try:
@@ -539,13 +506,35 @@ async def flatten_symbol_positions(exchange, symbol: str, hedge_mode: bool = Fal
             amount = abs(float(contracts or 0))
             if amount <= 0:
                 continue
+            
             side = str(pos.get("side") or raw.get("holdSide") or raw.get("posSide") or "").lower()
             if not side:
                 signed = float(pos.get("contracts") or pos.get("amount") or 0)
                 side = "long" if signed > 0 else "short"
-            close_side = "sell" if side == "long" else "buy"
-            pos_side = side if hedge_mode else None
-            results.append(await close_position_market(exchange, symbol, close_side, amount, pos_side))
+
+            # Bitget V2 close-positions API требует holdSide. Для хеджа это long/short, для one-way это buy/sell.
+            if hedge_mode:
+                hold_side = "long" if side == "long" else "short"
+            else:
+                hold_side = "buy" if side == "long" else "sell"
+
+            # Бронебойный запрос на полное закрытие
+            try:
+                payload = {
+                    "symbol": plain_symbol(symbol),
+                    "productType": PRODUCT_TYPE,
+                    "marginCoin": MARGIN_COIN,
+                    "holdSide": hold_side
+                }
+                data = await bitget_private_request("POST", "/api/v2/mix/order/close-positions", payload)
+                results.append({"status": "flash_closed", "side": hold_side, "response": data})
+            except Exception as api_err:
+                # Если прям вообще магия и close-positions упал, используем старый добрый fallback
+                close_side = "sell" if side == "long" else "buy"
+                pos_side = side if hedge_mode else None
+                fallback = await close_position_market(exchange, symbol, close_side, amount, pos_side)
+                results.append({"status": "fallback_market_close", "response": fallback, "error": str(api_err)})
+                
         except Exception as e:
             results.append({"error": str(e), "position": pos})
     return results

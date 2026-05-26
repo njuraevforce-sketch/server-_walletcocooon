@@ -119,11 +119,8 @@ async def preflight():
     except Exception as e:
         errors.append(f"spread/orderbook: {e}")
 
-    try:
-        await exchange.close()
-    except Exception:
-        pass
-
+    # БЛОК УДАЛЕН: Мы больше не закрываем exchange здесь, так как используем Singleton!
+    
     market_ok = spread_bps <= settings.max_spread_bps
     return {
         "status": "success" if not errors else "warning",
@@ -209,8 +206,6 @@ async def markets_scan():
         return {"status": "success", **await analyze_markets(settings)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
 
 
 @app.get("/api/volume-shock", dependencies=[Depends(require_auth)])

@@ -30,6 +30,10 @@ class WSState:
     reconnects: int = 0
     subscribed_symbols: List[str] = field(default_factory=list)
     ticker: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # НОВЫЕ ПОЛЯ ДЛЯ ORDER FLOW (СТАКАН И ДЕЛЬТА)
+    orderbook: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    cvd: Dict[str, float] = field(default_factory=dict) 
+    
     orders: List[Dict[str, Any]] = field(default_factory=list)
     positions: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -50,73 +54,85 @@ def status() -> Dict[str, Any]:
         "private_last_message_age": round(time.time() - _state.private_last_message_ts, 3) if _state.private_last_message_ts else None,
         "last_error": _state.last_error,
         "reconnects": _state.reconnects,
-        "subscribed_symbols": list(_state.subscribed_symbols),
+        "subscribed_symbols": _state.subscribed_symbols,
         "ticker_count": len(_state.ticker),
+        "orderbook_cached": len(_state.orderbook),
+        "cvd_tracked": len(_state.cvd),
         "orders_cached": len(_state.orders),
         "positions_cached": len(_state.positions),
     }
 
 
 def get_ticker(symbol: str) -> Optional[Dict[str, Any]]:
-    return _state.ticker.get(plain_symbol(symbol))
+    sym = plain_symbol(symbol)
+    return _state.ticker.get(sym)
 
 
-def _sign(timestamp: str, secret: str) -> str:
-    payload = f"{timestamp}GET/user/verify".encode()
-    digest = hmac.new(secret.encode(), payload, hashlib.sha256).digest()
-    return base64.b64encode(digest).decode()
+def get_orderbook(symbol: str) -> Optional[Dict[str, Any]]:
+    """Возвращает кэшированный стакан (bids и asks)."""
+    sym = plain_symbol(symbol)
+    return _state.orderbook.get(sym)
 
 
-async def _heartbeat(ws):
-    while not _stop.is_set():
-        try:
-            await asyncio.sleep(30)
-            await ws.send("ping")
-        except Exception:
-            return
+def get_cvd(symbol: str) -> float:
+    """Возвращает кумулятивную дельту объемов (CVD) с момента запуска."""
+    sym = plain_symbol(symbol)
+    return _state.cvd.get(sym, 0.0)
 
 
 async def _public_loop(symbols: List[str], reconnect_seconds: float):
-    args = []
-    for sym in symbols:
-        inst = plain_symbol(sym)
-        args.append({"instType": INST_TYPE, "channel": "ticker", "instId": inst})
-        args.append({"instType": INST_TYPE, "channel": "books1", "instId": inst})
+    _state.subscribed_symbols = [plain_symbol(s) for s in symbols]
+    subs = []
+    for sym in _state.subscribed_symbols:
+        subs.append({"instType": INST_TYPE, "channel": "ticker", "instId": sym})
+        subs.append({"instType": INST_TYPE, "channel": "books15", "instId": sym}) # Стакан 15 уровней
+        subs.append({"instType": INST_TYPE, "channel": "trade", "instId": sym})   # Лента сделок
+
     while not _stop.is_set():
         try:
-            async with websockets.connect(PUBLIC_URL, ping_interval=None, close_timeout=3) as ws:
+            async with websockets.connect(PUBLIC_URL, ping_interval=20, ping_timeout=10) as ws:
                 _state.public_connected = True
-                _state.subscribed_symbols = [plain_symbol(s) for s in symbols]
-                await ws.send(json.dumps({"op": "subscribe", "args": args}))
-                hb = asyncio.create_task(_heartbeat(ws))
+                _state.last_error = ""
+                await ws.send(json.dumps({"op": "subscribe", "args": subs}))
+                
+                async def keepalive():
+                    while not _stop.is_set():
+                        await asyncio.sleep(20)
+                        if ws.open:
+                            await ws.send("ping")
+                            
+                hb = asyncio.create_task(keepalive())
                 try:
                     async for msg in ws:
-                        if msg == "pong":
-                            _state.public_last_message_ts = time.time()
-                            continue
+                        if _stop.is_set():
+                            break
                         _state.public_last_message_ts = time.time()
-                        try:
-                            data = json.loads(msg)
-                        except Exception:
+                        if msg == "pong":
                             continue
+                        data = json.loads(msg)
                         arg = data.get("arg") or {}
-                        inst = plain_symbol(arg.get("instId") or "")
                         ch = arg.get("channel")
-                        payload = (data.get("data") or [{}])[0] if isinstance(data.get("data"), list) else {}
-                        if not inst or not payload:
-                            continue
-                        cached = _state.ticker.setdefault(inst, {})
-                        cached["ts"] = time.time()
-                        cached["channel"] = ch
-                        if ch == "ticker":
-                            for k in ("lastPr", "last", "markPrice", "bidPr", "askPr", "bidPx", "askPx"):
-                                if k in payload:
-                                    cached[k] = payload[k]
-                        elif ch == "books1":
-                            bids = payload.get("bids") or []
-                            asks = payload.get("asks") or []
-                            if bids: cached["bidPr"] = bids[0][0]
-                            if asks: cached["askPr"] = asks[0][0]
+                        inst_id = arg.get("instId")
+                        payload = data.get("data")
+                        
+                        if ch == "ticker" and payload and isinstance(payload, list):
+                            _state.ticker[inst_id] = payload[0]
+                            
+                        elif ch == "books15" and payload and isinstance(payload, list):
+                            # Сохраняем стакан
+                            _state.orderbook[inst_id] = payload[0]
+                            
+                        elif ch == "trade" and payload and isinstance(payload, list):
+                            # Высчитываем кумулятивную дельту (CVD)
+                            if inst_id not in _state.cvd:
+                                _state.cvd[inst_id] = 0.0
+                            for t in payload:
+                                side = str(t.get("side", "")).lower()
+                                sz = float(t.get("size") or t.get("sz") or 0)
+                                if side == "buy":
+                                    _state.cvd[inst_id] += sz
+                                elif side == "sell":
+                                    _state.cvd[inst_id] -= sz
                 finally:
                     hb.cancel()
         except Exception as e:
@@ -127,51 +143,60 @@ async def _public_loop(symbols: List[str], reconnect_seconds: float):
         await asyncio.sleep(reconnect_seconds)
 
 
-async def _private_loop(symbols: List[str], reconnect_seconds: float):
+def _api_creds():
     key = os.environ.get("BITGET_API_KEY") or ""
     secret = os.environ.get("BITGET_API_SECRET") or ""
     passphrase = os.environ.get("BITGET_API_PASSPHRASE") or os.environ.get("BITGET_API_PASSWORD") or ""
-    if not key or not secret or not passphrase:
-        _state.last_error = "private_ws: missing API key/secret/passphrase"
+    return key, secret, passphrase
+
+
+async def _private_loop(symbols: List[str], reconnect_seconds: float):
+    key, secret, passphrase = _api_creds()
+    if not key or not secret:
         return
-    args = [
-        {"instType": INST_TYPE, "channel": "orders", "instId": "default"},
-        # Trigger/plan orders. Important because the bot uses trigger traps.
-        {"instType": INST_TYPE, "channel": "orders-algo", "instId": "default"},
-        {"instType": INST_TYPE, "channel": "positions", "instId": "default"},
-        {"instType": INST_TYPE, "channel": "account", "instId": "default"},
-    ]
+
     while not _stop.is_set():
         try:
-            async with websockets.connect(PRIVATE_URL, ping_interval=None, close_timeout=3) as ws:
-                ts = str(int(time.time()))
-                await ws.send(json.dumps({"op": "login", "args": [{"apiKey": key, "passphrase": passphrase, "timestamp": ts, "sign": _sign(ts, secret)}]}))
-                login_msg = await asyncio.wait_for(ws.recv(), timeout=10)
-                try:
-                    login_data = json.loads(login_msg)
-                except Exception:
-                    login_data = {}
-                # Bitget docs show successful login as {"event":"login","code":"0"},
-                # but in live responses code can arrive as numeric 0 and can include connId.
-                # Treat both string "0" and integer 0 as success.
-                login_ok = login_data.get("event") == "login" and str(login_data.get("code")) == "0"
-                if not login_ok:
-                    raise RuntimeError(f"login failed: {login_msg}")
-                _state.last_error = ""
-                await ws.send(json.dumps({"op": "subscribe", "args": args}))
+            timestamp = str(int(time.time() * 1000))
+            payload = f"{timestamp}GET/user/verify"
+            sign = base64.b64encode(hmac.new(secret.encode(), payload.encode(), hashlib.sha256).digest()).decode()
+            
+            async with websockets.connect(PRIVATE_URL, ping_interval=20, ping_timeout=10) as ws:
+                login_msg = {
+                    "op": "login",
+                    "args": [{"apiKey": key, "passphrase": passphrase, "timestamp": timestamp, "sign": sign}],
+                }
+                await ws.send(json.dumps(login_msg))
+                
+                resp = await ws.recv()
+                if "login" not in resp:
+                    raise RuntimeError(f"WS login failed: {resp}")
+
                 _state.private_connected = True
-                _state.private_last_message_ts = time.time()
-                hb = asyncio.create_task(_heartbeat(ws))
+                _state.last_error = ""
+                
+                subs = [
+                    {"instType": INST_TYPE, "channel": "orders", "instId": "default"},
+                    {"instType": INST_TYPE, "channel": "orders-algo", "instId": "default"},
+                    {"instType": INST_TYPE, "channel": "positions", "instId": "default"},
+                ]
+                await ws.send(json.dumps({"op": "subscribe", "args": subs}))
+
+                async def keepalive():
+                    while not _stop.is_set():
+                        await asyncio.sleep(20)
+                        if ws.open:
+                            await ws.send("ping")
+                            
+                hb = asyncio.create_task(keepalive())
                 try:
                     async for msg in ws:
-                        if msg == "pong":
-                            _state.private_last_message_ts = time.time()
-                            continue
+                        if _stop.is_set():
+                            break
                         _state.private_last_message_ts = time.time()
-                        try:
-                            data = json.loads(msg)
-                        except Exception:
+                        if msg == "pong":
                             continue
+                        data = json.loads(msg)
                         arg = data.get("arg") or {}
                         ch = arg.get("channel")
                         payload = data.get("data") or []

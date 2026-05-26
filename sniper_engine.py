@@ -62,12 +62,9 @@ VOLUME_SHOCK_DEFAULTS: Dict[str, Any] = {
 
 
 SYMBOL_PROFILES: Dict[str, Dict[str, Any]] = {
-    # BTC keeps BTC-sized ranges, but allows a slightly larger chase candle than ETH/SOL.
-    # The previous global 1.8 ATR blocked a valid BTC arm at 1.85 ATR.
     "BTC": {
         "max_chase_candle_atr": 1.95,
     },
-    # ETH needs dollar thresholds around single-digit moves, not BTC's 80/120 USD filters.
     "ETH": {
         "min_pre_range_usd": 3.0,
         "max_pre_range_usd": 90.0,
@@ -89,7 +86,6 @@ SYMBOL_PROFILES: Dict[str, Dict[str, Any]] = {
         "volume_shock_order_life_seconds": 25,
         "volume_shock_cooldown_minutes": 10,
     },
-    # SOL needs cent-sized thresholds. BTC/ETH dollar settings would either block it or set unusable stops.
     "SOL": {
         "min_pre_range_usd": 0.25,
         "max_pre_range_usd": 8.0,
@@ -113,6 +109,20 @@ SYMBOL_PROFILES: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# --- NON-BLOCKING DB HELPERS (FAST LOOP) ---
+def fire_log(level: str, event_type: str, message: str, data: dict = None):
+    """Отправляет лог в БД в фоне, не блокируя торговый цикл."""
+    asyncio.create_task(asyncio.to_thread(db.log_event, level, event_type, message, data or {}))
+
+def fire_update_trade(oid: str, payload: dict):
+    """Обновляет трейд в БД в фоне."""
+    asyncio.create_task(asyncio.to_thread(db.update_trade_by_client_oid, oid, payload))
+
+def fire_state(mode: str, is_active: bool, reason: str):
+    """Обновляет статус панели в фоне."""
+    asyncio.create_task(asyncio.to_thread(db.set_runtime_state, mode, is_active, reason))
+# -------------------------------------------
+
 
 def base_symbol(symbol: str) -> str:
     s = str(symbol or "BTC").upper().replace(":USDT", "").replace("/", "")
@@ -124,38 +134,19 @@ def profile_overrides_for_symbol(symbol: str) -> Dict[str, Any]:
 
 
 def with_symbol_profile(settings: BotSettings, symbol: str) -> BotSettings:
-    """Return a copy of settings with BTC/ETH/SOL-safe thresholds for the selected symbol.
-
-    Global panel settings stay untouched in Supabase. The engine applies this copy only
-    while analyzing/trading that symbol, so BTC, ETH and SOL do not share the same
-    dollar range/stop/buffer thresholds.
-    """
     updates: Dict[str, Any] = {"symbol": symbol}
     for key, value in profile_overrides_for_symbol(symbol).items():
-        # Only copy fields that really exist in BotSettings. New volume_shock_* values
-        # are read by sget() because older BotSettings may not define them.
         if hasattr(settings, key):
             updates[key] = value
     try:
         return settings.model_copy(update=updates)
     except Exception:
-        # Pydantic v1 fallback, just in case Railway has a different pydantic.
         data = settings.model_dump() if hasattr(settings, "model_dump") else dict(settings)
         data.update(updates)
         return BotSettings(**data)
 
 
 def sget(settings: BotSettings, name: str, default: Any = None) -> Any:
-    """Read settings safely and apply per-symbol overrides.
-
-    Priority:
-    1) Real BotSettings field if it exists and is not None.
-    2) BTC/ETH/SOL profile override for new/non-model fields.
-    3) Global hard default.
-    """
-    # For normal BotSettings fields, a profiled settings copy already contains
-    # ETH/SOL overrides. For new fields that older models do not have, use the
-    # profile table directly.
     if hasattr(settings, name):
         value = getattr(settings, name)
         if value is not None:
@@ -164,7 +155,6 @@ def sget(settings: BotSettings, name: str, default: Any = None) -> Any:
     if name in profile:
         return profile[name]
     return VOLUME_SHOCK_DEFAULTS.get(name, default)
-
 
 
 @dataclass
@@ -212,13 +202,6 @@ def synthetic_event(kind: str, delay_seconds: int, title: str, raw: Optional[Dic
 
 
 def score_volume_shock(metrics: Dict[str, float], spread_bps: float, settings: BotSettings) -> Dict[str, Any]:
-    """Fast sudden-volume detector.
-
-    It is intentionally separate from the normal sniper score. Normal sniper waits for
-    full ATR/range confirmation; this mode reacts earlier to an abnormal volume/body
-    impulse, but still requires spread/wick/range sanity and still places traps rather
-    than a market order.
-    """
     vol = float(metrics.get("volume_spike") or 0.0)
     body = float(metrics.get("last_body_atr") or 0.0)
     range_exp = float(metrics.get("range_expansion") or 0.0)
@@ -326,12 +309,7 @@ async def analyze_market(symbol: str, settings: BotSettings) -> Dict[str, Any]:
         await exchange.close()
 
 
-
-
 async def analyze_markets(settings: BotSettings) -> Dict[str, Any]:
-    """Scan several symbols and return the best current volatility candidate.
-    This keeps the same entry filters; it only chooses the best pair in the moment.
-    """
     raw_symbols = settings.scan_symbols or [settings.symbol]
     symbols = list(dict.fromkeys([s.strip() for s in raw_symbols if str(s).strip()]))[: max(1, int(settings.max_symbols_per_scan))]
     sem = asyncio.Semaphore(max(1, int(settings.multi_scan_concurrency)))
@@ -357,11 +335,6 @@ async def build_armed_plan(exchange, settings: BotSettings, event: NewsEvent) ->
     await configure_symbol(exchange, settings.symbol, settings.leverage, settings.isolated_margin)
     is_shock = event.provider == "volume_shock"
 
-    # V8.3.8: for volume shock, do not throw away the scan signal and re-fetch 1m OHLCV.
-    # The previous flow detected SHOCK_ARM, then build_armed_plan recalculated the candle
-    # again; on SOL/ETH/BTC fast moves the impulse often died before traps were placed.
-    # Use the already validated scan snapshot for volume_shock only. Normal sniper/news
-    # still uses the old fresh-OHLCV validation path.
     snapshot_used = False
     snapshot = {}
     if is_shock:
@@ -380,8 +353,6 @@ async def build_armed_plan(exchange, settings: BotSettings, event: NewsEvent) ->
     if is_shock and snapshot_used:
         spread_bps = float(snapshot.get("spread_bps") or 999.0)
         metrics: Dict[str, Any] = {}
-        # Copy numeric market fields from the scan snapshot. Keep only simple values so
-        # the plan meta remains JSON-safe and the risk/trigger math is deterministic.
         for key, value in snapshot.items():
             if isinstance(value, (int, float, bool)):
                 metrics[key] = value
@@ -502,6 +473,7 @@ async def place_armed_orders(exchange, settings: BotSettings, plan: ArmedPlan) -
     plan.sell_order_id = str(sell.get("id") or sell.get("orderId") or plan.sell_client_oid)
 
     strategy_name = "volume_shock_runner" if plan.event.provider == "volume_shock" else "volatility_hunter" if plan.event.provider in {"volatility_scanner", "manual_volatility"} else "news_volatility_sniper"
+    
     db.create_trade({
         "client_oid": plan.buy_client_oid,
         "exchange_order_id": plan.buy_order_id,
@@ -530,20 +502,14 @@ async def place_armed_orders(exchange, settings: BotSettings, plan: ArmedPlan) -
         "risk_usd": plan.risk_usd,
         "meta": {"plan": plan.metrics, "paired_oid": plan.buy_client_oid, "preset_sl": plan.sell_stop_loss},
     })
-    db.log_event("warning", "orders_armed", "LIVE trigger traps placed", {
+    
+    fire_log("warning", "orders_armed", "LIVE trigger traps placed", {
         "event": plan.event.title,
         "provider": plan.event.provider,
-        "time": plan.event.event_time_utc.isoformat(),
         "buy_trigger": plan.buy_trigger,
         "sell_trigger": plan.sell_trigger,
-        "buy_stop_loss": plan.buy_stop_loss,
-        "sell_stop_loss": plan.sell_stop_loss,
         "amount": plan.amount,
-        "risk_usd": plan.risk_usd,
         "score": plan.metrics.get("volatility_score"),
-        "volume_shock_score": plan.metrics.get("volume_shock_score"),
-        "snapshot_used": plan.metrics.get("snapshot_used"),
-        "mode": plan.metrics.get("mode"),
     })
     return plan
 
@@ -555,55 +521,61 @@ def infer_filled(order: Dict[str, Any]) -> bool:
 
 
 async def wait_for_breakout(exchange, settings: BotSettings, plan: ArmedPlan) -> Optional[str]:
-    post_wait = sget(settings, "volume_shock_order_life_seconds") if plan.event.provider == "volume_shock" else settings.auto_post_wait_seconds if plan.event.provider in {"volatility_scanner", "manual_volatility"} else settings.post_event_wait_seconds
+    post_wait = sget(settings, "volume_shock_order_life_seconds") if plan.event.provider == "volume_shock" else settings.auto_post_wait_seconds if plan.event.provider in VOLATILITY_PROVIDERS else settings.post_event_wait_seconds
     deadline = plan.event.event_time_utc + timedelta(seconds=post_wait)
     mode = BotMode.VOLATILITY_ARMED.value if plan.event.provider in VOLATILITY_PROVIDERS else BotMode.CALENDAR_ARMED.value
-    db.set_runtime_state(mode, True, f"armed traps: {plan.event.title}")
+    
+    # Не блокируем цикл записью в БД
+    fire_state(mode, True, f"armed traps: {plan.event.title}")
 
-    # Bitget V2 trigger plan orders are not normal orders. Checking them through
-    # CCXT fetch_order causes 40109 spam. The reliable live signal is the actual
-    # futures position, via private WS/REST fetch_positions fallback.
+    last_rest_check = 0.0
+
     while utc_now() <= deadline and not engine_stop.is_set():
-        try:
-            pos = await fetch_symbol_position(exchange, settings.symbol)
-            if float(pos.get("amount") or 0) > 0 and pos.get("direction") in ("long", "short"):
-                direction = str(pos.get("direction"))
-                if direction == "long":
-                    await cancel_safely(exchange, plan.sell_order_id, settings.symbol)
-                    px = pos.get("entry") or await get_last_price(exchange, settings.symbol)
-                    db.update_trade_by_client_oid(plan.buy_client_oid, {"status": "active", "execution_price": px})
-                    db.update_trade_by_client_oid(plan.sell_client_oid, {"status": "cancelled"})
-                    db.log_event("warning", "breakout_position_detected", "Long position detected after trigger trap", {"symbol": settings.symbol, "amount": pos.get("amount"), "entry": px, "preset_sl": plan.buy_stop_loss})
-                    return "long"
-                else:
-                    await cancel_safely(exchange, plan.buy_order_id, settings.symbol)
-                    px = pos.get("entry") or await get_last_price(exchange, settings.symbol)
-                    db.update_trade_by_client_oid(plan.sell_client_oid, {"status": "active", "execution_price": px})
-                    db.update_trade_by_client_oid(plan.buy_client_oid, {"status": "cancelled"})
-                    db.log_event("warning", "breakout_position_detected", "Short position detected after trigger trap", {"symbol": settings.symbol, "amount": pos.get("amount"), "entry": px, "preset_sl": plan.sell_stop_loss})
-                    return "short"
-        except Exception as e:
-            db.log_event("error", "watch_position", f"Position watch error: {e}", {})
-        await asyncio.sleep(settings.order_watch_interval_seconds)
+        # 1. МГНОВЕННАЯ ПРОВЕРКА ЦЕНЫ (из кэша WebSocket)
+        px = await get_last_price(exchange, settings.symbol)
+        
+        # 2. Локально проверяем, пересекла ли цена триггеры ловушек
+        crossed = px >= plan.buy_trigger or px <= plan.sell_trigger
+        
+        now_ts = time.time()
+        
+        # 3. Дергаем тяжелый REST только если есть пробой ИЛИ раз в 1.5 секунды как страховку
+        if crossed or (now_ts - last_rest_check > 1.5):
+            try:
+                pos = await fetch_symbol_position(exchange, settings.symbol)
+                last_rest_check = now_ts
+                
+                if float(pos.get("amount") or 0) > 0 and pos.get("direction") in ("long", "short"):
+                    direction = str(pos.get("direction"))
+                    entry_px = pos.get("entry") or px
+                    
+                    if direction == "long":
+                        await cancel_safely(exchange, plan.sell_order_id, settings.symbol)
+                        fire_update_trade(plan.buy_client_oid, {"status": "active", "execution_price": entry_px})
+                        fire_update_trade(plan.sell_client_oid, {"status": "cancelled"})
+                        fire_log("warning", "breakout_position_detected", "Long position detected after trigger trap", {"symbol": settings.symbol, "amount": pos.get("amount"), "entry": entry_px, "preset_sl": plan.buy_stop_loss})
+                        return "long"
+                    else:
+                        await cancel_safely(exchange, plan.buy_order_id, settings.symbol)
+                        fire_update_trade(plan.sell_client_oid, {"status": "active", "execution_price": entry_px})
+                        fire_update_trade(plan.buy_client_oid, {"status": "cancelled"})
+                        fire_log("warning", "breakout_position_detected", "Short position detected after trigger trap", {"symbol": settings.symbol, "amount": pos.get("amount"), "entry": entry_px, "preset_sl": plan.sell_stop_loss})
+                        return "short"
+            except Exception as e:
+                fire_log("error", "watch_position", f"Position watch error: {e}", {})
+                
+        await asyncio.sleep(0.05) # FAST LOOP: 50 мс
 
+    # Если время вышло
     await cancel_safely(exchange, plan.buy_order_id, settings.symbol)
     await cancel_safely(exchange, plan.sell_order_id, settings.symbol)
-    db.update_trade_by_client_oid(plan.buy_client_oid, {"status": "expired"})
-    db.update_trade_by_client_oid(plan.sell_client_oid, {"status": "expired"})
-    db.log_event("info", "no_breakout", "Window passed without valid breakout; traps cancelled", {"event": plan.event.title})
+    fire_update_trade(plan.buy_client_oid, {"status": "expired"})
+    fire_update_trade(plan.sell_client_oid, {"status": "expired"})
+    fire_log("info", "no_breakout", "Window passed without valid breakout; traps cancelled", {"event": plan.event.title})
     return None
 
 
 async def attach_exchange_protection(exchange, settings: BotSettings, direction: str, amount: float, entry: float, stop_distance: float) -> Dict[str, Any]:
-    """Attach real exchange-side protection immediately after a trap fill.
-
-    V8.3.9 change:
-    - SL stays exchange-side, as before.
-    - TP1 is now also placed exchange-side immediately for the configured partial size.
-      Before this, TP1 was only a local polling rule inside manage_position(), so Bitget UI
-      did not show a TP order and a Railway lag/restart could miss the take-profit.
-    - TP2 remains optional and disabled unless settings.tp2_enabled is true.
-    """
     if direction == "long":
         sl = price_precision(exchange, settings.symbol, entry - stop_distance)
         tp1 = price_precision(exchange, settings.symbol, entry + stop_distance * settings.tp1_r)
@@ -632,7 +604,7 @@ async def attach_exchange_protection(exchange, settings: BotSettings, direction:
         )
         out["exchange_sl_id"] = extract_order_id(out["exchange_sl"])
     except Exception as e:
-        db.log_event("error", "protect_sl_failed", f"Exchange SL failed; manual guard active: {e}", {"sl": sl})
+        fire_log("error", "protect_sl_failed", f"Exchange SL failed; manual guard active: {e}", {"sl": sl})
 
     if tp1_amount > 0:
         try:
@@ -640,9 +612,9 @@ async def attach_exchange_protection(exchange, settings: BotSettings, direction:
                 exchange, settings.symbol, direction, tp1_amount, tp1, "take_profit", f"vhs-tp1-{uuid.uuid4().hex[:10]}", settings.hedge_mode
             )
             out["exchange_tp1_id"] = extract_order_id(out["exchange_tp1"])
-            db.log_event("info", "exchange_tp1_placed", "Exchange TP1 reduce trigger placed", {"tp1": tp1, "amount": tp1_amount})
+            fire_log("info", "exchange_tp1_placed", "Exchange TP1 reduce trigger placed", {"tp1": tp1, "amount": tp1_amount})
         except Exception as e:
-            db.log_event("error", "protect_tp1_failed", f"Exchange TP1 failed; local TP1 fallback active: {e}", {"tp1": tp1, "amount": tp1_amount})
+            fire_log("error", "protect_tp1_failed", f"Exchange TP1 failed; local TP1 fallback active: {e}", {"tp1": tp1, "amount": tp1_amount})
 
     if settings.tp2_enabled:
         try:
@@ -651,21 +623,17 @@ async def attach_exchange_protection(exchange, settings: BotSettings, direction:
             )
             out["exchange_tp2_id"] = extract_order_id(out["exchange_tp2"])
         except Exception as e:
-            db.log_event("error", "protect_tp2_failed", f"Exchange TP2 failed; manual guard active: {e}", {"tp2": tp2})
+            fire_log("error", "protect_tp2_failed", f"Exchange TP2 failed; manual guard active: {e}", {"tp2": tp2})
 
-    # TP without SL is dangerous. If SL failed, remove any exchange TP so the bot does
-    # not leave one-sided orphan protection orders after emergency flatten.
     if not out.get("exchange_sl") and settings.cancel_tp_if_sl_fails:
         for key, label in (("exchange_tp1", "TP1"), ("exchange_tp2", "TP2")):
             if out.get(key):
                 try:
                     await cancel_safely(exchange, str(out[key].get("id") or out[key].get("orderId")), settings.symbol)
-                    db.log_event("warning", "orphan_tp_cancelled", f"{label} cancelled because exchange SL was not confirmed", {"tp1": tp1, "tp2": tp2})
+                    fire_log("warning", "orphan_tp_cancelled", f"{label} cancelled because exchange SL was not confirmed", {"tp1": tp1, "tp2": tp2})
                 except Exception as e:
-                    db.log_event("error", "orphan_tp_cancel_failed", f"Could not cancel {label} after SL failure: {e}", {})
+                    fire_log("error", "orphan_tp_cancel_failed", f"Could not cancel {label} after SL failure: {e}", {})
     return out
-
-
 
 
 async def update_exchange_stop(exchange, settings: BotSettings, direction: str, amount: float, new_stop: float, old_order_id: Optional[str]) -> Optional[str]:
@@ -679,14 +647,14 @@ async def update_exchange_stop(exchange, settings: BotSettings, direction: str, 
         new_id = extract_order_id(new_sl)
         if old_order_id:
             await cancel_safely(exchange, old_order_id, settings.symbol)
-        db.log_event("info", "trailing_sl_updated", "Exchange SL moved by trailing manager", {"new_stop": new_stop, "old_order_id": old_order_id, "new_order_id": new_id})
+        fire_log("info", "trailing_sl_updated", "Exchange SL moved by trailing manager", {"new_stop": new_stop, "old_order_id": old_order_id, "new_order_id": new_id})
         return new_id
     except Exception as e:
-        db.log_event("error", "trailing_sl_update_failed", f"Could not update exchange trailing SL: {e}", {"new_stop": new_stop})
+        fire_log("error", "trailing_sl_update_failed", f"Could not update exchange trailing SL: {e}", {"new_stop": new_stop})
         return old_order_id
 
 async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, direction: str) -> None:
-    db.set_runtime_state(BotMode.IN_TRADE.value, True, f"{direction} active")
+    fire_state(BotMode.IN_TRADE.value, True, f"{direction} active")
     entry = await get_last_price(exchange, settings.symbol)
     side_close = "sell" if direction == "long" else "buy"
     remaining = plan.amount
@@ -706,15 +674,14 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
     current_tp1_order_id = last_protection.get("exchange_tp1_id")
     current_tp2_order_id = last_protection.get("exchange_tp2_id")
     has_exchange_guard = bool(last_protection.get("exchange_sl")) or bool(preset_sl_price)
+    
     if bool(preset_sl_price) and not last_protection.get("exchange_sl"):
-        db.log_event("warning", "preset_sl_guard_active", "Position protected by stop-loss preset on trigger order", {"direction": direction, "preset_sl": preset_sl_price})
+        fire_log("warning", "preset_sl_guard_active", "Position protected by stop-loss preset on trigger order", {"direction": direction, "preset_sl": preset_sl_price})
 
-    # V7 live guard: if the exchange did not confirm a real SL, do not keep the position alive.
-    # Manual polling is a backup, not a substitute for an exchange-side stop during news volatility.
     if settings.hard_exchange_sl_required and not has_exchange_guard:
         active_oid = plan.buy_client_oid if direction == "long" else plan.sell_client_oid
         msg = "Exchange-side SL was not confirmed; position will be flattened immediately"
-        db.log_event("critical", "no_exchange_sl_flatten", msg, {
+        fire_log("critical", "no_exchange_sl_flatten", msg, {
             "direction": direction,
             "entry": entry,
             "amount": remaining,
@@ -726,65 +693,62 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
                 await close_position_market(exchange, settings.symbol, side_close, remaining, direction if settings.hedge_mode else None)
                 pnl = (px - entry) * remaining if direction == "long" else (entry - px) * remaining
                 fee_est = plan.notional * 0.0008 * 2
-                db.update_trade_by_client_oid(active_oid, {
+                fire_update_trade(active_oid, {
                     "status": "closed",
                     "pnl": pnl - fee_est,
                     "close_price": px,
                     "close_reason": "no_exchange_sl",
                     "meta": {"entry": entry, "last": px, "gross_pnl": pnl, "fee_est": fee_est, "score": plan.metrics.get("volatility_score")},
                 })
-                db.set_runtime_state(BotMode.PAUSED.value, False, "paused: exchange SL failed and position was flattened")
+                fire_state(BotMode.PAUSED.value, False, "paused: exchange SL failed and position was flattened")
                 return
             except Exception as e:
-                db.log_event("critical", "no_exchange_sl_flatten_failed", f"Could not flatten after SL failure: {e}", {})
+                fire_log("critical", "no_exchange_sl_flatten_failed", f"Could not flatten after SL failure: {e}", {})
                 if settings.emergency_flatten_on_error:
                     try:
                         await flatten_symbol_positions(exchange, settings.symbol, settings.hedge_mode)
                     except Exception as inner:
-                        db.log_event("critical", "symbol_flatten_failed", f"Symbol flatten failed: {inner}", {})
+                        fire_log("critical", "symbol_flatten_failed", f"Symbol flatten failed: {inner}", {})
                 return
 
-    db.log_event("warning", "position_active", "Breakout position is active", {
+    fire_log("warning", "position_active", "Breakout position is active", {
         "direction": direction,
         "entry": entry,
         "amount": remaining,
         "sl": stop_price,
         "tp1": tp1_price,
         "tp2": tp2_price,
-        "exchange_protection": bool(has_exchange_guard),
-        "sl_source": "tpsl_order" if last_protection.get("exchange_sl") else "preset_trigger_order",
-        "tp1": tp1_price,
-        "tp1_amount": last_protection.get("tp1_amount"),
-        "tp1_source": "exchange_reduce_trigger" if last_protection.get("exchange_tp1") else "local_fallback",
-        "exchange_tp1": bool(last_protection.get("exchange_tp1")),
-        "score": plan.metrics.get("volatility_score"),
-        "volume_shock_score": plan.metrics.get("volume_shock_score"),
-        "snapshot_used": plan.metrics.get("snapshot_used"),
-        "mode": plan.metrics.get("mode"),
+        "exchange_protection": bool(has_exchange_guard)
     })
 
     realized = 0.0
+    last_sync_time = time.time()
+    live_amount = remaining
+
     try:
         while not engine_stop.is_set():
-            live_pos = await fetch_symbol_position(exchange, settings.symbol)
-            live_amount = float(live_pos.get("amount") or 0)
+            # Мгновенная цена из кэша
+            price = await get_last_price(exchange, settings.symbol)
+            now_ts = time.time()
+
+            # Редкая проверка биржи (защита от rate limits)
+            if now_ts - last_sync_time > 2.0:
+                live_pos = await fetch_symbol_position(exchange, settings.symbol)
+                live_amount = float(live_pos.get("amount") or 0)
+                last_sync_time = now_ts
+
             if live_amount <= 0:
                 active_oid = plan.buy_client_oid if direction == "long" else plan.sell_client_oid
-                px = await get_last_price(exchange, settings.symbol)
-                db.update_trade_by_client_oid(active_oid, {
+                fire_update_trade(active_oid, {
                     "status": "closed",
-                    "close_price": px,
+                    "close_price": price,
                     "close_reason": "external_or_manual_close",
-                    "meta": {"entry": entry, "last": px, "manual_or_exchange_closed": True, "score": plan.metrics.get("volatility_score")},
+                    "meta": {"entry": entry, "last": price, "manual_or_exchange_closed": True, "score": plan.metrics.get("volatility_score")},
                 })
-                db.log_event("warning", "position_closed_externally", "Position is no longer open on exchange; marked closed in database", {"direction": direction, "price": px})
+                fire_log("warning", "position_closed_externally", "Position is no longer open on exchange; marked closed in database", {"direction": direction, "price": price})
                 break
 
-            price = await get_last_price(exchange, settings.symbol)
-
-            # V8.3.9: if exchange TP1 partially reduced the position, detect it from
-            # live position size, then move remaining SL to breakeven. This makes TP1
-            # truly exchange-side while the bot still updates its internal state.
+            # ---- ЛОГИКА TP И ТРЕЙЛИНГА (работает на скорости 50мс) ----
             if settings.tp1_enabled and not tp1_done and live_amount < remaining:
                 closed_amount = order_amount_precision(exchange, settings.symbol, max(0.0, remaining - live_amount))
                 if closed_amount > 0:
@@ -795,8 +759,9 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
                     stop_price = entry
                     current_sl_order_id = await update_exchange_stop(exchange, settings, direction, remaining, stop_price, current_sl_order_id)
                     last_stop_sent = stop_price
-                    last_stop_update_at = time.time()
-                    db.log_event("info", "tp1_exchange_detected", "Exchange TP1 filled; stop moved to breakeven", {"price": price, "pnl": pnl, "closed_amount": closed_amount, "remaining": remaining, "sl": stop_price})
+                    last_stop_update_at = now_ts
+                    fire_log("info", "tp1_exchange_detected", "Exchange TP1 filled; stop moved to breakeven", {"price": price, "pnl": pnl, "closed_amount": closed_amount, "remaining": remaining, "sl": stop_price})
+
             if direction == "long":
                 r = (price - entry) / plan.stop_distance
                 best_price = max(best_price, price)
@@ -822,17 +787,16 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
                 if r >= settings.breakeven_after_r:
                     stop_price = min(stop_price, entry)
 
-            elapsed = time.time() - started
+            elapsed = now_ts - started
             stale_exit = elapsed >= settings.stale_trade_exit_seconds and r < settings.stale_trade_min_r
             timeout_exit = elapsed >= settings.hard_timeout_seconds
 
-            # Pro V8: move real exchange-side stop, not only local stop.
             stop_step = max(float(plan.metrics.get("atr14", 0) or 0) * settings.trailing_min_step_atr, settings.trailing_min_step_usd)
             stop_moved_enough = abs(stop_price - last_stop_sent) >= stop_step
-            if (trailing_active or r >= settings.breakeven_after_r) and stop_moved_enough and (time.time() - last_stop_update_at) >= settings.trailing_update_interval_seconds:
+            if (trailing_active or r >= settings.breakeven_after_r) and stop_moved_enough and (now_ts - last_stop_update_at) >= settings.trailing_update_interval_seconds:
                 current_sl_order_id = await update_exchange_stop(exchange, settings, direction, remaining, stop_price, current_sl_order_id)
                 last_stop_sent = stop_price
-                last_stop_update_at = time.time()
+                last_stop_update_at = now_ts
 
             if settings.tp1_enabled and settings.tp1_close_pct > 0 and hit_tp1 and not tp1_done and not current_tp1_order_id:
                 close_amount = order_amount_precision(exchange, settings.symbol, remaining * settings.tp1_close_pct)
@@ -843,58 +807,54 @@ async def manage_position(exchange, settings: BotSettings, plan: ArmedPlan, dire
                     remaining = order_amount_precision(exchange, settings.symbol, remaining - close_amount)
                     tp1_done = True
                     stop_price = entry
-                    # After partial close, replace full-size SL with remaining-size SL at breakeven.
                     current_sl_order_id = await update_exchange_stop(exchange, settings, direction, remaining, stop_price, current_sl_order_id)
                     last_stop_sent = stop_price
-                    last_stop_update_at = time.time()
-                    db.log_event("info", "tp1_local_fallback", "TP1 partial profit taken by local fallback; stop moved to breakeven", {"price": price, "pnl": pnl, "remaining": remaining})
+                    last_stop_update_at = now_ts
+                    fire_log("info", "tp1_local_fallback", "TP1 partial profit taken by local fallback; stop moved to breakeven", {"price": price, "pnl": pnl, "remaining": remaining})
 
             exit_by_tp2 = bool(settings.tp2_enabled and hit_tp2)
             if hit_stop or exit_by_tp2 or stale_exit or timeout_exit:
                 reason = "trailing_stop" if hit_stop and trailing_active else "stop" if hit_stop else "tp2" if exit_by_tp2 else "stale_exit" if stale_exit else "timeout"
-                # If the bot is closing the remaining position itself, remove any outstanding TP orders first.
+                
                 for oid, label in ((current_tp1_order_id, "TP1"), (current_tp2_order_id, "TP2")):
                     if oid:
                         try:
                             await cancel_safely(exchange, oid, settings.symbol)
-                            db.log_event("info", "exit_tp_cancelled", f"{label} cancelled before final exit", {"order_id": oid, "reason": reason})
+                            fire_log("info", "exit_tp_cancelled", f"{label} cancelled before final exit", {"order_id": oid, "reason": reason})
                         except Exception as e:
-                            db.log_event("error", "exit_tp_cancel_failed", f"Could not cancel {label} before final exit: {e}", {"order_id": oid})
+                            fire_log("error", "exit_tp_cancel_failed", f"Could not cancel {label} before final exit: {e}", {"order_id": oid})
+                
                 if remaining > 0:
                     await close_position_market(exchange, settings.symbol, side_close, remaining, direction if settings.hedge_mode else None)
                     pnl = (price - entry) * remaining if direction == "long" else (entry - price) * remaining
                     realized += pnl
+                
                 fee_est = plan.notional * 0.0008 * 2
                 net_pnl = realized - fee_est
                 active_oid = plan.buy_client_oid if direction == "long" else plan.sell_client_oid
-                db.update_trade_by_client_oid(active_oid, {
+                
+                fire_update_trade(active_oid, {
                     "status": "closed",
                     "pnl": net_pnl,
                     "close_price": price,
                     "close_reason": reason,
                     "meta": {"entry": entry, "last": price, "gross_pnl": realized, "fee_est": fee_est, "tp1_done": tp1_done, "trailing_active": trailing_active, "last_stop": stop_price, "score": plan.metrics.get("volatility_score")},
                 })
-                db.log_event("warning" if net_pnl < 0 else "info", "position_closed", f"Position closed: {reason}", {"net_pnl": net_pnl, "price": price})
+                fire_log("warning" if net_pnl < 0 else "info", "position_closed", f"Position closed: {reason}", {"net_pnl": net_pnl, "price": price})
                 break
 
-            await asyncio.sleep(settings.poll_interval_seconds)
+            await asyncio.sleep(0.05) # FAST LOOP: 50 мс
     except Exception as e:
-        db.log_event("error", "manage_position_error", f"Position manager error: {e}", {})
+        fire_log("error", "manage_position_error", f"Position manager error: {e}", {})
         if settings.emergency_flatten_on_error and remaining > 0:
             try:
                 await close_position_market(exchange, settings.symbol, side_close, remaining, direction if settings.hedge_mode else None)
-                db.log_event("warning", "emergency_flatten", "Emergency flatten executed after manager error", {"direction": direction, "amount": remaining})
+                fire_log("warning", "emergency_flatten", "Emergency flatten executed after manager error", {"direction": direction, "amount": remaining})
             except Exception as inner:
-                db.log_event("critical", "emergency_flatten_failed", f"Emergency flatten failed: {inner}", {})
+                fire_log("critical", "emergency_flatten_failed", f"Emergency flatten failed: {inner}", {})
 
 
 async def prepare_and_trade_event(settings: BotSettings, event: NewsEvent) -> bool:
-    """Prepare traps and manage the trade.
-
-    Returns True only after LIVE trigger traps were actually placed on the exchange.
-    This is important: auto-arm cooldown must not start after build/validation failures,
-    otherwise the scanner blocks itself while no order was ever armed.
-    """
     mode = BotMode.VOLATILITY_ARMED.value if event.provider in VOLATILITY_PROVIDERS else BotMode.CALENDAR_ARMED.value
     db.upsert_news_event(event)
     db.mark_event_status(event.provider_id, "arming", "Preparing trigger traps")
@@ -939,8 +899,6 @@ async def maybe_auto_arm_volatility(settings: BotSettings) -> bool:
     score = float(market.get("volatility_score") or 0)
     state = str(market.get("state") or "COLD")
 
-    # V8.2: fast sudden volume mode. It does NOT bypass risk limits, live guards, SL or trailing.
-    # It only bypasses the normal full score=88 requirement when abnormal volume/body impulse is present.
     shock_market = scan.get("best_shock") or {}
     shock_symbol = shock_market.get("symbol") or selected_symbol
     shock_score = float(shock_market.get("volume_shock_score") or 0)
@@ -949,20 +907,20 @@ async def maybe_auto_arm_volatility(settings: BotSettings) -> bool:
     reason = f"best {selected_symbol} score {score:.1f} / {state}"
     if bool(sget(settings, "volume_shock_enabled")):
         reason += f" | shock {shock_symbol} {shock_score:.1f}"
-    db.set_runtime_state(BotMode.VOLATILITY_SCAN.value, True, reason)
+    fire_state(BotMode.VOLATILITY_SCAN.value, True, reason)
 
     if score >= settings.notify_score or shock_score >= settings.notify_score:
         if not _last_hot_log_at or (utc_now() - _last_hot_log_at).total_seconds() > 60:
-            db.log_event("info", "multi_symbol_volatility_watch", f"Best normal {selected_symbol} score {score:.1f}; best shock {shock_symbol} score {shock_score:.1f}", {"best": market, "best_shock": shock_market, "top": (scan.get("markets") or [])[:5]})
+            fire_log("info", "multi_symbol_volatility_watch", f"Best normal {selected_symbol} score {score:.1f}; best shock {shock_symbol} score {shock_score:.1f}", {"best": market, "best_shock": shock_market, "top": (scan.get("markets") or [])[:5]})
             _last_hot_log_at = utc_now()
 
     if bool(sget(settings, "volume_shock_enabled")) and shock_valid:
         if _last_shock_arm_at and (utc_now() - _last_shock_arm_at).total_seconds() < sget(settings, "volume_shock_cooldown_minutes") * 60:
-            db.log_event("info", "volume_shock_cooldown", "Volume shock detected but cooldown is active", {"market": shock_market})
+            pass # cooldown
         else:
             ok, limit_reason = daily_limits_ok(settings, db.todays_pnl(), db.todays_trade_count(), db.consecutive_losses())
             if not ok:
-                db.log_event("warning", "volume_shock_blocked", limit_reason, shock_market)
+                fire_log("warning", "volume_shock_blocked", limit_reason, shock_market)
                 return False
             shock_settings = with_symbol_profile(settings, shock_symbol if settings.trade_selected_symbol else settings.symbol)
             event = synthetic_event(
@@ -974,9 +932,8 @@ async def maybe_auto_arm_volatility(settings: BotSettings) -> bool:
             armed = await prepare_and_trade_event(shock_settings, event)
             if armed:
                 _last_shock_arm_at = utc_now()
-                db.log_event("info", "volume_shock_cooldown_started", "Volume shock cooldown started after successful orders_armed", {"symbol": shock_settings.symbol, "score": shock_score})
+                fire_log("info", "volume_shock_cooldown_started", "Volume shock cooldown started after successful orders_armed", {"symbol": shock_settings.symbol, "score": shock_score})
                 return True
-            db.log_event("info", "volume_shock_no_cooldown", "Volume shock attempt failed before orders_armed; cooldown not started", {"symbol": shock_settings.symbol, "score": shock_score})
             return False
 
     if _last_vol_arm_at and (utc_now() - _last_vol_arm_at).total_seconds() < settings.volatility_cooldown_minutes * 60:
@@ -985,7 +942,7 @@ async def maybe_auto_arm_volatility(settings: BotSettings) -> bool:
     if score >= settings.auto_arm_score and market.get("valid_for_sniper"):
         ok, limit_reason = daily_limits_ok(settings, db.todays_pnl(), db.todays_trade_count(), db.consecutive_losses())
         if not ok:
-            db.log_event("warning", "auto_arm_blocked", limit_reason, market)
+            fire_log("warning", "auto_arm_blocked", limit_reason, market)
             return False
         normal_settings = with_symbol_profile(settings, selected_symbol if settings.trade_selected_symbol else settings.symbol)
         event = synthetic_event(
@@ -997,9 +954,8 @@ async def maybe_auto_arm_volatility(settings: BotSettings) -> bool:
         armed = await prepare_and_trade_event(normal_settings, event)
         if armed:
             _last_vol_arm_at = utc_now()
-            db.log_event("info", "volatility_cooldown_started", "Volatility cooldown started after successful orders_armed", {"symbol": normal_settings.symbol, "score": score})
+            fire_log("info", "volatility_cooldown_started", "Volatility cooldown started after successful orders_armed", {"symbol": normal_settings.symbol, "score": score})
             return True
-        db.log_event("info", "volatility_no_cooldown", "Volatility attempt failed before orders_armed; cooldown not started", {"symbol": normal_settings.symbol, "score": score})
         return False
     return False
 
@@ -1010,13 +966,13 @@ async def engine_loop() -> None:
         try:
             settings = db.get_settings()
             if not settings.calendar_enabled and not settings.volatility_auto_enabled:
-                db.set_runtime_state(BotMode.PAUSED.value, False, "calendar and volatility scanner disabled")
+                fire_state(BotMode.PAUSED.value, False, "calendar and volatility scanner disabled")
                 await asyncio.sleep(10)
                 continue
 
             ok, reason = daily_limits_ok(settings, db.todays_pnl(), db.todays_trade_count(), db.consecutive_losses())
             if not ok:
-                db.set_runtime_state(BotMode.PAUSED.value, False, reason)
+                fire_state(BotMode.PAUSED.value, False, reason)
                 await asyncio.sleep(15)
                 continue
 
@@ -1039,7 +995,7 @@ async def engine_loop() -> None:
             if selected:
                 seconds_to_event = (selected.event_time_utc - utc_now()).total_seconds()
                 if seconds_to_event > 1:
-                    db.set_runtime_state(BotMode.CALENDAR_ARMED.value, True, f"arming news soon: {selected.title} in {seconds_to_event:.0f}s")
+                    fire_state(BotMode.CALENDAR_ARMED.value, True, f"arming news soon: {selected.title} in {seconds_to_event:.0f}s")
                     await asyncio.sleep(max(0.2, min(5, seconds_to_event - 1)))
                 await prepare_and_trade_event(settings, selected)
                 await asyncio.sleep(settings.event_cooldown_minutes * 60)
@@ -1047,14 +1003,14 @@ async def engine_loop() -> None:
 
             armed = await maybe_auto_arm_volatility(settings)
             if not armed:
-                db.set_runtime_state(BotMode.HYBRID_SCAN.value, True, "no news; scanning volatility")
+                fire_state(BotMode.HYBRID_SCAN.value, True, "no news; scanning volatility")
                 await asyncio.sleep(settings.scan_interval_seconds)
         except asyncio.CancelledError:
             break
         except Exception as e:
-            db.log_event("error", "engine_loop", f"Engine loop error: {e}", {})
+            fire_log("error", "engine_loop", f"Engine loop error: {e}", {})
             await asyncio.sleep(5)
-    db.set_runtime_state(BotMode.OFF.value, False, "engine stopped")
+    fire_state(BotMode.OFF.value, False, "engine stopped")
 
 
 async def start_engine() -> Dict[str, Any]:
@@ -1088,16 +1044,16 @@ async def stop_engine() -> Dict[str, Any]:
                 if settings.kill_switch_closes_positions:
                     await flatten_symbol_positions(exchange, sym, settings.hedge_mode)
                     results[sym]["flattened"] = True
-                    db.log_event("warning", "kill_switch_flatten", "Kill switch attempted to flatten open symbol positions", {"symbol": sym})
+                    fire_log("warning", "kill_switch_flatten", "Kill switch attempted to flatten open symbol positions", {"symbol": sym})
             except Exception as e:
                 results[sym] = {"error": str(e)}
-                db.log_event("critical", "kill_switch_symbol_failed", f"Kill switch failed for {sym}: {e}", {"symbol": sym})
+                fire_log("critical", "kill_switch_symbol_failed", f"Kill switch failed for {sym}: {e}", {"symbol": sym})
     finally:
         await exchange.close()
     if engine_task:
         engine_task.cancel()
     await bitget_ws.stop()
-    db.set_runtime_state(BotMode.OFF.value, False, "manual stop; scan-symbol orders cancellation attempted")
+    fire_state(BotMode.OFF.value, False, "manual stop; scan-symbol orders cancellation attempted")
     return {"status": "stopped", "message": "Engine stopped and scan-symbol order cancellation attempted.", "symbols": results}
 
 
@@ -1135,6 +1091,5 @@ async def manual_arm_now(payload: ManualArmNowPayload) -> Dict[str, Any]:
         f"MANUAL VOLATILITY ARM score={score:.1f}: {payload.note}",
         raw={"market": market, "note": payload.note},
     )
-    # Temporarily use payload wait by patching event raw; wait_for_breakout uses settings auto wait for manual.
     asyncio.create_task(prepare_and_trade_event(settings, event))
     return {"status": "manual_volatility_armed", "event": event.model_dump(mode="json"), "market": market}

@@ -9,6 +9,7 @@
 // - Compatible with Supabase RPC public.create_deposit_with_balance
 // - V2: AUTO-SWEEP ADDED FOR BEP20 ONLY (Non-blocking)
 // - V3: WEBSOCKET FIX FOR NODE.JS 20 SUPABASE COMPATIBILITY
+// - V4: MORALIS FIX - Removed URL contract filters, strictly local filtering
 
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
@@ -56,7 +57,6 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     autoRefreshToken: false,
     persistSession: false
   },
-  // ИСПРАВЛЕНО: Теперь передаем WebSocket правильно для новых версий Supabase
   realtime: {
     transport: WebSocket
   }
@@ -740,8 +740,7 @@ async function getBEP20Transactions(address) {
       chain: 'bsc',
       limit: '100'
     });
-    params.append('contract_addresses', USDT_BSC_CONTRACT);
-    params.append('contract_addresses', USDC_BSC_CONTRACT);
+    // ⚠️ ИСПРАВЛЕНИЕ: Фильтры contract_addresses убраны из URL, чтобы не ломать Moralis
 
     const url = `https://deep-index.moralis.io/api/v2/${address}/erc20/transfers?${params.toString()}`;
 
@@ -768,11 +767,11 @@ async function getBEP20Transactions(address) {
 
         const tokenContract = String(tx.address || '').toLowerCase();
         
+        // ⚠️ ИСПРАВЛЕНИЕ: Локальная фильтрация USDT/USDC контрактов
         if (!validContracts.includes(tokenContract)) continue;
 
         const isUSDT = tokenContract === USDT_BSC_CONTRACT.toLowerCase();
         
-        // BSC использует 18 нулей
         const decimals = Number(tx.decimals || 18);
         const amount = Number(tx.value) / Math.pow(10, decimals);
         
@@ -810,8 +809,7 @@ async function getERC20Transactions(address) {
       chain: 'eth',
       limit: '100'
     });
-    params.append('contract_addresses', USDT_ETH_CONTRACT);
-    params.append('contract_addresses', USDC_ETH_CONTRACT);
+    // ⚠️ ИСПРАВЛЕНИЕ: Фильтры contract_addresses убраны из URL, чтобы не ломать Moralis
 
     const url = `https://deep-index.moralis.io/api/v2/${address}/erc20/transfers?${params.toString()}`;
 
@@ -838,6 +836,7 @@ async function getERC20Transactions(address) {
 
         const tokenContract = String(tx.address || '').toLowerCase();
         
+        // ⚠️ ИСПРАВЛЕНИЕ: Локальная фильтрация USDT/USDC контрактов
         if (!validContracts.includes(tokenContract)) continue;
 
         const isUSDT = tokenContract === USDT_ETH_CONTRACT.toLowerCase();
@@ -1398,7 +1397,6 @@ app.post('/public/deposit/generate', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Unsupported network' });
     }
 
-    // ИСПРАВЛЕНИЕ ЗДЕСЬ: ищем по колонке 'id', а не 'user_id'
     const { data: user, error: userError } = await supabase
       .from('profiles')
       .select('id')

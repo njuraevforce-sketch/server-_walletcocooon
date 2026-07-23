@@ -16,7 +16,6 @@ const ALLOWED_NETWORKS = new Set([
   'usdt_trc20',
   'trc_20',
 ]);
-
 function fail(message, code = 1) {
   console.error(message);
   process.exit(code);

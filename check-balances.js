@@ -23,8 +23,6 @@ const TRON_RPCS = [
   'https://api.trongrid.io'
 ];
 
-const TRONSCAN_API = 'https://apilist.tronscanapi.com';
-
 const USDT_BSC = '0x55d398326f99059fF775485246999027B3197955';
 const USDC_BSC = '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d';
 const USDT_ETH = '0xdAC17F958D2ee523a2206206994597C13D831ec7';
@@ -167,65 +165,6 @@ function parseTronGridAccount(data) {
   return { trx, usdt };
 }
 
-function parseTronScanAccountV2(data) {
-  let trx = 0;
-  let usdt = 0;
-
-  if (!data || typeof data !== 'object') {
-    return { trx, usdt };
-  }
-
-  trx = tokenAmount(data.balance || 0, 6);
-
-  const possibleTokenArrays = [
-    data.trc20token_balances,
-    data.trc20tokens,
-    data.tokens
-  ].filter(Array.isArray);
-
-  for (const arr of possibleTokenArrays) {
-    for (const token of arr) {
-      if (!token || typeof token !== 'object') continue;
-
-      const tokenId = normalizeAddress(token.tokenId || token.contract_address || token.contractAddress || token.address);
-      const symbol = String(token.tokenAbbr || token.tokenSymbol || token.symbol || token.name || '').toUpperCase();
-      const decimals = Number(token.tokenDecimal ?? token.decimals ?? 6);
-      const rawBalance = token.balance ?? token.amount ?? token.quantity ?? token.value ?? 0;
-
-      if (isUsdtTronKey(tokenId) || symbol === 'USDT') {
-        usdt += tokenAmount(rawBalance, decimals);
-      }
-    }
-  }
-
-  return { trx, usdt };
-}
-
-function parseTronScanTokens(data) {
-  let trx = 0;
-  let usdt = 0;
-  const tokens = Array.isArray(data?.data) ? data.data : [];
-
-  for (const token of tokens) {
-    if (!token || typeof token !== 'object') continue;
-
-    const tokenId = normalizeAddress(token.tokenId || token.contract_address || token.contractAddress || token.address);
-    const symbol = String(token.tokenAbbr || token.tokenSymbol || token.symbol || token.name || '').toUpperCase();
-    const decimals = Number(token.tokenDecimal ?? token.decimals ?? 6);
-    const rawBalance = token.balance ?? token.amount ?? token.quantity ?? token.value ?? 0;
-
-    if (symbol === 'TRX' || tokenId === '_' || token.type === 'trc10') {
-      trx = Math.max(trx, tokenAmount(rawBalance, decimals));
-    }
-
-    if (isUsdtTronKey(tokenId) || symbol === 'USDT') {
-      usdt += tokenAmount(rawBalance, decimals);
-    }
-  }
-
-  return { trx, usdt };
-}
-
 async function fetchTronGridBalance(address) {
   let lastErr;
 
@@ -244,60 +183,18 @@ async function fetchTronGridBalance(address) {
   throw lastErr;
 }
 
-async function fetchTronScanAccountV2Balance(address) {
-  const url = `${TRONSCAN_API}/api/accountv2?address=${encodeURIComponent(address)}`;
-  const data = await fetchJson(url, { headers: { Accept: 'application/json' } });
-  const parsed = parseTronScanAccountV2(data);
-  return { ...parsed, source: 'tronscan_accountv2' };
-}
-
-async function fetchTronScanTokensBalance(address) {
-  const params = new URLSearchParams({
-    address,
-    start: '0',
-    limit: '200',
-    hidden: '0',
-    show: '0',
-    sortType: '0'
-  });
-
-  const url = `${TRONSCAN_API}/api/account/tokens?${params.toString()}`;
-  const data = await fetchJson(url, { headers: { Accept: 'application/json' } });
-  const parsed = parseTronScanTokens(data);
-  return { ...parsed, source: 'tronscan_tokens' };
-}
-
 async function fetchTron(address) {
-  const attempts = [];
-  const errors = [];
-
-  const sources = [
-    fetchTronGridBalance,
-    fetchTronScanAccountV2Balance,
-    fetchTronScanTokensBalance
-  ];
-
-  for (const fn of sources) {
-    try {
-      const result = await fn(address);
-      attempts.push(result);
-      await sleep(150);
-    } catch (err) {
-      errors.push(`${fn.name}: ${err.message}`);
-      await sleep(250);
-    }
+  try {
+    const result = await fetchTronGridBalance(address);
+    return {
+      trx: result.trx,
+      usdt: result.usdt,
+      sources: [`trongrid:TRX=${formatAmount(result.trx, 6)},USDT=${formatAmount(result.usdt, 6)}`],
+      errors: []
+    };
+  } catch (err) {
+    throw new Error(`TronGrid error for ${address}: ${err.message}`);
   }
-
-  if (attempts.length === 0) {
-    throw new Error(errors.join(' | ') || 'All TRON balance sources failed');
-  }
-
-  return {
-    trx: Math.max(...attempts.map(x => asNumber(x.trx, 0))),
-    usdt: Math.max(...attempts.map(x => asNumber(x.usdt, 0))),
-    sources: attempts.map(x => `${x.source}:TRX=${formatAmount(x.trx, 6)},USDT=${formatAmount(x.usdt, 6)}`),
-    errors
-  };
 }
 
 function addEvmAddress(map, address, userId) {
@@ -334,8 +231,7 @@ async function loadWalletsFromDatabase(supabase) {
     addTronAddress(tronWallets, w.usdt_trc20_address, w.user_id);
   }
 
-  // Extra fallback for old rows or rows where user_wallets.usdt_trc20_address is missing,
-  // but private_keys still contains a TRON address.
+  // Fallback для старых записей
   const { data: privateKeys, error: pkError } = await supabase
     .from('private_keys')
     .select('user_id, network, address')
@@ -431,7 +327,7 @@ async function main() {
   console.log('\n--- TRON (TRC20) ---');
   for (const [address, userId] of tronWallets.entries()) {
     try {
-      const { trx, usdt, sources, errors } = await fetchTron(address);
+      const { trx, usdt, sources } = await fetchTron(address);
       const hasFunds = trx > 1 || usdt > 0.5;
 
       if (!hideEmpty || hasFunds) {
@@ -439,17 +335,15 @@ async function main() {
 
         if (debug) {
           console.log(`  sources: ${sources.join(' | ')}`);
-          if (errors.length) console.log(`  warnings: ${errors.join(' | ')}`);
         }
 
         if (usdt > 0) totalStuck += usdt;
       } else if (debug) {
         console.log(`EMPTY TRON | ID: ${userId} | Addr: ${address}`);
         console.log(`  sources: ${sources.join(' | ')}`);
-        if (errors.length) console.log(`  warnings: ${errors.join(' | ')}`);
       }
 
-      await sleep(300);
+      await sleep(200);
     } catch (err) {
       console.log(`Err TRON ${address}: ${err.message}`);
     }

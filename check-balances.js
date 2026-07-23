@@ -25,8 +25,7 @@ const ETH_RPCS = [
 
 const OPBNB_RPCS = [
   'https://opbnb-mainnet-rpc.bnbchain.org',
-  'https://opbnb-rpc.publicnode.com',
-  'https://opbnb.drpc.org'
+  'https://opbnb.publicnode.com'
 ];
 
 const TRON_RPCS = [
@@ -40,7 +39,6 @@ const USDT_ETH = '0xdAC17F958D2ee523a2206206994597C13D831ec7';
 const USDC_ETH = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48';
 
 const USDT_OPBNB = '0x9e5aac1ba1a2e6aed6b32689dfcf62a509ca96f3';
-const USDC_OPBNB = '0x245cc372c84b361d904ab723b75d38eb57b6f633';
 
 // Official USDT contract on TRON mainnet.
 const USDT_TRON = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
@@ -184,7 +182,9 @@ async function fetchEVM(rpcs, chainId, address, usdtAddr, usdcAddr) {
       const [coinWei, usdtWei, usdcWei] = await Promise.all([
         provider.getBalance(address),
         new ethers.Contract(usdtAddr, ERC20_ABI, provider).balanceOf(address),
-        new ethers.Contract(usdcAddr, ERC20_ABI, provider).balanceOf(address)
+        usdcAddr
+          ? new ethers.Contract(usdcAddr, ERC20_ABI, provider).balanceOf(address)
+          : Promise.resolve(0n)
       ]);
 
       return {
@@ -200,6 +200,65 @@ async function fetchEVM(rpcs, chainId, address, usdtAddr, usdcAddr) {
   }
 
   throw lastErr || new Error(`No EVM RPC available for chain ${chainId}`);
+}
+
+async function selectEvmProvider(rpcs, chainId, requiredContracts = []) {
+  const errors = [];
+
+  for (const rpc of rpcs) {
+    try {
+      const provider = new ethers.JsonRpcProvider(rpc, chainId, {
+        staticNetwork: true
+      });
+
+      const reportedChainId = BigInt(
+        await provider.send('eth_chainId', [])
+      );
+
+      if (reportedChainId !== BigInt(chainId)) {
+        throw new Error(
+          `wrong chain ID ${reportedChainId}; expected ${chainId}`
+        );
+      }
+
+      const contractCodes = await Promise.all(
+        requiredContracts.map((contractAddress) =>
+          provider.getCode(contractAddress)
+        )
+      );
+
+      for (let index = 0; index < contractCodes.length; index += 1) {
+        if (!contractCodes[index] || contractCodes[index] === '0x') {
+          throw new Error(
+            `no contract code at ${requiredContracts[index]}`
+          );
+        }
+      }
+
+      // Confirm that the RPC can execute ERC20 read calls, not only return
+      // contract bytecode. Some public endpoints return an empty "0x" result
+      // for eth_call even though eth_getCode succeeds.
+      await Promise.all(
+        requiredContracts.map((contractAddress) =>
+          new ethers.Contract(
+            contractAddress,
+            ERC20_ABI,
+            provider
+          ).balanceOf(ethers.ZeroAddress)
+        )
+      );
+
+      return {
+        provider,
+        source: rpc
+      };
+    } catch (err) {
+      errors.push(`${rpc}: ${err.shortMessage || err.message}`);
+      await sleep(200);
+    }
+  }
+
+  throw new Error(errors.join(' | ') || `No RPC available for chain ${chainId}`);
 }
 
 /**
@@ -518,37 +577,56 @@ async function main() {
 
   console.log('\n--- opBNB (L2) ---');
 
-  for (const [address, userId] of evmWallets.entries()) {
-    try {
-      const { coinWei, usdtWei, usdcWei } = await fetchEVM(
-        OPBNB_RPCS,
-        204,
-        address,
-        USDT_OPBNB,
-        USDC_OPBNB
-      );
+  let opBnbConnection = null;
 
-      const bnb = Number(ethers.formatEther(coinWei));
-      const usdt = Number(ethers.formatUnits(usdtWei, 18));
-      const usdc = Number(ethers.formatUnits(usdcWei, 18));
-      const hasFunds = bnb > 0.0005 || usdt > 0.5 || usdc > 0.5;
+  try {
+    opBnbConnection = await selectEvmProvider(
+      OPBNB_RPCS,
+      204,
+      [USDT_OPBNB]
+    );
 
-      if (!hideEmpty || hasFunds) {
-        console.log(
-          `ID: ${userId} | Addr: ${address} | ` +
-            `BNB: ${formatAmount(bnb, 4)} | ` +
-            `USDT: ${formatAmount(usdt)} | ` +
-            `USDC: ${formatAmount(usdc)}`
-        );
+    if (debug) {
+      console.log(`opBNB RPC: ${opBnbConnection.source}`);
+    }
+  } catch (err) {
+    console.log(`WARNING: opBNB skipped: ${err.message}`);
+  }
 
-        if (usdt > 0 || usdc > 0) {
-          totalStuck += usdt + usdc;
+  if (opBnbConnection) {
+    const usdtContract = new ethers.Contract(
+      USDT_OPBNB,
+      ERC20_ABI,
+      opBnbConnection.provider
+    );
+
+    for (const [address, userId] of evmWallets.entries()) {
+      try {
+        const [coinWei, usdtWei] = await Promise.all([
+          opBnbConnection.provider.getBalance(address),
+          usdtContract.balanceOf(address)
+        ]);
+
+        const bnb = Number(ethers.formatEther(coinWei));
+        const usdt = Number(ethers.formatUnits(usdtWei, 18));
+        const hasFunds = bnb > 0.0005 || usdt > 0.5;
+
+        if (!hideEmpty || hasFunds) {
+          console.log(
+            `ID: ${userId} | Addr: ${address} | ` +
+              `BNB: ${formatAmount(bnb, 4)} | ` +
+              `USDT: ${formatAmount(usdt)}`
+          );
+
+          if (usdt > 0) {
+            totalStuck += usdt;
+          }
         }
-      }
 
-      await sleep(100);
-    } catch (err) {
-      console.log(`Err opBNB ${address}: ${err.message}`);
+        await sleep(100);
+      } catch (err) {
+        console.log(`Err opBNB ${address}: ${err.message}`);
+      }
     }
   }
 

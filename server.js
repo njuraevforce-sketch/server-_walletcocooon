@@ -1,15 +1,3 @@
-// server.js — Oracle Deposit System (BEP20 + ERC20 + TRC20 USDT/USDC)
-// Built from the user's original full server flow.
-// Changes vs original:
-// - UNIFIED EVM WALLETS: One 0x... address generated and shared across USDT/USDC and BEP20/ERC20.
-// - TRC20 restored for USDT
-// - ERC20 explicitly fixed (contract_addresses, limit 100, strict 6 decimals)
-// - BEP20 explicitly fixed (contract_addresses, limit 100, strict 18 decimals)
-// - Old vulnerable getChainTokenTransfers removed completely
-// - Compatible with Supabase RPC public.create_deposit_with_balance
-// - V2: AUTO-SWEEP ADDED FOR BEP20 ONLY (Non-blocking)
-// - V3: WEBSOCKET FIX FOR NODE.JS 20 SUPABASE COMPATIBILITY
-// - V4: MORALIS FIX - Removed URL contract filters, strictly local filtering
 
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');

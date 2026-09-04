@@ -3,17 +3,17 @@
 // Changes vs original:
 // - UNIFIED EVM WALLETS: One 0x... address generated and shared across USDT/USDC and BEP20/ERC20.
 // - TRC20 restored for USDT
-// - ERC20 explicitly fixed (contract_addresses, limit 100, strict 6 decimals)
-// - BEP20 explicitly fixed (contract_addresses, limit 100, strict 18 decimals)
+// - ERC20/BEP20 discovery migrated from Moralis to Alchemy JSON-RPC
+// - Confirmed ERC20/BEP20 Transfer logs are scanned in safe block windows
 // - Old vulnerable getChainTokenTransfers removed completely
 // - Compatible with Supabase RPC public.credit_chain_deposit
 // - V2: AUTO-SWEEP ADDED FOR BEP20 ONLY (Non-blocking)
 // - V3: WEBSOCKET FIX FOR NODE.JS 20 SUPABASE COMPATIBILITY
-// - V4: MORALIS FIX - Removed URL contract filters, strictly local filtering
+// - V5: ALCHEMY PROVIDER - Moralis removed without changing database crediting
 // - PixelNFT compatibility: atomic database RPCs, credited/reversed statuses,
 //   encrypted key envelopes and existing PixelNFT app/admin API contracts.
-//   Provider queries, confirmation flags, scan timers and BEP20 transfer flow
-//   deliberately remain the same as the supplied server (6)(3).js.
+//   Atomic crediting, confirmation flags, scan timers and BEP20 sweep flow
+//   deliberately remain compatible with the supplied server (8).js.
 
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
@@ -28,7 +28,15 @@ const PORT = Number(process.env.PORT || 8080);
 // ========== CONFIGURATION ==========
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fkjwueogfmdolcjtvvme.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const MORALIS_API_KEY = process.env.MORALIS_API_KEY || '';
+const ALCHEMY_API_KEY = String(process.env.ALCHEMY_API_KEY || '').trim();
+const ALCHEMY_ETH_RPC_URL = String(
+  process.env.ALCHEMY_ETH_RPC_URL ||
+  (ALCHEMY_API_KEY ? `https://eth-mainnet.g.alchemy.com/v2/${encodeURIComponent(ALCHEMY_API_KEY)}` : '')
+).trim();
+const ALCHEMY_BSC_RPC_URL = String(
+  process.env.ALCHEMY_BSC_RPC_URL ||
+  (ALCHEMY_API_KEY ? `https://bnb-mainnet.g.alchemy.com/v2/${encodeURIComponent(ALCHEMY_API_KEY)}` : '')
+).trim();
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
 const API_SECRET_KEY = process.env.API_SECRET_KEY;
 
@@ -44,8 +52,8 @@ if (!ENCRYPTION_KEY || String(ENCRYPTION_KEY).length < 32) {
   console.error('❌ Missing/invalid ENCRYPTION_KEY env (must be 32+ chars)');
   process.exit(1);
 }
-if (!MORALIS_API_KEY) {
-  console.warn('⚠️ MORALIS_API_KEY is empty (BEP20/ERC20 checks may fail).');
+if (!ALCHEMY_ETH_RPC_URL || !ALCHEMY_BSC_RPC_URL) {
+  console.warn('⚠️ Alchemy RPC is not fully configured (BEP20/ERC20 checks may fail).');
 }
 if (!API_SECRET_KEY || String(API_SECRET_KEY).length < 32) {
   console.error('❌ Missing/invalid API_SECRET_KEY env (must be 32+ chars)');
@@ -192,6 +200,31 @@ const BEP20_CHECK_INTERVAL = Number(process.env.BEP20_CHECK_INTERVAL || 120000);
 const ERC20_CHECK_INTERVAL = Number(process.env.ERC20_CHECK_INTERVAL || 150000);
 const TRC20_CHECK_INTERVAL = Number(process.env.TRC20_CHECK_INTERVAL || 60000);
 const API_DELAY_MS = Number(process.env.API_DELAY_MS || 400);
+
+function boundedEnvInteger(name, fallback, minimum, maximum) {
+  const parsed = Number.parseInt(process.env[name] || '', 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(Math.max(parsed, minimum), maximum);
+}
+
+// Alchemy Free currently limits eth_getLogs to ten blocks per request on BNB
+// and Ethereum. Paid plans can raise the two *_LOG_BLOCK_RANGE values.
+const ALCHEMY_REQUEST_TIMEOUT_MS = boundedEnvInteger('ALCHEMY_REQUEST_TIMEOUT_MS', 15000, 1000, 60000);
+const ALCHEMY_MAX_RETRIES = boundedEnvInteger('ALCHEMY_MAX_RETRIES', 4, 0, 8);
+const ALCHEMY_RETRY_BASE_MS = boundedEnvInteger('ALCHEMY_RETRY_BASE_MS', 500, 100, 10000);
+const ALCHEMY_ETH_MAX_PAGES = boundedEnvInteger('ALCHEMY_ETH_MAX_PAGES', 2, 1, 10);
+const ALCHEMY_ADDRESS_BATCH_SIZE = boundedEnvInteger('ALCHEMY_ADDRESS_BATCH_SIZE', 200, 1, 500);
+const ALCHEMY_BSC_LOG_BLOCK_RANGE = boundedEnvInteger('ALCHEMY_BSC_LOG_BLOCK_RANGE', 10, 1, 10000);
+const ALCHEMY_ETH_LOG_BLOCK_RANGE = boundedEnvInteger('ALCHEMY_ETH_LOG_BLOCK_RANGE', 10, 1, 10000);
+const ALCHEMY_BSC_CONFIRMATIONS = boundedEnvInteger('ALCHEMY_BSC_CONFIRMATIONS', 3, 1, 100);
+const ALCHEMY_ETH_CONFIRMATIONS = boundedEnvInteger('ALCHEMY_ETH_CONFIRMATIONS', 12, 1, 200);
+const ALCHEMY_BSC_INITIAL_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_BSC_INITIAL_LOOKBACK_BLOCKS', 1200, 10, 100000);
+const ALCHEMY_ETH_INITIAL_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_ETH_INITIAL_LOOKBACK_BLOCKS', 720, 10, 100000);
+const ALCHEMY_BSC_MANUAL_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_BSC_MANUAL_LOOKBACK_BLOCKS', 600, 10, 100000);
+const ALCHEMY_ETH_MANUAL_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_ETH_MANUAL_LOOKBACK_BLOCKS', 300, 10, 100000);
+const ALCHEMY_BSC_REORG_OVERLAP_BLOCKS = boundedEnvInteger('ALCHEMY_BSC_REORG_OVERLAP_BLOCKS', 20, 1, 500);
+const ALCHEMY_ETH_REORG_OVERLAP_BLOCKS = boundedEnvInteger('ALCHEMY_ETH_REORG_OVERLAP_BLOCKS', 12, 1, 500);
+const DEPOSIT_WALLET_PAGE_SIZE = boundedEnvInteger('DEPOSIT_WALLET_PAGE_SIZE', 500, 50, 1000);
 
 // ========== HELPERS ==========
 function sleep(ms) {
@@ -632,142 +665,381 @@ async function processDepositAtomic(userId, amount, txid, network, address = nul
 }
 
 // ========== CHAIN TRANSFERS ==========
+const ERC20_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const alchemyLastScannedBlock = { bsc: null, eth: null };
+const alchemyBlockTimestampCache = new Map();
+let alchemyRequestId = 0;
 
-async function getBEP20Transactions(address) {
+const ALCHEMY_CHAIN_CONFIG = {
+  bsc: {
+    label: 'BEP20',
+    rpcUrl: ALCHEMY_BSC_RPC_URL,
+    confirmations: ALCHEMY_BSC_CONFIRMATIONS,
+    initialLookback: ALCHEMY_BSC_INITIAL_LOOKBACK_BLOCKS,
+    manualLookback: ALCHEMY_BSC_MANUAL_LOOKBACK_BLOCKS,
+    reorgOverlap: ALCHEMY_BSC_REORG_OVERLAP_BLOCKS,
+    logBlockRange: ALCHEMY_BSC_LOG_BLOCK_RANGE,
+    tokens: {
+      [USDT_BSC_CONTRACT.toLowerCase()]: { symbol: 'USDT', decimals: 18, network: 'usdt_bep20' },
+      [USDC_BSC_CONTRACT.toLowerCase()]: { symbol: 'USDC', decimals: 18, network: 'usdc_bep20' }
+    }
+  },
+  eth: {
+    label: 'ERC20',
+    rpcUrl: ALCHEMY_ETH_RPC_URL,
+    confirmations: ALCHEMY_ETH_CONFIRMATIONS,
+    initialLookback: ALCHEMY_ETH_INITIAL_LOOKBACK_BLOCKS,
+    manualLookback: ALCHEMY_ETH_MANUAL_LOOKBACK_BLOCKS,
+    reorgOverlap: ALCHEMY_ETH_REORG_OVERLAP_BLOCKS,
+    logBlockRange: ALCHEMY_ETH_LOG_BLOCK_RANGE,
+    tokens: {
+      [USDT_ETH_CONTRACT.toLowerCase()]: { symbol: 'USDT', decimals: 6, network: 'usdt_erc20' },
+      [USDC_ETH_CONTRACT.toLowerCase()]: { symbol: 'USDC', decimals: 6, network: 'usdc_erc20' }
+    }
+  }
+};
+
+function normalizeEvmAddress(address) {
+  const normalized = String(address || '').trim().toLowerCase();
+  return /^0x[0-9a-f]{40}$/.test(normalized) ? normalized : '';
+}
+
+function evmAddressTopic(address) {
+  const normalized = normalizeEvmAddress(address);
+  if (!normalized) throw new Error('Invalid EVM address');
+  return '0x' + normalized.slice(2).padStart(64, '0');
+}
+
+function evmAddressFromTopic(topic) {
+  const value = String(topic || '').toLowerCase().replace(/^0x/, '');
+  if (!/^[0-9a-f]{64}$/.test(value)) return '';
+  return normalizeEvmAddress('0x' + value.slice(24));
+}
+
+function rpcHexNumber(value) {
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error('Invalid block number');
+  return '0x' + value.toString(16);
+}
+
+function safeRpcNumber(value, fieldName) {
+  let parsed;
   try {
-    if (!address) return [];
+    parsed = typeof value === 'number' ? value : Number(BigInt(String(value)));
+  } catch (_) {
+    throw new Error(`Invalid Alchemy ${fieldName}`);
+  }
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`Invalid Alchemy ${fieldName}`);
+  return parsed;
+}
 
-    const params = new URLSearchParams({
-      chain: 'bsc',
-      limit: '100'
-    });
-    // ⚠️ ИСПРАВЛЕНИЕ: Фильтры contract_addresses убраны из URL, чтобы не ломать Moralis
+function chunkValues(values, size) {
+  const chunks = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+}
 
-    const url = `https://deep-index.moralis.io/api/v2/${address}/erc20/transfers?${params.toString()}`;
+function retryAfterMilliseconds(response) {
+  const raw = response?.headers?.get?.('retry-after');
+  if (!raw) return 0;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const date = Date.parse(raw);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
+}
 
-    const response = await fetch(url, {
-      headers: {
-        'X-API-Key': MORALIS_API_KEY,
-        Accept: 'application/json'
+async function alchemyRpc(chainKey, method, params) {
+  const chain = ALCHEMY_CHAIN_CONFIG[chainKey];
+  if (!chain?.rpcUrl) throw new Error(`Alchemy ${chainKey.toUpperCase()} RPC is not configured`);
+
+  let lastError;
+  for (let attempt = 0; attempt <= ALCHEMY_MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), ALCHEMY_REQUEST_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(chain.rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: ++alchemyRequestId,
+          method,
+          params
+        }),
+        signal: controller.signal
+      });
+
+      const retryAfterMs = retryAfterMilliseconds(response);
+      const rawBody = await response.text();
+      let payload = null;
+      try {
+        payload = rawBody ? JSON.parse(rawBody) : null;
+      } catch (_) {
+        // A gateway can return HTML/text during a transient outage.
       }
-    });
 
-    if (!response.ok) {
-      throw new Error(`Moralis API error: ${response.status}`);
+      if (!response.ok) {
+        const error = new Error(`Alchemy ${chain.label} ${method} HTTP ${response.status}`);
+        error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+        error.retryAfterMs = retryAfterMs;
+        throw error;
+      }
+
+      if (!payload || payload.error) {
+        const code = payload?.error?.code;
+        const providerMessage = String(payload?.error?.message || 'invalid JSON-RPC response').slice(0, 240);
+        const error = new Error(`Alchemy ${chain.label} ${method} error${code == null ? '' : ` ${code}`}: ${providerMessage}`);
+        error.retryable = code === -32005 || /rate|limit|timeout|temporar|busy|unavailable/i.test(providerMessage);
+        throw error;
+      }
+
+      return payload.result;
+    } catch (error) {
+      const normalizedError = error?.name === 'AbortError'
+        ? Object.assign(new Error(`Alchemy ${chain.label} ${method} timed out`), { retryable: true })
+        : error;
+      lastError = normalizedError;
+
+      const retryable = normalizedError?.retryable !== false;
+      if (!retryable || attempt >= ALCHEMY_MAX_RETRIES) throw normalizedError;
+
+      const exponentialDelay = ALCHEMY_RETRY_BASE_MS * (2 ** attempt);
+      const jitter = Math.floor(Math.random() * Math.max(100, ALCHEMY_RETRY_BASE_MS));
+      await sleep(Math.max(Number(normalizedError?.retryAfterMs || 0), exponentialDelay + jitter));
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw lastError || new Error(`Alchemy ${chainKey} request failed`);
+}
+
+async function alchemyBlockTimestamp(chainKey, blockHex) {
+  const cacheKey = `${chainKey}:${String(blockHex).toLowerCase()}`;
+  if (alchemyBlockTimestampCache.has(cacheKey)) return alchemyBlockTimestampCache.get(cacheKey);
+
+  let timestamp = Date.now();
+  try {
+    const block = await alchemyRpc(chainKey, 'eth_getBlockByNumber', [blockHex, false]);
+    const seconds = safeRpcNumber(block?.timestamp, 'block timestamp');
+    timestamp = seconds * 1000;
+  } catch (error) {
+    console.warn(`⚠️ Alchemy ${chainKey.toUpperCase()} block timestamp fallback:`, error.message);
+  }
+
+  alchemyBlockTimestampCache.set(cacheKey, timestamp);
+  if (alchemyBlockTimestampCache.size > 2000) {
+    const oldestKey = alchemyBlockTimestampCache.keys().next().value;
+    if (oldestKey) alchemyBlockTimestampCache.delete(oldestKey);
+  }
+  return timestamp;
+}
+
+async function resolveAlchemyScanRange(chainKey, mode) {
+  const chain = ALCHEMY_CHAIN_CONFIG[chainKey];
+  const latestBlock = safeRpcNumber(await alchemyRpc(chainKey, 'eth_blockNumber', []), 'latest block');
+  const toBlock = latestBlock - chain.confirmations;
+  if (toBlock < 0) return null;
+
+  let fromBlock;
+  if (mode === 'background' && Number.isSafeInteger(alchemyLastScannedBlock[chainKey])) {
+    fromBlock = Math.max(0, alchemyLastScannedBlock[chainKey] - chain.reorgOverlap + 1);
+  } else {
+    const lookback = mode === 'background' ? chain.initialLookback : chain.manualLookback;
+    fromBlock = Math.max(0, toBlock - lookback + 1);
+  }
+
+  if (fromBlock > toBlock) fromBlock = toBlock;
+  return { fromBlock, toBlock };
+}
+
+async function scanAlchemyLogTransfers(chainKey, addresses, mode = 'manual') {
+  const chain = ALCHEMY_CHAIN_CONFIG[chainKey];
+  if (!chain) throw new Error(`Unsupported Alchemy chain: ${chainKey}`);
+
+  const normalizedAddresses = Array.from(new Set((addresses || []).map(normalizeEvmAddress).filter(Boolean)));
+  if (!normalizedAddresses.length) return { transactions: [], fromBlock: null, toBlock: null };
+
+  const scanRange = await resolveAlchemyScanRange(chainKey, mode);
+  if (!scanRange) return { transactions: [], fromBlock: null, toBlock: null };
+
+  const contractAddresses = Object.keys(chain.tokens);
+  const addressChunks = chunkValues(normalizedAddresses, ALCHEMY_ADDRESS_BATCH_SIZE);
+  const rawLogs = [];
+
+  for (let fromBlock = scanRange.fromBlock; fromBlock <= scanRange.toBlock; fromBlock += chain.logBlockRange) {
+    const toBlock = Math.min(scanRange.toBlock, fromBlock + chain.logBlockRange - 1);
+
+    for (const addressChunk of addressChunks) {
+      const destinationTopics = addressChunk.map(evmAddressTopic);
+      const logs = await alchemyRpc(chainKey, 'eth_getLogs', [{
+        fromBlock: rpcHexNumber(fromBlock),
+        toBlock: rpcHexNumber(toBlock),
+        address: contractAddresses,
+        topics: [
+          ERC20_TRANSFER_TOPIC,
+          null,
+          destinationTopics.length === 1 ? destinationTopics[0] : destinationTopics
+        ]
+      }]);
+
+      if (!Array.isArray(logs)) throw new Error(`Alchemy ${chain.label} eth_getLogs returned invalid data`);
+      rawLogs.push(...logs);
+    }
+  }
+
+  const destinationSet = new Set(normalizedAddresses);
+  const uniqueLogs = new Map();
+  for (const log of rawLogs) {
+    if (log?.removed === true) continue;
+    const uniqueKey = `${String(log?.transactionHash || '').toLowerCase()}:${String(log?.logIndex || '')}:${String(log?.address || '').toLowerCase()}`;
+    if (!uniqueLogs.has(uniqueKey)) uniqueLogs.set(uniqueKey, log);
+  }
+
+  const transactions = [];
+  for (const log of uniqueLogs.values()) {
+    try {
+      const tokenContract = normalizeEvmAddress(log?.address);
+      const token = chain.tokens[tokenContract];
+      if (!token) continue;
+
+      const toAddress = evmAddressFromTopic(log?.topics?.[2]);
+      if (!destinationSet.has(toAddress)) continue;
+
+      const fromAddress = evmAddressFromTopic(log?.topics?.[1]);
+      const rawAmount = BigInt(String(log?.data || '0x0'));
+      const amount = Number(ethers.formatUnits(rawAmount, token.decimals));
+      if (!Number.isFinite(amount) || amount < MIN_DEPOSIT) continue;
+
+      const blockNumber = safeRpcNumber(log?.blockNumber, 'log block number');
+      const blockHex = rpcHexNumber(blockNumber);
+      const timestamp = await alchemyBlockTimestamp(chainKey, blockHex);
+      const transactionId = String(log?.transactionHash || '').toLowerCase();
+      if (!/^0x[0-9a-f]{64}$/.test(transactionId)) continue;
+
+      transactions.push({
+        transaction_id: transactionId,
+        to: toAddress,
+        from: fromAddress,
+        amount,
+        token: token.symbol,
+        confirmed: true,
+        network: token.network,
+        timestamp,
+        blockNumber
+      });
+    } catch (error) {
+      throw new Error(`Alchemy ${chain.label} returned an invalid Transfer log: ${error.message}`);
+    }
+  }
+
+  transactions.sort((a, b) => b.blockNumber - a.blockNumber || b.timestamp - a.timestamp);
+  return { transactions, fromBlock: scanRange.fromBlock, toBlock: scanRange.toBlock };
+}
+
+async function getAlchemyLogTransfers(chainKey, addresses, mode = 'manual') {
+  const scan = await scanAlchemyLogTransfers(chainKey, addresses, mode);
+  return scan.transactions;
+}
+
+async function getAlchemyERC20AssetTransfers(address) {
+  const normalizedAddress = normalizeEvmAddress(address);
+  if (!normalizedAddress) return [];
+
+  const chain = ALCHEMY_CHAIN_CONFIG.eth;
+  const latestBlock = safeRpcNumber(await alchemyRpc('eth', 'eth_blockNumber', []), 'latest block');
+  const confirmedBlock = Math.max(0, latestBlock - chain.confirmations);
+  const transactions = [];
+  let pageKey = null;
+
+  for (let page = 0; page < ALCHEMY_ETH_MAX_PAGES; page++) {
+    const request = {
+      fromBlock: '0x0',
+      toBlock: rpcHexNumber(confirmedBlock),
+      toAddress: normalizedAddress,
+      contractAddresses: Object.keys(chain.tokens),
+      category: ['erc20'],
+      excludeZeroValue: true,
+      withMetadata: true,
+      order: 'desc',
+      maxCount: '0x3e8'
+    };
+    if (pageKey) request.pageKey = pageKey;
+
+    const result = await alchemyRpc('eth', 'alchemy_getAssetTransfers', [request]);
+    if (!result || !Array.isArray(result.transfers)) {
+      throw new Error('Alchemy ERC20 Transfers API returned invalid data');
     }
 
-    const data = await response.json();
-    const transactions = [];
-
-    const validContracts = [USDT_BSC_CONTRACT.toLowerCase(), USDC_BSC_CONTRACT.toLowerCase()];
-
-    for (const tx of data.result || []) {
+    for (const transfer of result.transfers) {
       try {
-        const toAddress = String(tx.to_address || '').toLowerCase();
-        if (toAddress !== String(address).toLowerCase()) continue;
+        const toAddress = normalizeEvmAddress(transfer?.to);
+        if (toAddress !== normalizedAddress) continue;
 
-        const tokenContract = String(tx.address || '').toLowerCase();
-        
-        // ⚠️ ИСПРАВЛЕНИЕ: Локальная фильтрация USDT/USDC контрактов
-        if (!validContracts.includes(tokenContract)) continue;
+        const tokenContract = normalizeEvmAddress(transfer?.rawContract?.address);
+        const token = chain.tokens[tokenContract];
+        if (!token) continue;
 
-        const isUSDT = tokenContract === USDT_BSC_CONTRACT.toLowerCase();
-        
-        const decimals = Number(tx.decimals || 18);
-        const amount = Number(tx.value) / Math.pow(10, decimals);
-        
+        let amount = Number(transfer?.value);
+        const rawValue = transfer?.rawContract?.value;
+        if (rawValue != null && String(rawValue) !== '') {
+          amount = Number(ethers.formatUnits(BigInt(String(rawValue)), token.decimals));
+        }
         if (!Number.isFinite(amount) || amount < MIN_DEPOSIT) continue;
 
+        const transactionId = String(transfer?.hash || '').toLowerCase();
+        if (!/^0x[0-9a-f]{64}$/.test(transactionId)) continue;
+
         transactions.push({
-          transaction_id: tx.transaction_hash,
+          transaction_id: transactionId,
           to: toAddress,
-          from: String(tx.from_address || '').toLowerCase(),
+          from: normalizeEvmAddress(transfer?.from),
           amount,
-          token: isUSDT ? 'USDT' : 'USDC',
+          token: token.symbol,
           confirmed: true,
-          network: isUSDT ? 'usdt_bep20' : 'usdc_bep20',
-          timestamp: new Date(tx.block_timestamp).getTime(),
-          blockNumber: Number(tx.block_number || 0)
+          network: token.network,
+          timestamp: Date.parse(transfer?.metadata?.blockTimestamp || '') || Date.now(),
+          blockNumber: safeRpcNumber(transfer?.blockNum, 'transfer block number')
         });
-      } catch (innerErr) {
+      } catch (_) {
         continue;
       }
     }
 
-    transactions.sort((a, b) => b.timestamp - a.timestamp);
-    return transactions;
+    pageKey = String(result.pageKey || '').trim();
+    if (!pageKey) break;
+  }
+
+  const uniqueTransactions = new Map();
+  for (const transaction of transactions) {
+    const key = `${transaction.network}:${transaction.transaction_id}`;
+    if (!uniqueTransactions.has(key)) uniqueTransactions.set(key, transaction);
+  }
+  return Array.from(uniqueTransactions.values()).sort((a, b) => b.blockNumber - a.blockNumber || b.timestamp - a.timestamp);
+}
+
+async function getBEP20Transactions(address) {
+  try {
+    return await getAlchemyLogTransfers('bsc', [address], 'manual');
   } catch (error) {
-    console.error(`❌ BEP20 transfer fetch error:`, error.message);
-    return [];
+    console.error('❌ BEP20 Alchemy transfer fetch error:', error.message);
+    throw error;
   }
 }
 
 async function getERC20Transactions(address) {
   try {
-    if (!address) return [];
-
-    const params = new URLSearchParams({
-      chain: 'eth',
-      limit: '100'
-    });
-    // ⚠️ ИСПРАВЛЕНИЕ: Фильтры contract_addresses убраны из URL, чтобы не ломать Moralis
-
-    const url = `https://deep-index.moralis.io/api/v2/${address}/erc20/transfers?${params.toString()}`;
-
-    const response = await fetch(url, {
-      headers: {
-        'X-API-Key': MORALIS_API_KEY,
-        Accept: 'application/json'
-      }
-    });
-
-    if (!response.ok) {
-      throw new Error(`Moralis API error: ${response.status}`);
-    }
-
-    const data = await response.json();
-    const transactions = [];
-
-    const validContracts = [USDT_ETH_CONTRACT.toLowerCase(), USDC_ETH_CONTRACT.toLowerCase()];
-
-    for (const tx of data.result || []) {
-      try {
-        const toAddress = String(tx.to_address || '').toLowerCase();
-        if (toAddress !== String(address).toLowerCase()) continue;
-
-        const tokenContract = String(tx.address || '').toLowerCase();
-        
-        // ⚠️ ИСПРАВЛЕНИЕ: Локальная фильтрация USDT/USDC контрактов
-        if (!validContracts.includes(tokenContract)) continue;
-
-        const isUSDT = tokenContract === USDT_ETH_CONTRACT.toLowerCase();
-        
-        const decimals = Number(tx.decimals || 6);
-        const amount = Number(tx.value) / Math.pow(10, decimals);
-        
-        if (!Number.isFinite(amount) || amount < MIN_DEPOSIT) continue;
-
-        transactions.push({
-          transaction_id: tx.transaction_hash,
-          to: toAddress,
-          from: String(tx.from_address || '').toLowerCase(),
-          amount,
-          token: isUSDT ? 'USDT' : 'USDC',
-          confirmed: true,
-          network: isUSDT ? 'usdt_erc20' : 'usdc_erc20',
-          timestamp: new Date(tx.block_timestamp).getTime(),
-          blockNumber: Number(tx.block_number || 0)
-        });
-      } catch (innerErr) {
-        continue;
-      }
-    }
-
-    transactions.sort((a, b) => b.timestamp - a.timestamp);
-    return transactions;
+    return await getAlchemyERC20AssetTransfers(address);
   } catch (error) {
-    console.error(`❌ ERC20 transfer fetch error:`, error.message);
-    return [];
+    console.warn('⚠️ ERC20 Transfers API failed; using Alchemy log fallback:', error.message);
+    try {
+      return await getAlchemyLogTransfers('eth', [address], 'manual');
+    } catch (fallbackError) {
+      console.error('❌ ERC20 Alchemy transfer fetch error:', fallbackError.message);
+      throw fallbackError;
+    }
   }
 }
 
@@ -841,186 +1113,162 @@ async function getTRC20Transactions(address) {
 }
 
 // ========== CHAIN CHECKERS ==========
-async function handleCheckBEP20Deposits() {
-  try {
-    console.log('🔄 Checking BEP20 deposits...');
+async function fetchAllDepositWallets(selectColumns, filter) {
+  const wallets = [];
 
-    const { data: wallets, error } = await supabase
+  for (let offset = 0; ; offset += DEPOSIT_WALLET_PAGE_SIZE) {
+    let query = supabase
       .from('deposit_wallets')
-      .select('*')
-      .or('usdt_bep20_address.not.is.null,usdc_bep20_address.not.is.null')
-      .limit(200);
+      .select(selectColumns)
+      .order('user_id', { ascending: true })
+      .range(offset, offset + DEPOSIT_WALLET_PAGE_SIZE - 1);
 
+    if (filter?.or) query = query.or(filter.or);
+    if (filter?.notNull) query = query.not(filter.notNull, 'is', null);
+
+    const { data, error } = await query;
     if (error) throw error;
+    wallets.push(...(data || []));
+    if (!data || data.length < DEPOSIT_WALLET_PAGE_SIZE) break;
+  }
 
-    let processedCount = 0;
+  return wallets;
+}
+
+function buildEvmWalletAddressIndex(wallets, addressFields, label) {
+  const index = new Map();
+
+  for (const wallet of wallets || []) {
+    for (const field of addressFields) {
+      const address = normalizeEvmAddress(wallet?.[field]);
+      if (!address) continue;
+
+      const existing = index.get(address);
+      if (existing && existing.user_id !== wallet.user_id) {
+        throw new Error(`${label} address belongs to multiple users: ${address}`);
+      }
+      index.set(address, wallet);
+    }
+  }
+
+  return index;
+}
+
+async function handleCheckEvmDeposits({ chainKey, label, addressFields, filter, sweepAfterCredit }) {
+  try {
+    console.log(`🔄 Checking ${label} deposits via Alchemy...`);
+
+    const selectColumns = ['user_id', ...addressFields].join(',');
+    const wallets = await fetchAllDepositWallets(selectColumns, { or: filter });
+    const walletByAddress = buildEvmWalletAddressIndex(wallets, addressFields, label);
+    const scan = await scanAlchemyLogTransfers(chainKey, Array.from(walletByAddress.keys()), 'background');
+    const transactions = scan.transactions;
+
     let depositsFound = 0;
     let duplicatesSkipped = 0;
     let errors = 0;
 
-    for (const wallet of wallets || []) {
+    for (const tx of transactions) {
+      const wallet = walletByAddress.get(normalizeEvmAddress(tx.to));
+      if (!wallet) continue;
+
       try {
-        const addresses = Array.from(
-          new Set([wallet.usdt_bep20_address, wallet.usdc_bep20_address].filter(Boolean))
-        );
+        const { data: existing, error: existingError } = await supabase
+          .from('deposits')
+          .select('id, status')
+          .eq('tx_hash', tx.transaction_id)
+          .eq('network', tx.network)
+          .maybeSingle();
 
-        for (const address of addresses) {
-          await sleep(API_DELAY_MS);
-
-          const transactions = await getBEP20Transactions(address);
-          for (const tx of transactions) {
-            try {
-              const { data: existing } = await supabase
-                .from('deposits')
-                .select('id, status')
-                .eq('tx_hash', tx.transaction_id)
-                .eq('network', tx.network)
-                .maybeSingle();
-
-              if (existing && ['credited', 'reversed'].includes(existing.status)) {
-                duplicatesSkipped++;
-                console.log(`⏭️ Skipping duplicate ${tx.network} transaction: ${tx.transaction_id}`);
-                continue;
-              }
-
-              const result = await processDeposit(wallet.user_id, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0);
-              if (!result.success) throw new Error(result.error || 'Deposit processing failed');
-              if (result.already_processed) { duplicatesSkipped++; continue; }
-              if (result.success) {
-                depositsFound++;
-                console.log(`💰 NEW ${tx.network} DEPOSIT: $${tx.amount} ${tx.token} for user ${wallet.user_id}`);
-                
-                // ВЫЗОВ АВТОСБОРА (Без await, чтобы не блокировать выполнение других юзеров)
-                sweepDepositBEP20(wallet.user_id, tx.token, tx.network).catch(err => 
-                  console.error(`Sweep background error:`, err.message)
-                );
-              }
-            } catch (err) {
-              if (String(err.message || '').includes('already_processed') || String(err.message || '').includes('duplicate')) {
-                duplicatesSkipped++;
-                console.log(`⏭️ Duplicate ${tx.network} deposit skipped: ${tx.transaction_id}`);
-              } else {
-                console.error(`❌ Error processing ${tx.network} deposit ${tx.transaction_id}:`, err.message);
-                errors++;
-              }
-            }
-          }
+        if (existingError) throw existingError;
+        if (existing && ['credited', 'reversed'].includes(existing.status)) {
+          duplicatesSkipped++;
+          console.log(`⏭️ Skipping duplicate ${tx.network} transaction: ${tx.transaction_id}`);
+          continue;
         }
 
-        processedCount++;
-      } catch (err) {
-        console.error(`❌ Error processing BEP20 wallet ${wallet.user_id}:`, err.message);
-        errors++;
+        const result = await processDeposit(
+          wallet.user_id,
+          tx.amount,
+          tx.transaction_id,
+          tx.network,
+          tx.to,
+          tx.confirmed ? 1 : 0
+        );
+        if (!result.success) throw new Error(result.error || 'Deposit processing failed');
+        if (result.already_processed) {
+          duplicatesSkipped++;
+          continue;
+        }
+
+        depositsFound++;
+        console.log(`💰 NEW ${tx.network} DEPOSIT: $${tx.amount} ${tx.token} for user ${wallet.user_id}`);
+
+        if (sweepAfterCredit) {
+          // Non-blocking: the next user's deposit check does not wait for sweep gas/receipt.
+          sweepDepositBEP20(wallet.user_id, tx.token, tx.network).catch((error) =>
+            console.error('Sweep background error:', error.message)
+          );
+        }
+      } catch (error) {
+        if (/already_processed|duplicate/i.test(String(error.message || ''))) {
+          duplicatesSkipped++;
+          console.log(`⏭️ Duplicate ${tx.network} deposit skipped: ${tx.transaction_id}`);
+        } else {
+          errors++;
+          console.error(`❌ Error processing ${tx.network} deposit ${tx.transaction_id}:`, error.message);
+        }
       }
     }
 
-    console.log(`✅ BEP20: Processed ${processedCount} wallets, found ${depositsFound} new deposits, skipped ${duplicatesSkipped} duplicates, errors: ${errors}`);
+    // Advance only after every discovered transfer was either atomically credited
+    // or proved to be an existing transaction. A database error must be retried.
+    if (errors === 0 && Number.isSafeInteger(scan.toBlock)) {
+      alchemyLastScannedBlock[chainKey] = scan.toBlock;
+    }
+
+    console.log(`✅ ${label}: Processed ${wallets.length} wallets, found ${depositsFound} new deposits, skipped ${duplicatesSkipped} duplicates, errors: ${errors}`);
     return {
-      success: true,
-      processed: processedCount,
+      success: errors === 0,
+      processed: wallets.length,
       deposits: depositsFound,
       duplicates: duplicatesSkipped,
       errors
     };
   } catch (error) {
-    console.error('❌ BEP20 check error:', error.message);
+    console.error(`❌ ${label} check error:`, error.message);
     return { success: false, error: error.message };
   }
 }
 
+async function handleCheckBEP20Deposits() {
+  return handleCheckEvmDeposits({
+    chainKey: 'bsc',
+    label: 'BEP20',
+    addressFields: ['usdt_bep20_address', 'usdc_bep20_address'],
+    filter: 'usdt_bep20_address.not.is.null,usdc_bep20_address.not.is.null',
+    sweepAfterCredit: true
+  });
+}
+
 async function handleCheckERC20Deposits() {
-  try {
-    console.log('🔄 Checking ERC20 deposits...');
-
-    const { data: wallets, error } = await supabase
-      .from('deposit_wallets')
-      .select('*')
-      .or('usdt_erc20_address.not.is.null,usdc_erc20_address.not.is.null')
-      .limit(200);
-
-    if (error) throw error;
-
-    let processedCount = 0;
-    let depositsFound = 0;
-    let duplicatesSkipped = 0;
-    let errors = 0;
-
-    for (const wallet of wallets || []) {
-      try {
-        const addresses = Array.from(
-          new Set([wallet.usdt_erc20_address, wallet.usdc_erc20_address].filter(Boolean))
-        );
-
-        for (const address of addresses) {
-          await sleep(API_DELAY_MS);
-
-          const transactions = await getERC20Transactions(address);
-          for (const tx of transactions) {
-            try {
-              const { data: existing } = await supabase
-                .from('deposits')
-                .select('id, status')
-                .eq('tx_hash', tx.transaction_id)
-                .eq('network', tx.network)
-                .maybeSingle();
-
-              if (existing && ['credited', 'reversed'].includes(existing.status)) {
-                duplicatesSkipped++;
-                console.log(`⏭️ Skipping duplicate ${tx.network} transaction: ${tx.transaction_id}`);
-                continue;
-              }
-
-              const result = await processDeposit(wallet.user_id, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0);
-              if (!result.success) throw new Error(result.error || 'Deposit processing failed');
-              if (result.already_processed) { duplicatesSkipped++; continue; }
-              if (result.success) {
-                depositsFound++;
-                console.log(`💰 NEW ${tx.network} DEPOSIT: $${tx.amount} ${tx.token} for user ${wallet.user_id}`);
-              }
-            } catch (err) {
-              if (String(err.message || '').includes('already_processed') || String(err.message || '').includes('duplicate')) {
-                duplicatesSkipped++;
-                console.log(`⏭️ Duplicate ${tx.network} deposit skipped: ${tx.transaction_id}`);
-              } else {
-                console.error(`❌ Error processing ${tx.network} deposit ${tx.transaction_id}:`, err.message);
-                errors++;
-              }
-            }
-          }
-        }
-
-        processedCount++;
-      } catch (err) {
-        console.error(`❌ Error processing ERC20 wallet ${wallet.user_id}:`, err.message);
-        errors++;
-      }
-    }
-
-    console.log(`✅ ERC20: Processed ${processedCount} wallets, found ${depositsFound} new deposits, skipped ${duplicatesSkipped} duplicates, errors: ${errors}`);
-    return {
-      success: true,
-      processed: processedCount,
-      deposits: depositsFound,
-      duplicates: duplicatesSkipped,
-      errors
-    };
-  } catch (error) {
-    console.error('❌ ERC20 check error:', error.message);
-    return { success: false, error: error.message };
-  }
+  return handleCheckEvmDeposits({
+    chainKey: 'eth',
+    label: 'ERC20',
+    addressFields: ['usdt_erc20_address', 'usdc_erc20_address'],
+    filter: 'usdt_erc20_address.not.is.null,usdc_erc20_address.not.is.null',
+    sweepAfterCredit: false
+  });
 }
 
 async function handleCheckTRC20Deposits() {
   try {
     console.log('🔄 Checking TRC20 deposits...');
 
-    const { data: wallets, error } = await supabase
-      .from('deposit_wallets')
-      .select('*')
-      .not('usdt_trc20_address', 'is', null)
-      .limit(200);
-
-    if (error) throw error;
+    const wallets = await fetchAllDepositWallets(
+      'user_id,usdt_trc20_address',
+      { notNull: 'usdt_trc20_address' }
+    );
 
     let processedCount = 0;
     let depositsFound = 0;
@@ -1645,7 +1893,8 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ SECURE Endpoint: GET  http://0.0.0.0:${PORT}/api/check-deposits (requires API key)`);
   console.log(`✅ RATE LIMIT: 60 requests per 15 minutes per IP`);
   console.log(`✅ SUPABASE DEPOSIT STORAGE: CONFIGURED (connection verified on first request)`);
-  console.log(`✅ MORALIS: ${MORALIS_API_KEY ? 'API KEY SET' : 'API KEY MISSING'}`);
+  console.log(`✅ ALCHEMY ETH RPC: ${ALCHEMY_ETH_RPC_URL ? 'CONFIGURED' : 'MISSING'}`);
+  console.log(`✅ ALCHEMY BSC RPC: ${ALCHEMY_BSC_RPC_URL ? 'CONFIGURED' : 'MISSING'}`);
   console.log(`✅ BEP20 (USDT & USDC): Checking every ${BEP20_CHECK_INTERVAL} ms`);
   console.log(`✅ ERC20 (USDT & USDC): Checking every ${ERC20_CHECK_INTERVAL} ms`);
   console.log(`✅ TRC20 (USDT): Checking every ${TRC20_CHECK_INTERVAL} ms`);

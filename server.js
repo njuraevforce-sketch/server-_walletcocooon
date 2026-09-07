@@ -607,28 +607,95 @@ async function generateWalletSingleFlight(userId, network) {
 }
 
 // ========== DEPOSIT PROCESSING ==========
-async function processDeposit(userId, amount, txid, network, address = null, confirmations = 1) {
+function normalizeEventIndex(value) {
+  let parsed;
+  try {
+    const raw = String(value ?? '').trim();
+    if (!raw) throw new Error('empty');
+    parsed = typeof value === 'number' ? value : Number(BigInt(raw));
+  } catch (_) {
+    throw new Error('INVALID_EVENT_INDEX');
+  }
+  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > 2147483647) {
+    throw new Error('INVALID_EVENT_INDEX');
+  }
+  return parsed;
+}
+
+function depositIdentityMatches(deposit, userId, amount, network, address) {
+  if (!deposit || deposit.user_id !== userId || Number(deposit.amount) !== Number(amount)) return false;
+
+  const savedAddress = String(deposit.address || '').trim();
+  const currentAddress = String(address || '').trim();
+  if (!savedAddress || !currentAddress) return true;
+  return String(network).endsWith('_trc20')
+    ? savedAddress === currentAddress
+    : savedAddress.toLowerCase() === currentAddress.toLowerCase();
+}
+
+async function findLegacyEventZeroDeposit(userId, amount, txid, network, address, eventIndex) {
+  // Before logIndex was forwarded, every chain event was stored as index 0.
+  // Keep those already-credited rows idempotent when their real index is non-zero.
+  if (eventIndex === 0) return null;
+
+  const { data, error } = await supabase
+    .from('deposits')
+    .select('id,user_id,asset,network,address,amount,status,event_index')
+    .eq('network', network)
+    .eq('tx_hash', txid)
+    .eq('event_index', 0)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!data || !['credited', 'reversed', 'completed'].includes(data.status)) return null;
+  return depositIdentityMatches(data, userId, amount, network, address) ? data : null;
+}
+
+async function processDeposit(userId, amount, txid, network, address = null, confirmations = 1, eventIndex = 0) {
   try {
     const normalizedNetwork = String(network || '').trim().toLowerCase();
     const hash = String(txid || '').trim().toLowerCase().replace(/^0x/, '');
     const normalizedTxid = normalizedNetwork.endsWith('_trc20') ? hash : '0x' + hash;
+    const normalizedEventIndex = normalizeEventIndex(eventIndex);
     if (!Number.isFinite(Number(amount)) || Number(amount) < MIN_DEPOSIT) {
       return { success: false, error: 'Minimum deposit is $' + MIN_DEPOSIT };
     }
+
+    const legacyDeposit = await findLegacyEventZeroDeposit(
+      userId,
+      Number(amount),
+      normalizedTxid,
+      normalizedNetwork,
+      address,
+      normalizedEventIndex
+    );
+    if (legacyDeposit) {
+      return {
+        success: true,
+        already_processed: true,
+        deposit_id: legacyDeposit.id,
+        status: legacyDeposit.status,
+        amount: Number(legacyDeposit.amount),
+        asset: legacyDeposit.asset,
+        network: legacyDeposit.network
+      };
+    }
+
     // The RPC owns the duplicate check AND all financial writes. A separate
-    // JS read cannot protect against concurrent manual/background checks.
+    // JS read cannot protect against concurrent manual/background checks. The
+    // read above exists only for rows created before real logIndex forwarding.
     return await processDepositAtomic(userId, Number(amount), normalizedTxid,
-      normalizedNetwork, address, confirmations);
+      normalizedNetwork, address, confirmations, normalizedEventIndex);
   } catch (error) {
     console.error('❌ Error in processDeposit:', error.message);
     await safeSystemLog('deposit_processing_error', 'Deposit processing error: ' + error.message, {
-      user_id: userId, amount, tx_hash: txid, network, address, confirmations
+      user_id: userId, amount, tx_hash: txid, network, address, confirmations, event_index: eventIndex
     });
     return { success: false, error: error.message };
   }
 }
 
-async function processDepositAtomic(userId, amount, txid, network, address = null, confirmations = 1) {
+async function processDepositAtomic(userId, amount, txid, network, address = null, confirmations = 1, eventIndex = 0) {
   const { data: result, error } = await supabase.rpc('credit_chain_deposit', {
     p_user_id: userId,
     p_amount: amount,
@@ -637,7 +704,8 @@ async function processDepositAtomic(userId, amount, txid, network, address = nul
     p_address: address || null,
     // Original server protocol: confirmed provider transfer -> 1, else -> 0.
     // This is not a fabricated count of blockchain confirmations.
-    p_confirmations: Math.max(Number(confirmations || 0), 0)
+    p_confirmations: Math.max(Number(confirmations || 0), 0),
+    p_event_index: eventIndex
   });
   if (error) throw error;
   if (!result || result.success !== true) throw new Error(result?.error || 'Deposit processing failed');
@@ -646,7 +714,7 @@ async function processDepositAtomic(userId, amount, txid, network, address = nul
     await safeSystemLog('deposit_atomic_success', 'Atomic deposit successful for user ' + userId, {
       deposit_id: result.deposit_id, user_id: userId, amount: result.amount,
       old_balance: result.old_balance, new_balance: result.new_balance,
-      asset: result.asset, tx_hash: txid, network
+      asset: result.asset, tx_hash: txid, network, event_index: eventIndex
     });
   }
   return {
@@ -918,9 +986,11 @@ async function scanAlchemyLogTransfers(chainKey, addresses, mode = 'manual') {
       const timestamp = await alchemyBlockTimestamp(chainKey, blockHex);
       const transactionId = String(log?.transactionHash || '').toLowerCase();
       if (!/^0x[0-9a-f]{64}$/.test(transactionId)) continue;
+      const eventIndex = normalizeEventIndex(log?.logIndex);
 
       transactions.push({
         transaction_id: transactionId,
+        event_index: eventIndex,
         to: toAddress,
         from: fromAddress,
         amount,
@@ -935,13 +1005,31 @@ async function scanAlchemyLogTransfers(chainKey, addresses, mode = 'manual') {
     }
   }
 
-  transactions.sort((a, b) => b.blockNumber - a.blockNumber || b.timestamp - a.timestamp);
+  transactions.sort((a, b) => b.blockNumber - a.blockNumber || b.event_index - a.event_index || b.timestamp - a.timestamp);
   return { transactions, fromBlock: scanRange.fromBlock, toBlock: scanRange.toBlock };
 }
 
 async function getAlchemyLogTransfers(chainKey, addresses, mode = 'manual') {
   const scan = await scanAlchemyLogTransfers(chainKey, addresses, mode);
   return scan.transactions;
+}
+
+function alchemyAssetTransferEventIndex(transfer) {
+  const candidates = [transfer?.logIndex, transfer?.metadata?.logIndex];
+  for (const candidate of candidates) {
+    if (candidate !== null && candidate !== undefined && String(candidate).trim() !== '') {
+      return normalizeEventIndex(candidate);
+    }
+  }
+
+  // ERC20 transfer uniqueId is normally <tx hash>:log:<log index>.
+  const uniqueId = String(transfer?.uniqueId || '').trim();
+  const match = uniqueId.match(/(?:^|:)(0x[0-9a-f]+|[0-9]+)$/i);
+  if (match) return normalizeEventIndex(match[1]);
+
+  const error = new Error('Alchemy ERC20 transfer logIndex is unavailable');
+  error.code = 'EVENT_INDEX_UNAVAILABLE';
+  throw error;
 }
 
 async function getAlchemyERC20AssetTransfers(address) {
@@ -991,9 +1079,11 @@ async function getAlchemyERC20AssetTransfers(address) {
 
         const transactionId = String(transfer?.hash || '').toLowerCase();
         if (!/^0x[0-9a-f]{64}$/.test(transactionId)) continue;
+        const eventIndex = alchemyAssetTransferEventIndex(transfer);
 
         transactions.push({
           transaction_id: transactionId,
+          event_index: eventIndex,
           to: toAddress,
           from: normalizeEvmAddress(transfer?.from),
           amount,
@@ -1003,7 +1093,8 @@ async function getAlchemyERC20AssetTransfers(address) {
           timestamp: Date.parse(transfer?.metadata?.blockTimestamp || '') || Date.now(),
           blockNumber: safeRpcNumber(transfer?.blockNum, 'transfer block number')
         });
-      } catch (_) {
+      } catch (error) {
+        if (error?.code === 'EVENT_INDEX_UNAVAILABLE') throw error;
         continue;
       }
     }
@@ -1014,10 +1105,10 @@ async function getAlchemyERC20AssetTransfers(address) {
 
   const uniqueTransactions = new Map();
   for (const transaction of transactions) {
-    const key = `${transaction.network}:${transaction.transaction_id}`;
+    const key = `${transaction.network}:${transaction.transaction_id}:${transaction.event_index}`;
     if (!uniqueTransactions.has(key)) uniqueTransactions.set(key, transaction);
   }
-  return Array.from(uniqueTransactions.values()).sort((a, b) => b.blockNumber - a.blockNumber || b.timestamp - a.timestamp);
+  return Array.from(uniqueTransactions.values()).sort((a, b) => b.blockNumber - a.blockNumber || b.event_index - a.event_index || b.timestamp - a.timestamp);
 }
 
 async function getBEP20Transactions(address) {
@@ -1178,6 +1269,7 @@ async function handleCheckEvmDeposits({ chainKey, label, addressFields, filter, 
           .select('id, status')
           .eq('tx_hash', tx.transaction_id)
           .eq('network', tx.network)
+          .eq('event_index', tx.event_index)
           .maybeSingle();
 
         if (existingError) throw existingError;
@@ -1193,7 +1285,8 @@ async function handleCheckEvmDeposits({ chainKey, label, addressFields, filter, 
           tx.transaction_id,
           tx.network,
           tx.to,
-          tx.confirmed ? 1 : 0
+          tx.confirmed ? 1 : 0,
+          tx.event_index
         );
         if (!result.success) throw new Error(result.error || 'Deposit processing failed');
         if (result.already_processed) {
@@ -1404,7 +1497,7 @@ async function checkUserBEP20Deposits(userId) {
 
       for (const tx of transactions) {
         try {
-          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0);
+          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0, tx.event_index);
           if (!result?.success) throw new Error(result?.error || 'Deposit processing failed');
           if (result?.success) {
             if (result.already_processed) {
@@ -1454,7 +1547,7 @@ async function checkUserERC20Deposits(userId) {
 
       for (const tx of transactions) {
         try {
-          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0);
+          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0, tx.event_index);
           if (!result?.success) throw new Error(result?.error || 'Deposit processing failed');
           if (result?.success) {
             if (result.already_processed) summary.duplicates++;

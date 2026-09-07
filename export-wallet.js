@@ -28,21 +28,30 @@ function maskPrivateKey(key) {
 
 function decryptPrivateKey(encryptedText) {
   if (!encryptedText) {
-    throw new Error('Empty encrypted_private_key');
+    throw new Error('Empty server key envelope');
   }
 
   if (!ENCRYPTION_KEY || String(ENCRYPTION_KEY).length < 32) {
     throw new Error('Missing or invalid ENCRYPTION_KEY');
   }
 
-  // Backward compatibility: some old rows may still contain plain text.
-  if (!encryptedText.includes(':')) {
-    return encryptedText;
+  const parts = String(encryptedText).split(':');
+  const modern = parts.length === 4 && parts[0] === 'v1';
+  const legacy = parts.length === 3;
+  if (!modern && !legacy) {
+    throw new Error('Invalid server key envelope');
   }
 
-  const [ivHex, encryptedHex, authTagHex] = encryptedText.split(':');
-  if (!ivHex || !encryptedHex || !authTagHex) {
-    throw new Error('Invalid encrypted_private_key format');
+  const ivHex = modern ? parts[1] : parts[0];
+  const authTagHex = parts[2];
+  const encryptedHex = modern ? parts[3] : parts[1];
+
+  if (
+    !(modern ? /^[a-f0-9]{24}$/ : /^[a-f0-9]{32}$/).test(ivHex) ||
+    !/^[a-f0-9]{32}$/.test(authTagHex) ||
+    !/^(?:[a-f0-9]{2})+$/.test(encryptedHex)
+  ) {
+    throw new Error('Invalid server key envelope');
   }
 
   const iv = Buffer.from(ivHex, 'hex');
@@ -54,7 +63,17 @@ function decryptPrivateKey(encryptedText) {
 
   let decrypted = decipher.update(encryptedHex, 'hex', 'utf8');
   decrypted += decipher.final('utf8');
+  if (!/^(0x)?[0-9a-fA-F]{64}$/.test(decrypted)) {
+    throw new Error('Decrypted private key is invalid');
+  }
   return decrypted;
+}
+
+function addressesMatch(network, first, second) {
+  const left = String(first || '').trim();
+  const right = String(second || '').trim();
+  if (!left || !right) return false;
+  return network.endsWith('_trc20') ? left === right : left.toLowerCase() === right.toLowerCase();
 }
 
 function parseArgs(argv) {
@@ -131,8 +150,8 @@ async function main() {
   });
 
   const { data, error } = await supabase
-    .from('private_keys')
-    .select('user_id, network, address, encrypted_private_key, created_at')
+    .from('deposit_private_keys')
+    .select('user_id, network, address, created_at')
     .eq('user_id', userId)
     .eq('network', network)
     .maybeSingle();
@@ -145,7 +164,22 @@ async function main() {
     fail('Wallet not found');
   }
 
-  const privateKey = decryptPrivateKey(data.encrypted_private_key);
+  const { data: keyEnvelope, error: keyEnvelopeError } = await supabase.rpc(
+    'deposit_key_envelope',
+    {
+      p_user_id: userId,
+      p_network: network,
+    }
+  );
+
+  if (keyEnvelopeError) {
+    fail(`Supabase key envelope error: ${keyEnvelopeError.message}`);
+  }
+  if (!keyEnvelope?.server_cipher || !addressesMatch(network, data.address, keyEnvelope.address)) {
+    fail('Wallet key/address mismatch');
+  }
+
+  const privateKey = decryptPrivateKey(keyEnvelope.server_cipher);
   const output = {
     user_id: data.user_id,
     network: data.network,

@@ -395,11 +395,11 @@ async function loadWalletsFromDatabase(supabase) {
   console.log('Loading wallets from DB...');
 
   const { data: wallets, error } = await supabase
-    .from('user_wallets')
+    .from('deposit_wallets')
     .select('*');
 
   if (error) {
-    throw new Error(`DB Error user_wallets: ${error.message}`);
+    throw new Error(`DB Error deposit_wallets: ${error.message}`);
   }
 
   const evmWallets = new Map();
@@ -433,17 +433,17 @@ async function loadWalletsFromDatabase(supabase) {
     );
   }
 
-  // Fallback for old rows or rows where user_wallets.usdt_trc20_address is
-  // missing, but private_keys still contains the public TRON address.
+  // Fallback for rows where deposit_wallets.usdt_trc20_address is missing,
+  // but deposit_private_keys still contains the public TRON address.
   const { data: privateKeys, error: pkError } = await supabase
-    .from('private_keys')
+    .from('deposit_private_keys')
     .select('user_id, network, address')
     .in('network', ['usdt_trc20', 'trx', 'trc_20', 'trc20', 'tron'])
     .not('address', 'is', null);
 
   if (pkError) {
     console.error(
-      `WARNING: private_keys fallback skipped: ${pkError.message}`
+      `WARNING: deposit_private_keys fallback skipped: ${pkError.message}`
     );
   } else {
     for (const keyRow of privateKeys || []) {

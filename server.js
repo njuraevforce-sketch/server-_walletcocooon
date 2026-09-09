@@ -218,12 +218,17 @@ const ALCHEMY_BSC_LOG_BLOCK_RANGE = boundedEnvInteger('ALCHEMY_BSC_LOG_BLOCK_RAN
 const ALCHEMY_ETH_LOG_BLOCK_RANGE = boundedEnvInteger('ALCHEMY_ETH_LOG_BLOCK_RANGE', 10, 1, 10000);
 const ALCHEMY_BSC_CONFIRMATIONS = boundedEnvInteger('ALCHEMY_BSC_CONFIRMATIONS', 3, 1, 100);
 const ALCHEMY_ETH_CONFIRMATIONS = boundedEnvInteger('ALCHEMY_ETH_CONFIRMATIONS', 12, 1, 200);
-const ALCHEMY_BSC_INITIAL_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_BSC_INITIAL_LOOKBACK_BLOCKS', 1200, 10, 100000);
+// Railway restarts must not hide deposits that are already more than 1,200
+// BSC blocks old. Recovery is processed in bounded chunks below, so this
+// larger safety window does not create one oversized provider request burst.
+const ALCHEMY_BSC_INITIAL_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_BSC_INITIAL_LOOKBACK_BLOCKS', 10000, 10, 100000);
 const ALCHEMY_ETH_INITIAL_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_ETH_INITIAL_LOOKBACK_BLOCKS', 720, 10, 100000);
 const ALCHEMY_BSC_MANUAL_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_BSC_MANUAL_LOOKBACK_BLOCKS', 600, 10, 100000);
 const ALCHEMY_ETH_MANUAL_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_ETH_MANUAL_LOOKBACK_BLOCKS', 300, 10, 100000);
 const ALCHEMY_BSC_REORG_OVERLAP_BLOCKS = boundedEnvInteger('ALCHEMY_BSC_REORG_OVERLAP_BLOCKS', 20, 1, 500);
 const ALCHEMY_ETH_REORG_OVERLAP_BLOCKS = boundedEnvInteger('ALCHEMY_ETH_REORG_OVERLAP_BLOCKS', 12, 1, 500);
+const ALCHEMY_BSC_RECOVERY_BLOCKS_PER_CHECK = boundedEnvInteger('ALCHEMY_BSC_RECOVERY_BLOCKS_PER_CHECK', 2000, 10, 10000);
+const ALCHEMY_BSC_LOG_DELAY_MS = boundedEnvInteger('ALCHEMY_BSC_LOG_DELAY_MS', 200, 0, 5000);
 const DEPOSIT_WALLET_PAGE_SIZE = boundedEnvInteger('DEPOSIT_WALLET_PAGE_SIZE', 500, 50, 1000);
 
 // ========== HELPERS ==========
@@ -747,6 +752,8 @@ const ALCHEMY_CHAIN_CONFIG = {
     manualLookback: ALCHEMY_BSC_MANUAL_LOOKBACK_BLOCKS,
     reorgOverlap: ALCHEMY_BSC_REORG_OVERLAP_BLOCKS,
     logBlockRange: ALCHEMY_BSC_LOG_BLOCK_RANGE,
+    recoveryBlocksPerCheck: ALCHEMY_BSC_RECOVERY_BLOCKS_PER_CHECK,
+    logDelayMs: ALCHEMY_BSC_LOG_DELAY_MS,
     tokens: {
       [USDT_BSC_CONTRACT.toLowerCase()]: { symbol: 'USDT', decimals: 18, network: 'usdt_bep20' },
       [USDC_BSC_CONTRACT.toLowerCase()]: { symbol: 'USDC', decimals: 18, network: 'usdc_bep20' }
@@ -908,18 +915,22 @@ async function alchemyBlockTimestamp(chainKey, blockHex) {
 async function resolveAlchemyScanRange(chainKey, mode) {
   const chain = ALCHEMY_CHAIN_CONFIG[chainKey];
   const latestBlock = safeRpcNumber(await alchemyRpc(chainKey, 'eth_blockNumber', []), 'latest block');
-  const toBlock = latestBlock - chain.confirmations;
-  if (toBlock < 0) return null;
+  const latestConfirmedBlock = latestBlock - chain.confirmations;
+  if (latestConfirmedBlock < 0) return null;
 
   let fromBlock;
   if (mode === 'background' && Number.isSafeInteger(alchemyLastScannedBlock[chainKey])) {
     fromBlock = Math.max(0, alchemyLastScannedBlock[chainKey] - chain.reorgOverlap + 1);
   } else {
     const lookback = mode === 'background' ? chain.initialLookback : chain.manualLookback;
-    fromBlock = Math.max(0, toBlock - lookback + 1);
+    fromBlock = Math.max(0, latestConfirmedBlock - lookback + 1);
   }
 
-  if (fromBlock > toBlock) fromBlock = toBlock;
+  if (fromBlock > latestConfirmedBlock) fromBlock = latestConfirmedBlock;
+  const recoveryBatch = mode === 'background' ? Number(chain.recoveryBlocksPerCheck || 0) : 0;
+  const toBlock = recoveryBatch > 0
+    ? Math.min(latestConfirmedBlock, fromBlock + recoveryBatch - 1)
+    : latestConfirmedBlock;
   return { fromBlock, toBlock };
 }
 
@@ -955,6 +966,7 @@ async function scanAlchemyLogTransfers(chainKey, addresses, mode = 'manual') {
 
       if (!Array.isArray(logs)) throw new Error(`Alchemy ${chain.label} eth_getLogs returned invalid data`);
       rawLogs.push(...logs);
+      if (chain.logDelayMs > 0) await sleep(chain.logDelayMs);
     }
   }
 
@@ -1258,6 +1270,14 @@ async function handleCheckEvmDeposits({ chainKey, label, addressFields, filter, 
     let depositsFound = 0;
     let duplicatesSkipped = 0;
     let errors = 0;
+    // One sweep per user/token is enough: it transfers the complete on-chain
+    // token balance and avoids parallel sweep attempts during recovery replay.
+    const pendingSweeps = new Map();
+    const rememberSweep = (wallet, tx) => {
+      if (!sweepAfterCredit) return;
+      const key = `${wallet.user_id}:${tx.token}:${tx.network}`;
+      pendingSweeps.set(key, { userId: wallet.user_id, token: tx.token, network: tx.network });
+    };
 
     for (const tx of transactions) {
       const wallet = walletByAddress.get(normalizeEvmAddress(tx.to));
@@ -1276,6 +1296,9 @@ async function handleCheckEvmDeposits({ chainKey, label, addressFields, filter, 
         if (existing && ['credited', 'reversed'].includes(existing.status)) {
           duplicatesSkipped++;
           console.log(`⏭️ Skipping duplicate ${tx.network} transaction: ${tx.transaction_id}`);
+          // A manually credited deposit bypassed the original auto-sweep call.
+          // When recovery sees it again, retry the sweep without re-crediting.
+          if (existing.status === 'credited') rememberSweep(wallet, tx);
           continue;
         }
 
@@ -1291,18 +1314,14 @@ async function handleCheckEvmDeposits({ chainKey, label, addressFields, filter, 
         if (!result.success) throw new Error(result.error || 'Deposit processing failed');
         if (result.already_processed) {
           duplicatesSkipped++;
+          if (result.status === 'credited') rememberSweep(wallet, tx);
           continue;
         }
 
         depositsFound++;
         console.log(`💰 NEW ${tx.network} DEPOSIT: $${tx.amount} ${tx.token} for user ${wallet.user_id}`);
 
-        if (sweepAfterCredit) {
-          // Non-blocking: the next user's deposit check does not wait for sweep gas/receipt.
-          sweepDepositBEP20(wallet.user_id, tx.token, tx.network).catch((error) =>
-            console.error('Sweep background error:', error.message)
-          );
-        }
+        rememberSweep(wallet, tx);
       } catch (error) {
         if (/already_processed|duplicate/i.test(String(error.message || ''))) {
           duplicatesSkipped++;
@@ -1312,6 +1331,14 @@ async function handleCheckEvmDeposits({ chainKey, label, addressFields, filter, 
           console.error(`❌ Error processing ${tx.network} deposit ${tx.transaction_id}:`, error.message);
         }
       }
+    }
+
+    for (const sweep of pendingSweeps.values()) {
+      // Non-blocking: crediting and the scanner cursor never wait for gas or a
+      // sweep receipt. A later recovery replay can safely request it again.
+      sweepDepositBEP20(sweep.userId, sweep.token, sweep.network).catch((error) =>
+        console.error('Sweep background error:', error.message)
+      );
     }
 
     // Advance only after every discovered transfer was either atomically credited

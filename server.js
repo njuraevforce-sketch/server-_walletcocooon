@@ -3,13 +3,15 @@
 // Changes vs original:
 // - UNIFIED EVM WALLETS: One 0x... address generated and shared across USDT/USDC and BEP20/ERC20.
 // - TRC20 restored for USDT
-// - ERC20/BEP20 discovery migrated from Moralis to Alchemy JSON-RPC
+// - Background ERC20/BEP20 discovery uses Alchemy JSON-RPC
 // - Confirmed ERC20/BEP20 Transfer logs are scanned in safe block windows
 // - Old vulnerable getChainTokenTransfers removed completely
+// - User BEP20 checks add indexed Moralis discovery, but every candidate is
+//   independently verified from its BSC receipt through Alchemy before credit
 // - Compatible with Supabase RPC public.credit_chain_deposit
 // - V2: AUTO-SWEEP ADDED FOR BEP20 ONLY (Non-blocking)
 // - V3: WEBSOCKET FIX FOR NODE.JS 20 SUPABASE COMPATIBILITY
-// - V5: ALCHEMY PROVIDER - Moralis removed without changing database crediting
+// - V5: ALCHEMY PROVIDER - database crediting remains unchanged
 // - PixelNFT compatibility: atomic database RPCs, credited/reversed statuses,
 //   encrypted key envelopes and existing PixelNFT app/admin API contracts.
 //   Atomic crediting, confirmation flags, scan timers and BEP20 sweep flow
@@ -29,6 +31,7 @@ const PORT = Number(process.env.PORT || 8080);
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fkjwueogfmdolcjtvvme.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const ALCHEMY_API_KEY = String(process.env.ALCHEMY_API_KEY || '').trim();
+const MORALIS_API_KEY = String(process.env.MORALIS_API_KEY || '').trim();
 const ALCHEMY_ETH_RPC_URL = String(
   process.env.ALCHEMY_ETH_RPC_URL ||
   (ALCHEMY_API_KEY ? `https://eth-mainnet.g.alchemy.com/v2/${encodeURIComponent(ALCHEMY_API_KEY)}` : '')
@@ -230,6 +233,13 @@ const ALCHEMY_ETH_REORG_OVERLAP_BLOCKS = boundedEnvInteger('ALCHEMY_ETH_REORG_OV
 const ALCHEMY_BSC_RECOVERY_BLOCKS_PER_CHECK = boundedEnvInteger('ALCHEMY_BSC_RECOVERY_BLOCKS_PER_CHECK', 2000, 10, 10000);
 const ALCHEMY_BSC_LOG_DELAY_MS = boundedEnvInteger('ALCHEMY_BSC_LOG_DELAY_MS', 200, 0, 5000);
 const DEPOSIT_WALLET_PAGE_SIZE = boundedEnvInteger('DEPOSIT_WALLET_PAGE_SIZE', 500, 50, 1000);
+// Moralis is used only as an address-history index for a user's BEP20 button.
+// Alchemy receipts remain the source of truth, and the existing atomic RPC
+// remains the only code path allowed to credit a balance.
+const MORALIS_BSC_MAX_PAGES = boundedEnvInteger('MORALIS_BSC_MAX_PAGES', 2, 1, 10);
+const MORALIS_BSC_PAGE_SIZE = boundedEnvInteger('MORALIS_BSC_PAGE_SIZE', 100, 1, 100);
+const MORALIS_REQUEST_TIMEOUT_MS = boundedEnvInteger('MORALIS_REQUEST_TIMEOUT_MS', 15000, 1000, 60000);
+const MORALIS_MAX_RETRIES = boundedEnvInteger('MORALIS_MAX_RETRIES', 2, 0, 5);
 
 // ========== HELPERS ==========
 function sleep(ms) {
@@ -1123,13 +1133,203 @@ async function getAlchemyERC20AssetTransfers(address) {
   return Array.from(uniqueTransactions.values()).sort((a, b) => b.blockNumber - a.blockNumber || b.event_index - a.event_index || b.timestamp - a.timestamp);
 }
 
-async function getBEP20Transactions(address) {
-  try {
-    return await getAlchemyLogTransfers('bsc', [address], 'manual');
-  } catch (error) {
-    console.error('❌ BEP20 Alchemy transfer fetch error:', error.message);
-    throw error;
+async function fetchMoralisBscPage(url) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= MORALIS_MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), MORALIS_REQUEST_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(url, {
+        headers: { Accept: 'application/json', 'X-API-Key': MORALIS_API_KEY },
+        signal: controller.signal
+      });
+      const retryAfterMs = retryAfterMilliseconds(response);
+      const rawBody = await response.text();
+      let payload = null;
+      try {
+        payload = rawBody ? JSON.parse(rawBody) : null;
+      } catch (_) {
+        // A provider gateway may temporarily return HTML or plain text.
+      }
+
+      if (!response.ok) {
+        const error = new Error(`Moralis BEP20 history HTTP ${response.status}`);
+        error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+        error.retryAfterMs = retryAfterMs;
+        throw error;
+      }
+      if (!payload || !Array.isArray(payload.result)) {
+        throw Object.assign(new Error('Moralis BEP20 history returned invalid data'), { retryable: true });
+      }
+
+      return payload;
+    } catch (error) {
+      const normalizedError = error?.name === 'AbortError'
+        ? Object.assign(new Error('Moralis BEP20 history timed out'), { retryable: true })
+        : error;
+      lastError = normalizedError;
+
+      if (normalizedError?.retryable === false || attempt >= MORALIS_MAX_RETRIES) {
+        throw normalizedError;
+      }
+
+      const exponentialDelay = ALCHEMY_RETRY_BASE_MS * (2 ** attempt);
+      const jitter = Math.floor(Math.random() * Math.max(100, ALCHEMY_RETRY_BASE_MS));
+      await sleep(Math.max(Number(normalizedError?.retryAfterMs || 0), exponentialDelay + jitter));
+    } finally {
+      clearTimeout(timeout);
+    }
   }
+
+  throw lastError || new Error('Moralis BEP20 history failed');
+}
+
+async function getMoralisBscCandidateHashes(address) {
+  if (!MORALIS_API_KEY) throw new Error('MORALIS_API_KEY is not configured');
+
+  const normalizedAddress = normalizeEvmAddress(address);
+  if (!normalizedAddress) return [];
+
+  const tokenContracts = Object.keys(ALCHEMY_CHAIN_CONFIG.bsc.tokens);
+  const candidateHashes = new Map();
+  let cursor = '';
+
+  for (let page = 0; page < MORALIS_BSC_MAX_PAGES; page++) {
+    const url = new URL(`https://deep-index.moralis.io/api/v2.2/${encodeURIComponent(normalizedAddress)}/erc20/transfers`);
+    url.searchParams.set('chain', 'bsc');
+    url.searchParams.set('order', 'DESC');
+    url.searchParams.set('limit', String(MORALIS_BSC_PAGE_SIZE));
+    tokenContracts.forEach((contract, index) => {
+      url.searchParams.append(`contract_addresses[${index}]`, contract);
+    });
+    if (cursor) url.searchParams.set('cursor', cursor);
+
+    const payload = await fetchMoralisBscPage(url);
+    for (const transfer of payload.result) {
+      const tokenContract = normalizeEvmAddress(transfer?.address);
+      const toAddress = normalizeEvmAddress(transfer?.to_address);
+      const transactionHash = String(transfer?.transaction_hash || '').trim().toLowerCase();
+
+      if (!ALCHEMY_CHAIN_CONFIG.bsc.tokens[tokenContract]) continue;
+      if (toAddress !== normalizedAddress) continue;
+      if (!/^0x[0-9a-f]{64}$/.test(transactionHash)) continue;
+      candidateHashes.set(transactionHash, transactionHash);
+    }
+
+    cursor = String(payload.cursor || '').trim();
+    if (!cursor) break;
+  }
+
+  return Array.from(candidateHashes.values());
+}
+
+async function verifyMoralisBscCandidates(address, candidateHashes) {
+  const normalizedAddress = normalizeEvmAddress(address);
+  if (!normalizedAddress || !candidateHashes.length) return [];
+
+  const chain = ALCHEMY_CHAIN_CONFIG.bsc;
+  const chainId = safeRpcNumber(await alchemyRpc('bsc', 'eth_chainId', []), 'chain id');
+  if (chainId !== 56) throw new Error(`Alchemy BSC RPC returned chain ${chainId}`);
+
+  const latestBlock = safeRpcNumber(await alchemyRpc('bsc', 'eth_blockNumber', []), 'latest block');
+  const latestConfirmedBlock = latestBlock - chain.confirmations;
+  const verifiedTransfers = new Map();
+
+  for (const candidateHash of candidateHashes) {
+    const receipt = await alchemyRpc('bsc', 'eth_getTransactionReceipt', [candidateHash]);
+    if (!receipt || safeRpcNumber(receipt.status, 'receipt status') !== 1) continue;
+
+    const transactionId = String(receipt.transactionHash || '').trim().toLowerCase();
+    if (transactionId !== candidateHash) continue;
+
+    const blockNumber = safeRpcNumber(receipt.blockNumber, 'receipt block number');
+    if (blockNumber > latestConfirmedBlock) continue;
+
+    let timestamp = null;
+    for (const log of receipt.logs || []) {
+      if (log?.removed === true) continue;
+      if (String(log?.transactionHash || '').trim().toLowerCase() !== transactionId) continue;
+      if (String(log?.topics?.[0] || '').trim().toLowerCase() !== ERC20_TRANSFER_TOPIC) continue;
+
+      const tokenContract = normalizeEvmAddress(log?.address);
+      const token = chain.tokens[tokenContract];
+      if (!token) continue;
+
+      const toAddress = evmAddressFromTopic(log?.topics?.[2]);
+      if (toAddress !== normalizedAddress) continue;
+
+      const rawAmount = BigInt(String(log?.data || '0x0'));
+      const amount = Number(ethers.formatUnits(rawAmount, token.decimals));
+      if (!Number.isFinite(amount) || amount < MIN_DEPOSIT) continue;
+
+      const eventIndex = normalizeEventIndex(log?.logIndex);
+      if (timestamp === null) {
+        timestamp = await alchemyBlockTimestamp('bsc', rpcHexNumber(blockNumber));
+      }
+
+      const key = `${token.network}:${transactionId}:${eventIndex}`;
+      verifiedTransfers.set(key, {
+        transaction_id: transactionId,
+        event_index: eventIndex,
+        to: toAddress,
+        from: evmAddressFromTopic(log?.topics?.[1]),
+        amount,
+        token: token.symbol,
+        confirmed: true,
+        network: token.network,
+        timestamp,
+        blockNumber
+      });
+    }
+  }
+
+  return Array.from(verifiedTransfers.values());
+}
+
+async function getVerifiedMoralisBEP20Transactions(address) {
+  const candidateHashes = await getMoralisBscCandidateHashes(address);
+  return verifyMoralisBscCandidates(address, candidateHashes);
+}
+
+function mergeEvmTransactions(groups) {
+  const uniqueTransactions = new Map();
+  for (const transaction of groups.flat()) {
+    const key = `${transaction.network}:${transaction.transaction_id}:${transaction.event_index}`;
+    if (!uniqueTransactions.has(key)) uniqueTransactions.set(key, transaction);
+  }
+  return Array.from(uniqueTransactions.values()).sort(
+    (a, b) => b.blockNumber - a.blockNumber || b.event_index - a.event_index || b.timestamp - a.timestamp
+  );
+}
+
+async function getBEP20Transactions(address) {
+  // Keep the existing Alchemy scan for transfers that have just arrived and
+  // may not yet be indexed. Moralis supplies older candidate hashes quickly;
+  // those candidates cannot be credited until Alchemy verifies their receipts.
+  const checks = [getAlchemyLogTransfers('bsc', [address], 'manual')];
+  if (MORALIS_API_KEY) checks.push(getVerifiedMoralisBEP20Transactions(address));
+
+  const results = await Promise.allSettled(checks);
+  const successfulGroups = results
+    .filter((result) => result.status === 'fulfilled')
+    .map((result) => result.value);
+
+  results.forEach((result, index) => {
+    if (result.status !== 'rejected') return;
+    const source = index === 0 ? 'Alchemy recent scan' : 'Moralis indexed scan';
+    console.warn(`⚠️ BEP20 ${source} failed:`, result.reason?.message || result.reason);
+  });
+
+  if (!successfulGroups.length) {
+    const messages = results.map((result) => result.status === 'rejected'
+      ? String(result.reason?.message || result.reason)
+      : '').filter(Boolean);
+    throw new Error(messages.join('; ') || 'BEP20 transfer discovery failed');
+  }
+
+  return mergeEvmTransactions(successfulGroups);
 }
 
 async function getERC20Transactions(address) {
@@ -2015,6 +2215,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ SUPABASE DEPOSIT STORAGE: CONFIGURED (connection verified on first request)`);
   console.log(`✅ ALCHEMY ETH RPC: ${ALCHEMY_ETH_RPC_URL ? 'CONFIGURED' : 'MISSING'}`);
   console.log(`✅ ALCHEMY BSC RPC: ${ALCHEMY_BSC_RPC_URL ? 'CONFIGURED' : 'MISSING'}`);
+  console.log(`✅ BEP20 USER HISTORY: ${MORALIS_API_KEY ? 'MORALIS DISCOVERY + ALCHEMY RECEIPT VERIFICATION' : 'ALCHEMY RECENT WINDOW ONLY'}`);
   console.log(`✅ BEP20 (USDT & USDC): Checking every ${BEP20_CHECK_INTERVAL} ms`);
   console.log(`✅ ERC20 (USDT & USDC): Checking every ${ERC20_CHECK_INTERVAL} ms`);
   console.log(`✅ TRC20 (USDT): Checking every ${TRC20_CHECK_INTERVAL} ms`);

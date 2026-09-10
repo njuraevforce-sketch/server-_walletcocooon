@@ -12,6 +12,8 @@
 // - V5: ALCHEMY PROVIDER - Moralis removed without changing database crediting
 // - V6: BEP20 user check scans Alchemy history newest-first in bounded batches
 //   so deposits older than the former 600-block window are not skipped.
+// - V7: selected-network checks run as single-flight background jobs with
+//   progress polling and a process-wide Alchemy 429 protection gate.
 // - PixelNFT compatibility: atomic database RPCs, credited/reversed statuses,
 //   encrypted key envelopes and existing PixelNFT app/admin API contracts.
 //   Atomic crediting, confirmation flags, scan timers and BEP20 sweep flow
@@ -95,7 +97,7 @@ function simpleRateLimit(req, res, next) {
   const windowMs = 15 * 60 * 1000;
   const max = 60;
 
-  if (req.path === '/health' || req.path === '/api/health' || req.path === '/') {
+  if (req.path === '/health' || req.path === '/api/health' || req.path === '/' || req.path === '/public/deposit/check/status') {
     return next();
   }
 
@@ -160,6 +162,13 @@ const userDepositCheckCooldownMiddleware = createCooldownMiddleware(
   Number(process.env.USER_DEPOSIT_CHECK_COOLDOWN_MS || 60000),
   'Please wait before checking your deposit again'
 );
+
+function userDepositCheckRequestMiddleware(req, res, next) {
+  const asyncValue = readParam(req, 'async', false);
+  const asyncMode = asyncValue === true || String(asyncValue).toLowerCase() === 'true';
+  if (asyncMode) return next();
+  return userDepositCheckCooldownMiddleware(req, res, next);
+}
 
 const adminDepositCheckCooldownMiddleware = createCooldownMiddleware(
   adminDepositCheckCooldown,
@@ -232,10 +241,15 @@ const ALCHEMY_ETH_REORG_OVERLAP_BLOCKS = boundedEnvInteger('ALCHEMY_ETH_REORG_OV
 const ALCHEMY_BSC_RECOVERY_BLOCKS_PER_CHECK = boundedEnvInteger('ALCHEMY_BSC_RECOVERY_BLOCKS_PER_CHECK', 2000, 10, 10000);
 const ALCHEMY_BSC_LOG_DELAY_MS = boundedEnvInteger('ALCHEMY_BSC_LOG_DELAY_MS', 200, 0, 5000);
 const DEPOSIT_WALLET_PAGE_SIZE = boundedEnvInteger('DEPOSIT_WALLET_PAGE_SIZE', 500, 50, 1000);
-// Four workers keep an exceptional deep user check reasonably fast while the
-// existing retry/backoff in alchemyRpc protects the free-plan throughput.
-// No new Railway variable is required.
+// Workers overlap network latency, while one process-wide gate below spaces
+// every eth_getLogs attempt so simultaneous user/background scans cannot burst
+// through the Alchemy free-plan throughput limit.
 const ALCHEMY_BSC_USER_SCAN_CONCURRENCY = 4;
+const ALCHEMY_LOG_REQUEST_MIN_INTERVAL_MS = boundedEnvInteger('ALCHEMY_LOG_REQUEST_MIN_INTERVAL_MS', 150, 50, 5000);
+const ALCHEMY_RATE_LIMIT_PAUSE_MS = boundedEnvInteger('ALCHEMY_RATE_LIMIT_PAUSE_MS', 5000, 1000, 60000);
+const DEPOSIT_CHECK_JOB_TTL_MS = boundedEnvInteger('DEPOSIT_CHECK_JOB_TTL_MS', 15 * 60 * 1000, 60 * 1000, 60 * 60 * 1000);
+const DEPOSIT_CHECK_RESULT_REUSE_MS = boundedEnvInteger('DEPOSIT_CHECK_RESULT_REUSE_MS', 60 * 1000, 5 * 1000, 5 * 60 * 1000);
+const DEPOSIT_CHECK_JOB_CONCURRENCY = boundedEnvInteger('DEPOSIT_CHECK_JOB_CONCURRENCY', 2, 1, 10);
 
 // ========== HELPERS ==========
 function sleep(ms) {
@@ -593,9 +607,10 @@ async function generateWallet(user_id, network) {
       { user_id, network, address }
     ));
     setTimeout(() => {
-      if (network.includes('bep20')) checkUserBEP20Deposits(user_id).catch(console.error);
-      if (network.includes('erc20')) checkUserERC20Deposits(user_id).catch(console.error);
-      if (network.includes('trc20')) checkUserTRC20Deposits(user_id).catch(console.error);
+      const options = { network };
+      if (network.includes('bep20')) checkUserBEP20Deposits(user_id, options).catch(console.error);
+      if (network.includes('erc20')) checkUserERC20Deposits(user_id, options).catch(console.error);
+      if (network.includes('trc20')) checkUserTRC20Deposits(user_id, options).catch(console.error);
     }, 10000);
   }
   return { success: true, address, exists: !!exists, network, wallet };
@@ -748,6 +763,23 @@ const ERC20_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a116
 const alchemyLastScannedBlock = { bsc: null, eth: null };
 const alchemyBlockTimestampCache = new Map();
 let alchemyRequestId = 0;
+let nextAlchemyLogRequestAt = 0;
+let alchemyLogPausedUntil = 0;
+
+async function waitForAlchemyLogRequestSlot() {
+  while (true) {
+    const now = Date.now();
+    const scheduledAt = Math.max(now, nextAlchemyLogRequestAt, alchemyLogPausedUntil);
+    nextAlchemyLogRequestAt = scheduledAt + ALCHEMY_LOG_REQUEST_MIN_INTERVAL_MS;
+    if (scheduledAt > now) await sleep(scheduledAt - now);
+    if (Date.now() >= alchemyLogPausedUntil) return;
+  }
+}
+
+function pauseAlchemyLogRequests(waitMs = ALCHEMY_RATE_LIMIT_PAUSE_MS) {
+  alchemyLogPausedUntil = Math.max(alchemyLogPausedUntil, Date.now() + Math.max(0, waitMs));
+  nextAlchemyLogRequestAt = Math.max(nextAlchemyLogRequestAt, alchemyLogPausedUntil);
+}
 
 const ALCHEMY_CHAIN_CONFIG = {
   bsc: {
@@ -836,6 +868,7 @@ async function alchemyRpc(chainKey, method, params) {
 
   let lastError;
   for (let attempt = 0; attempt <= ALCHEMY_MAX_RETRIES; attempt++) {
+    if (method === 'eth_getLogs') await waitForAlchemyLogRequestSlot();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), ALCHEMY_REQUEST_TIMEOUT_MS);
 
@@ -863,6 +896,7 @@ async function alchemyRpc(chainKey, method, params) {
 
       if (!response.ok) {
         const error = new Error(`Alchemy ${chain.label} ${method} HTTP ${response.status}`);
+        error.status = response.status;
         error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
         error.retryAfterMs = retryAfterMs;
         throw error;
@@ -872,6 +906,7 @@ async function alchemyRpc(chainKey, method, params) {
         const code = payload?.error?.code;
         const providerMessage = String(payload?.error?.message || 'invalid JSON-RPC response').slice(0, 240);
         const error = new Error(`Alchemy ${chain.label} ${method} error${code == null ? '' : ` ${code}`}: ${providerMessage}`);
+        error.code = code;
         error.retryable = code === -32005 || /rate|limit|timeout|temporar|busy|unavailable/i.test(providerMessage);
         throw error;
       }
@@ -888,7 +923,11 @@ async function alchemyRpc(chainKey, method, params) {
 
       const exponentialDelay = ALCHEMY_RETRY_BASE_MS * (2 ** attempt);
       const jitter = Math.floor(Math.random() * Math.max(100, ALCHEMY_RETRY_BASE_MS));
-      await sleep(Math.max(Number(normalizedError?.retryAfterMs || 0), exponentialDelay + jitter));
+      const retryDelay = Math.max(Number(normalizedError?.retryAfterMs || 0), exponentialDelay + jitter);
+      if (method === 'eth_getLogs' && (normalizedError?.status === 429 || normalizedError?.code === -32005)) {
+        pauseAlchemyLogRequests(Math.max(ALCHEMY_RATE_LIMIT_PAUSE_MS, retryDelay));
+      }
+      await sleep(retryDelay);
     } finally {
       clearTimeout(timeout);
     }
@@ -957,7 +996,11 @@ async function scanAlchemyLogTransfers(chainKey, addresses, mode = 'manual', opt
   if (!scanRange) return { transactions: [], fromBlock: null, toBlock: null };
   if (scanRange.fromBlock > scanRange.toBlock) return { transactions: [], fromBlock: scanRange.fromBlock, toBlock: scanRange.toBlock };
 
-  const contractAddresses = Object.keys(chain.tokens);
+  const requestedNetwork = String(options?.network || '').trim().toLowerCase();
+  const contractAddresses = Object.entries(chain.tokens)
+    .filter(([, token]) => !requestedNetwork || token.network === requestedNetwork)
+    .map(([address]) => address);
+  if (!contractAddresses.length) throw new Error(`Unsupported ${chain.label} token network: ${requestedNetwork}`);
   const addressChunks = chunkValues(normalizedAddresses, ALCHEMY_ADDRESS_BATCH_SIZE);
   const rawLogs = [];
   const logRequests = [];
@@ -973,6 +1016,7 @@ async function scanAlchemyLogTransfers(chainKey, addresses, mode = 'manual', opt
   const requestedConcurrency = Number.isSafeInteger(options?.concurrency) ? options.concurrency : 1;
   const concurrency = Math.max(1, Math.min(requestedConcurrency, ALCHEMY_BSC_USER_SCAN_CONCURRENCY));
   let nextRequestIndex = 0;
+  let completedRequests = 0;
 
   async function logWorker() {
     while (nextRequestIndex < logRequests.length) {
@@ -992,6 +1036,19 @@ async function scanAlchemyLogTransfers(chainKey, addresses, mode = 'manual', opt
 
       if (!Array.isArray(logs)) throw new Error(`Alchemy ${chain.label} eth_getLogs returned invalid data`);
       rawLogs.push(...logs);
+      completedRequests++;
+      if (typeof options?.onProgress === 'function') {
+        try {
+          options.onProgress({
+            completedRequests,
+            totalRequests: logRequests.length,
+            fromBlock: scanRange.fromBlock,
+            toBlock: scanRange.toBlock
+          });
+        } catch (progressError) {
+          console.warn('⚠️ Deposit scan progress callback failed:', progressError.message);
+        }
+      }
       if (chain.logDelayMs > 0) await sleep(chain.logDelayMs);
     }
   }
@@ -1051,8 +1108,8 @@ async function scanAlchemyLogTransfers(chainKey, addresses, mode = 'manual', opt
   return { transactions, fromBlock: scanRange.fromBlock, toBlock: scanRange.toBlock };
 }
 
-async function getAlchemyLogTransfers(chainKey, addresses, mode = 'manual') {
-  const scan = await scanAlchemyLogTransfers(chainKey, addresses, mode);
+async function getAlchemyLogTransfers(chainKey, addresses, mode = 'manual', options = {}) {
+  const scan = await scanAlchemyLogTransfers(chainKey, addresses, mode, options);
   return scan.transactions;
 }
 
@@ -1074,11 +1131,16 @@ function alchemyAssetTransferEventIndex(transfer) {
   throw error;
 }
 
-async function getAlchemyERC20AssetTransfers(address) {
+async function getAlchemyERC20AssetTransfers(address, network = '') {
   const normalizedAddress = normalizeEvmAddress(address);
   if (!normalizedAddress) return [];
 
   const chain = ALCHEMY_CHAIN_CONFIG.eth;
+  const requestedNetwork = String(network || '').trim().toLowerCase();
+  const contractAddresses = Object.entries(chain.tokens)
+    .filter(([, token]) => !requestedNetwork || token.network === requestedNetwork)
+    .map(([contractAddress]) => contractAddress);
+  if (!contractAddresses.length) throw new Error(`Unsupported ERC20 token network: ${requestedNetwork}`);
   const latestBlock = safeRpcNumber(await alchemyRpc('eth', 'eth_blockNumber', []), 'latest block');
   const confirmedBlock = Math.max(0, latestBlock - chain.confirmations);
   const transactions = [];
@@ -1089,7 +1151,7 @@ async function getAlchemyERC20AssetTransfers(address) {
       fromBlock: '0x0',
       toBlock: rpcHexNumber(confirmedBlock),
       toAddress: normalizedAddress,
-      contractAddresses: Object.keys(chain.tokens),
+      contractAddresses,
       category: ['erc20'],
       excludeZeroValue: true,
       withMetadata: true,
@@ -1162,13 +1224,13 @@ async function getBEP20Transactions(address) {
   }
 }
 
-async function getERC20Transactions(address) {
+async function getERC20Transactions(address, network = '') {
   try {
-    return await getAlchemyERC20AssetTransfers(address);
+    return await getAlchemyERC20AssetTransfers(address, network);
   } catch (error) {
     console.warn('⚠️ ERC20 Transfers API failed; using Alchemy log fallback:', error.message);
     try {
-      return await getAlchemyLogTransfers('eth', [address], 'manual');
+      return await getAlchemyLogTransfers('eth', [address], 'manual', { network });
     } catch (fallbackError) {
       console.error('❌ ERC20 Alchemy transfer fetch error:', fallbackError.message);
       throw fallbackError;
@@ -1488,10 +1550,15 @@ async function handleCheckTRC20Deposits() {
   }
 }
 
-async function checkUserTRC20Deposits(userId) {
+async function checkUserTRC20Deposits(userId, options = {}) {
   const summary = { success: true, network_group: 'trc20', checked: 0, deposits: 0, duplicates: 0, errors: 0 };
 
   try {
+    const requestedNetwork = String(options?.network || '').trim().toLowerCase();
+    if (requestedNetwork && requestedNetwork !== 'usdt_trc20') {
+      throw new Error(`Unsupported TRC20 network: ${requestedNetwork}`);
+    }
+    if (typeof options?.onProgress === 'function') options.onProgress({ phase: 'recent', scannedBlocks: null, totalBlocks: null });
     const { data: wallet, error } = await supabase
       .from('deposit_wallets')
       .select('*')
@@ -1531,10 +1598,15 @@ async function checkUserTRC20Deposits(userId) {
   }
 }
 
-async function checkUserBEP20Deposits(userId) {
+async function checkUserBEP20Deposits(userId, options = {}) {
   const summary = { success: true, network_group: 'bep20', checked: 0, deposits: 0, duplicates: 0, errors: 0 };
 
   try {
+    const requestedNetwork = String(options?.network || '').trim().toLowerCase();
+    if (requestedNetwork && !requestedNetwork.endsWith('_bep20')) {
+      throw new Error(`Unsupported BEP20 network: ${requestedNetwork}`);
+    }
+
     const { data: wallet, error } = await supabase
       .from('deposit_wallets')
       .select('*')
@@ -1544,23 +1616,39 @@ async function checkUserBEP20Deposits(userId) {
     if (error) throw error;
     if (!wallet) return summary;
 
-    const addresses = Array.from(new Set(
-      [wallet.usdt_bep20_address, wallet.usdc_bep20_address]
-        .map(normalizeEvmAddress)
-        .filter(Boolean)
-    ));
+    const selectedAddressField = requestedNetwork ? networkFields[requestedNetwork]?.addressField : null;
+    const rawAddresses = selectedAddressField
+      ? [wallet[selectedAddressField]]
+      : [wallet.usdt_bep20_address, wallet.usdc_bep20_address];
+    const addresses = Array.from(new Set(rawAddresses.map(normalizeEvmAddress).filter(Boolean)));
 
     const chain = ALCHEMY_CHAIN_CONFIG.bsc;
     const latestBlock = safeRpcNumber(await alchemyRpc('bsc', 'eth_blockNumber', []), 'latest block');
     const latestConfirmedBlock = latestBlock - chain.confirmations;
-    if (latestConfirmedBlock < 0) return summary;
+    if (latestConfirmedBlock < 0 || !addresses.length) return summary;
 
-    // The former user check covered only the newest 600 blocks. Search the
-    // existing 10,000-block Alchemy recovery window newest-first, one bounded
-    // band at a time. Stop after the requested user's first newly credited
-    // band, so the normal case remains cheap and fast.
+    // Search the existing 10,000-block recovery window newest-first. The first
+    // 600-block band is the fast path; older bands are the extended scan.
     const historyFromBlock = Math.max(0, latestConfirmedBlock - chain.initialLookback + 1);
+    const blocksPerAddress = latestConfirmedBlock - historyFromBlock + 1;
+    const totalBlocks = blocksPerAddress * addresses.length;
     const bandSize = Math.max(chain.logBlockRange, chain.manualLookback);
+    let completedAddressBlocks = 0;
+
+    const reportProgress = (progress) => {
+      if (typeof options?.onProgress !== 'function') return;
+      try {
+        options.onProgress({
+          phase: progress.phase,
+          scannedBlocks: Math.min(totalBlocks, Math.max(0, progress.scannedBlocks)),
+          totalBlocks
+        });
+      } catch (progressError) {
+        console.warn('⚠️ BEP20 progress reporting failed:', progressError.message);
+      }
+    };
+
+    reportProgress({ phase: 'recent', scannedBlocks: 0 });
 
     for (const address of addresses) {
       let bandToBlock = latestConfirmedBlock;
@@ -1568,10 +1656,23 @@ async function checkUserBEP20Deposits(userId) {
 
       while (bandToBlock >= historyFromBlock) {
         const bandFromBlock = Math.max(historyFromBlock, bandToBlock - bandSize + 1);
+        const completedBeforeBand = latestConfirmedBlock - bandToBlock;
+        const bandBlocks = bandToBlock - bandFromBlock + 1;
         const scan = await scanAlchemyLogTransfers('bsc', [address], 'manual', {
           fromBlock: bandFromBlock,
           toBlock: bandToBlock,
-          concurrency: ALCHEMY_BSC_USER_SCAN_CONCURRENCY
+          concurrency: ALCHEMY_BSC_USER_SCAN_CONCURRENCY,
+          network: requestedNetwork,
+          onProgress: ({ completedRequests, totalRequests }) => {
+            const currentBandBlocks = totalRequests > 0
+              ? Math.ceil((completedRequests / totalRequests) * bandBlocks)
+              : bandBlocks;
+            const scannedBlocks = completedAddressBlocks + completedBeforeBand + currentBandBlocks;
+            reportProgress({
+              phase: completedBeforeBand + currentBandBlocks > bandSize ? 'extended' : 'recent',
+              scannedBlocks
+            });
+          }
         });
         const transactions = scan.transactions;
         let creditedInBand = 0;
@@ -1601,10 +1702,18 @@ async function checkUserBEP20Deposits(userId) {
           console.log(`🔎 BEP20: no uncredited transfer in the latest ${bandSize} blocks for ${userId}; extending Alchemy history scan`);
           extendedHistoryLogged = true;
         }
+        reportProgress({
+          phase: 'extended',
+          scannedBlocks: completedAddressBlocks + completedBeforeBand + bandBlocks
+        });
         bandToBlock = bandFromBlock - 1;
       }
+
+      completedAddressBlocks += blocksPerAddress;
     }
 
+    summary.scanned_blocks = Math.min(totalBlocks, completedAddressBlocks);
+    summary.total_blocks = totalBlocks;
     return summary;
   } catch (error) {
     summary.success = false;
@@ -1614,10 +1723,15 @@ async function checkUserBEP20Deposits(userId) {
   }
 }
 
-async function checkUserERC20Deposits(userId) {
+async function checkUserERC20Deposits(userId, options = {}) {
   const summary = { success: true, network_group: 'erc20', checked: 0, deposits: 0, duplicates: 0, errors: 0 };
 
   try {
+    const requestedNetwork = String(options?.network || '').trim().toLowerCase();
+    if (requestedNetwork && !requestedNetwork.endsWith('_erc20')) {
+      throw new Error(`Unsupported ERC20 network: ${requestedNetwork}`);
+    }
+    if (typeof options?.onProgress === 'function') options.onProgress({ phase: 'recent', scannedBlocks: null, totalBlocks: null });
     const { data: wallet, error } = await supabase
       .from('deposit_wallets')
       .select('*')
@@ -1627,12 +1741,14 @@ async function checkUserERC20Deposits(userId) {
     if (error) throw error;
     if (!wallet) return summary;
 
-    const addresses = Array.from(
-      new Set([wallet.usdt_erc20_address, wallet.usdc_erc20_address].filter(Boolean))
-    );
+    const selectedAddressField = requestedNetwork ? networkFields[requestedNetwork]?.addressField : null;
+    const rawAddresses = selectedAddressField
+      ? [wallet[selectedAddressField]]
+      : [wallet.usdt_erc20_address, wallet.usdc_erc20_address];
+    const addresses = Array.from(new Set(rawAddresses.filter(Boolean)));
 
     for (const address of addresses) {
-      const transactions = await getERC20Transactions(address);
+      const transactions = await getERC20Transactions(address, requestedNetwork);
       summary.checked += transactions.length;
 
       for (const tx of transactions) {
@@ -1661,11 +1777,13 @@ async function checkUserERC20Deposits(userId) {
 
 // Compatibility with pixelnft-api: an empty body checks this user's three
 // chain groups; an explicit network preserves the original single-group API.
-async function checkUserRequestedNetworks(userId, network = '') {
+async function checkUserRequestedNetworks(userId, network = '', options = {}) {
+  const selectedNetwork = String(network || '').trim().toLowerCase();
+  const checkOptions = { ...options, network: selectedNetwork };
   const jobs = [];
-  if (!network || network.includes('bep20')) jobs.push(checkUserBEP20Deposits(userId));
-  if (!network || network.includes('erc20')) jobs.push(checkUserERC20Deposits(userId));
-  if (!network || network.includes('trc20')) jobs.push(checkUserTRC20Deposits(userId));
+  if (!selectedNetwork || selectedNetwork.endsWith('_bep20')) jobs.push(checkUserBEP20Deposits(userId, checkOptions));
+  if (!selectedNetwork || selectedNetwork.endsWith('_erc20')) jobs.push(checkUserERC20Deposits(userId, checkOptions));
+  if (!selectedNetwork || selectedNetwork.endsWith('_trc20')) jobs.push(checkUserTRC20Deposits(userId, checkOptions));
   const groups = await Promise.all(jobs);
   const failures = groups.filter(g => !g.success || g.errors > 0).map(g => ({
     network: g.network_group, error: g.error || 'DEPOSIT_PROCESSING_FAILED', count: g.errors
@@ -1678,6 +1796,162 @@ async function checkUserRequestedNetworks(userId, network = '') {
     errors: groups.reduce((sum, g) => sum + Number(g.errors || 0), 0),
     failures, groups
   };
+}
+
+// In-memory jobs keep the HTTP request short while the authenticated client
+// polls a safe, read-only status endpoint. Financial crediting remains inside
+// the existing atomic processDeposit flow above.
+const depositCheckJobs = new Map();
+const activeDepositCheckJobByUser = new Map();
+const depositCheckQueue = [];
+let runningDepositCheckJobs = 0;
+
+function cleanupDepositCheckJobs() {
+  const now = Date.now();
+  for (const [jobId, job] of depositCheckJobs.entries()) {
+    if (job.status === 'queued' || job.status === 'running') continue;
+    if (now - job.updatedAt <= DEPOSIT_CHECK_JOB_TTL_MS) continue;
+    depositCheckJobs.delete(jobId);
+    if (activeDepositCheckJobByUser.get(job.userId) === jobId) {
+      activeDepositCheckJobByUser.delete(job.userId);
+    }
+  }
+}
+
+function updateDepositCheckJobProgress(job, progress = {}) {
+  if (!job || !['queued', 'running'].includes(job.status)) return;
+  if (progress.phase) job.phase = progress.phase;
+  if (Number.isFinite(progress.scannedBlocks)) job.scannedBlocks = Math.max(0, Number(progress.scannedBlocks));
+  if (Number.isFinite(progress.totalBlocks) && Number(progress.totalBlocks) > 0) job.totalBlocks = Number(progress.totalBlocks);
+  if (job.totalBlocks > 0) {
+    const percent = Math.min(99, Math.floor((job.scannedBlocks / job.totalBlocks) * 100));
+    job.percent = Math.max(job.percent || 0, percent);
+  }
+  job.updatedAt = Date.now();
+}
+
+function publicDepositCheckJob(job, reused = false) {
+  const result = job.result || {};
+  const checking = job.status === 'queued' || job.status === 'running';
+  return {
+    success: true,
+    job_id: job.id,
+    job_status: job.status,
+    checking,
+    reused,
+    network: job.network,
+    phase: job.phase,
+    progress: {
+      percent: Number.isFinite(job.percent) ? job.percent : null,
+      scanned_blocks: Number.isFinite(job.scannedBlocks) ? job.scannedBlocks : null,
+      total_blocks: Number.isFinite(job.totalBlocks) ? job.totalBlocks : null
+    },
+    found: Boolean(job.found),
+    checked: Number(result.checked || 0),
+    deposits: Number(result.deposits || 0),
+    duplicates: Number(result.duplicates || 0),
+    error_code: job.errorCode || null,
+    created_at: new Date(job.createdAt).toISOString(),
+    updated_at: new Date(job.updatedAt).toISOString()
+  };
+}
+
+function resultWasAlchemyRateLimited(result) {
+  return (result?.failures || []).some((failure) => /Alchemy .* (HTTP 429|error -32005)/i.test(String(failure?.error || '')));
+}
+
+async function runDepositCheckJob(job) {
+  job.status = 'running';
+  job.phase = 'recent';
+  job.updatedAt = Date.now();
+
+  const onProgress = (progress) => updateDepositCheckJobProgress(job, progress);
+  let result = await checkUserRequestedNetworks(job.userId, job.network, { onProgress });
+
+  // A provider-side burst can still happen during platform-wide traffic. Wait
+  // once and resume automatically instead of asking the user to press again.
+  if (resultWasAlchemyRateLimited(result)) {
+    job.phase = 'retrying';
+    job.updatedAt = Date.now();
+    pauseAlchemyLogRequests(ALCHEMY_RATE_LIMIT_PAUSE_MS);
+    await sleep(ALCHEMY_RATE_LIMIT_PAUSE_MS);
+    result = await checkUserRequestedNetworks(job.userId, job.network, { onProgress });
+  }
+
+  job.result = result;
+  job.found = Number(result?.deposits || 0) > 0;
+  job.updatedAt = Date.now();
+  job.finishedAt = job.updatedAt;
+
+  if (result?.success) {
+    job.status = 'completed';
+    job.phase = job.found ? 'credited' : 'complete';
+    job.percent = 100;
+  } else {
+    job.status = 'failed';
+    job.phase = 'failed';
+    job.errorCode = resultWasAlchemyRateLimited(result)
+      ? 'DEPOSIT_PROVIDER_BUSY'
+      : 'DEPOSIT_CHECK_FAILED';
+  }
+}
+
+function drainDepositCheckQueue() {
+  while (runningDepositCheckJobs < DEPOSIT_CHECK_JOB_CONCURRENCY && depositCheckQueue.length) {
+    const jobId = depositCheckQueue.shift();
+    const job = depositCheckJobs.get(jobId);
+    if (!job || job.status !== 'queued') continue;
+    runningDepositCheckJobs++;
+    runDepositCheckJob(job)
+      .catch((error) => {
+        job.status = 'failed';
+        job.phase = 'failed';
+        job.errorCode = /429|rate|limit/i.test(String(error?.message || ''))
+          ? 'DEPOSIT_PROVIDER_BUSY'
+          : 'DEPOSIT_CHECK_FAILED';
+        job.updatedAt = Date.now();
+        job.finishedAt = job.updatedAt;
+        console.error(`❌ Deposit check job ${job.id} failed:`, error.message);
+      })
+      .finally(() => {
+        runningDepositCheckJobs--;
+        drainDepositCheckQueue();
+      });
+  }
+}
+
+function startOrReuseDepositCheckJob(userId, network) {
+  cleanupDepositCheckJobs();
+  const existingId = activeDepositCheckJobByUser.get(userId);
+  const existing = existingId ? depositCheckJobs.get(existingId) : null;
+  if (existing) {
+    const running = existing.status === 'queued' || existing.status === 'running';
+    const recentlyFinished = existing.finishedAt && Date.now() - existing.finishedAt < DEPOSIT_CHECK_RESULT_REUSE_MS;
+    if (running || (existing.network === network && recentlyFinished)) return { job: existing, reused: true };
+  }
+
+  const now = Date.now();
+  const job = {
+    id: crypto.randomUUID(),
+    userId,
+    network,
+    status: 'queued',
+    phase: 'queued',
+    percent: null,
+    scannedBlocks: null,
+    totalBlocks: null,
+    found: false,
+    result: null,
+    errorCode: null,
+    createdAt: now,
+    updatedAt: now,
+    finishedAt: null
+  };
+  depositCheckJobs.set(job.id, job);
+  activeDepositCheckJobByUser.set(userId, job.id);
+  depositCheckQueue.push(job.id);
+  drainDepositCheckQueue();
+  return { job, reused: false };
 }
 
 async function verifyAdminUnlock(req, user) {
@@ -1837,14 +2111,17 @@ app.post('/public/deposit/generate', async (req, res) => {
 
 // 3. Public/app endpoint: user manually checks only their own deposit address.
 // Requires Bearer auth and resolves user only from the token.
-app.post('/public/deposit/check', userDepositCheckCooldownMiddleware, async (req, res) => {
+app.post('/public/deposit/check', userDepositCheckRequestMiddleware, async (req, res) => {
   try {
     const network = String(readParam(req, 'network', '') || '').trim().toLowerCase();
+    const asyncValue = readParam(req, 'async', false);
+    const asyncMode = asyncValue === true || String(asyncValue).toLowerCase() === 'true';
     const bearerUser = await getUserFromBearerToken(req);
 
     console.log('🔎 [PUBLIC] User deposit check request:', {
       resolved_user_id: bearerUser?.id || null,
       network,
+      async: asyncMode,
       ip: req.ip,
       timestamp: new Date().toISOString(),
       bearer_auth: !!bearerUser
@@ -1862,6 +2139,22 @@ app.post('/public/deposit/check', userDepositCheckCooldownMiddleware, async (req
     if (req.pixelState?.config?.deposits_enabled === false) {
       return res.status(403).json({ success: false, error: 'DEPOSITS_PAUSED' });
     }
+
+    if (asyncMode) {
+      if (!network) {
+        return res.status(400).json({ success: false, error: 'Network is required' });
+      }
+      const { job, reused } = startOrReuseDepositCheckJob(user_id, network);
+      runInBackground('public_deposit_check_started', () => safeSystemLog('public_deposit_check_started', `User started deposit check for ${user_id}`, {
+        user_id,
+        network,
+        job_id: job.id,
+        reused,
+        ip: req.ip
+      }));
+      return res.status(reused ? 200 : 202).json(publicDepositCheckJob(job, reused));
+    }
+
     const result = await checkUserRequestedNetworks(user_id, network);
 
     await safeSystemLog('public_deposit_check', `User triggered deposit check for ${user_id}`, {
@@ -1893,6 +2186,30 @@ app.post('/public/deposit/check', userDepositCheckCooldownMiddleware, async (req
       query: req.query || null
     });
 
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Read-only progress endpoint. The job is visible only to the authenticated
+// user who started it; no wallet key or provider detail is returned.
+app.post('/public/deposit/check/status', async (req, res) => {
+  try {
+    const bearerUser = await getUserFromBearerToken(req);
+    if (!bearerUser?.id) {
+      return res.status(401).json({ success: false, error: 'Auth required' });
+    }
+
+    cleanupDepositCheckJobs();
+    const jobId = String(readParam(req, 'job_id', '') || '').trim();
+    const job = /^[0-9a-f-]{36}$/i.test(jobId) ? depositCheckJobs.get(jobId) : null;
+    if (!job || job.userId !== bearerUser.id) {
+      return res.status(404).json({ success: false, error: 'DEPOSIT_CHECK_JOB_NOT_FOUND' });
+    }
+
+    res.set('Cache-Control', 'private, no-store');
+    return res.json(publicDepositCheckJob(job));
+  } catch (error) {
+    console.error('❌ [PUBLIC] Deposit check status error:', error.message);
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
@@ -2070,6 +2387,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ API Health check: http://0.0.0.0:${PORT}/api/health`);
   console.log(`✅ PUBLIC Endpoint: POST http://0.0.0.0:${PORT}/public/deposit/generate`);
   console.log(`✅ PUBLIC Endpoint: POST http://0.0.0.0:${PORT}/public/deposit/check`);
+  console.log(`✅ PUBLIC Endpoint: POST http://0.0.0.0:${PORT}/public/deposit/check/status`);
   console.log(`✅ ADMIN Endpoint:  POST http://0.0.0.0:${PORT}/public/admin/check-deposits`);
   console.log(`✅ SECURE Endpoint: POST http://0.0.0.0:${PORT}/api/deposit/generate (requires API key)`);
   console.log(`✅ SECURE Endpoint: GET  http://0.0.0.0:${PORT}/api/deposit/history (requires API key)`);
@@ -2079,6 +2397,8 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ ALCHEMY ETH RPC: ${ALCHEMY_ETH_RPC_URL ? 'CONFIGURED' : 'MISSING'}`);
   console.log(`✅ ALCHEMY BSC RPC: ${ALCHEMY_BSC_RPC_URL ? 'CONFIGURED' : 'MISSING'}`);
   console.log(`✅ BEP20 USER HISTORY: ALCHEMY-ONLY, NEWEST-FIRST, UP TO ${ALCHEMY_BSC_INITIAL_LOOKBACK_BLOCKS} BLOCKS`);
+  console.log(`✅ DEPOSIT CHECK JOBS: BACKGROUND, ${DEPOSIT_CHECK_JOB_CONCURRENCY} CONCURRENT, SINGLE-FLIGHT PER USER`);
+  console.log(`✅ ALCHEMY LOG GATE: ONE REQUEST EVERY ${ALCHEMY_LOG_REQUEST_MIN_INTERVAL_MS} ms, AUTOMATIC 429 PAUSE`);
   console.log(`✅ BEP20 (USDT & USDC): Checking every ${BEP20_CHECK_INTERVAL} ms`);
   console.log(`✅ ERC20 (USDT & USDC): Checking every ${ERC20_CHECK_INTERVAL} ms`);
   console.log(`✅ TRC20 (USDT): Checking every ${TRC20_CHECK_INTERVAL} ms`);

@@ -48,6 +48,10 @@ const API_SECRET_KEY = process.env.API_SECRET_KEY;
 const HOT_WALLET_PRIVATE_KEY = process.env.HOT_WALLET_PRIVATE_KEY; 
 const ADMIN_SWEEP_ADDRESS = process.env.ADMIN_SWEEP_ADDRESS;       
 
+if (new URL(SUPABASE_URL).hostname !== 'fkjwueogfmdolcjtvvme.supabase.co') {
+  throw new Error('Wrong Supabase project: this server build is for PixelNFT only');
+}
+
 if (!SUPABASE_SERVICE_ROLE_KEY) {
   console.error('❌ Missing SUPABASE_SERVICE_ROLE_KEY env');
   process.exit(1);
@@ -606,12 +610,6 @@ async function generateWallet(user_id, network) {
       'deposit_wallet_generated', 'Deposit wallets generated for user ' + user_id,
       { user_id, network, address }
     ));
-    setTimeout(() => {
-      const options = { network };
-      if (network.includes('bep20')) checkUserBEP20Deposits(user_id, options).catch(console.error);
-      if (network.includes('erc20')) checkUserERC20Deposits(user_id, options).catch(console.error);
-      if (network.includes('trc20')) checkUserTRC20Deposits(user_id, options).catch(console.error);
-    }, 10000);
   }
   return { success: true, address, exists: !!exists, network, wallet };
 }
@@ -1805,6 +1803,7 @@ const depositCheckJobs = new Map();
 const activeDepositCheckJobByUser = new Map();
 const depositCheckQueue = [];
 let runningDepositCheckJobs = 0;
+const runningDepositCheckUsers = new Set();
 
 function cleanupDepositCheckJobs() {
   const now = Date.now();
@@ -1897,10 +1896,13 @@ async function runDepositCheckJob(job) {
 }
 
 function drainDepositCheckQueue() {
-  while (runningDepositCheckJobs < DEPOSIT_CHECK_JOB_CONCURRENCY && depositCheckQueue.length) {
+  let candidates = depositCheckQueue.length;
+  while (runningDepositCheckJobs < DEPOSIT_CHECK_JOB_CONCURRENCY && depositCheckQueue.length && candidates-- > 0) {
     const jobId = depositCheckQueue.shift();
     const job = depositCheckJobs.get(jobId);
     if (!job || job.status !== 'queued') continue;
+    if (runningDepositCheckUsers.has(job.userId)) { depositCheckQueue.push(jobId); continue; }
+    runningDepositCheckUsers.add(job.userId);
     runningDepositCheckJobs++;
     runDepositCheckJob(job)
       .catch((error) => {
@@ -1913,16 +1915,22 @@ function drainDepositCheckQueue() {
         job.finishedAt = job.updatedAt;
         console.error(`❌ Deposit check job ${job.id} failed:`, error.message);
       })
-      .finally(() => {
+      .finally(async () => {
+        if (job.watchId) {
+          clearInterval(job.watchHeartbeat);
+          try { await finishDepositWatch(job, job.status); }
+          catch (error) { console.error('Deposit monitor completion failed:', error.message); }
+        }
         runningDepositCheckJobs--;
+        runningDepositCheckUsers.delete(job.userId);
         drainDepositCheckQueue();
       });
   }
 }
 
-function startOrReuseDepositCheckJob(userId, network) {
+function startOrReuseDepositCheckJob(userId, network, watch = null) {
   cleanupDepositCheckJobs();
-  const existingId = activeDepositCheckJobByUser.get(userId);
+  const existingId = watch ? watch.lease_id : activeDepositCheckJobByUser.get(userId);
   const existing = existingId ? depositCheckJobs.get(existingId) : null;
   if (existing) {
     const running = existing.status === 'queued' || existing.status === 'running';
@@ -1932,7 +1940,7 @@ function startOrReuseDepositCheckJob(userId, network) {
 
   const now = Date.now();
   const job = {
-    id: crypto.randomUUID(),
+    id: watch ? watch.lease_id : crypto.randomUUID(),
     userId,
     network,
     status: 'queued',
@@ -1947,12 +1955,80 @@ function startOrReuseDepositCheckJob(userId, network) {
     updatedAt: now,
     finishedAt: null
   };
+  if (watch) {
+    job.watchId = watch.watch_id;
+    job.watchHeartbeat = setInterval(() => {
+      finishDepositWatch(job).catch(error => console.error('Deposit monitor heartbeat failed:', error.message));
+    }, 20000);
+    job.watchHeartbeat.unref?.();
+  }
   depositCheckJobs.set(job.id, job);
   activeDepositCheckJobByUser.set(userId, job.id);
   depositCheckQueue.push(job.id);
   drainDepositCheckQueue();
   return { job, reused: false };
 }
+
+// PIXEL_DEPOSIT_MONITOR_START: persistent scheduling only; no money logic.
+async function depositWatchRpc(name, args) {
+  const { data, error } = await supabase.rpc(name, args);
+  if (error) throw new Error('DEPOSIT_MONITOR_UNAVAILABLE');
+  return data;
+}
+
+async function finishDepositWatch(job, status = null) {
+  return depositWatchRpc('pixel_finish_deposit_watch', {
+    p_user_id: job.userId, p_watch_id: job.watchId, p_lease_id: job.id,
+    p_status: status === 'completed' ? 'completed' : status === 'failed' ? 'failed' : null
+  });
+}
+
+async function readDepositWatch(userId, network = null, watchId = null) {
+  const state = await depositWatchRpc('pixel_deposit_watch_status', {
+    p_user_id: userId, p_network: network || null, p_watch_id: watchId || null
+  });
+  if (!state) return null;
+  const job = state.job_id ? depositCheckJobs.get(state.job_id) : null;
+  if (job && job.userId === userId && job.watchId === state.watch_id && !state.found) {
+    return { ...state, ...publicDepositCheckJob(job),
+      watch_id: state.watch_id, watch_until: state.watch_until,
+      first_check_at: state.first_check_at, next_check_at: state.next_check_at,
+      last_checked_at: state.last_checked_at, server_time: state.server_time,
+      // Detection is not proof of credit: only the persisted credited row is.
+      found: state.found === true,
+      // A completed job must not hide the persisted expiry of its window.
+      job_status: state.job_status === 'expired' ? 'expired' : job.status };
+  }
+  return state;
+}
+
+async function startDueDepositWatch(userId, network, watchId) {
+  const before = await readDepositWatch(userId, network, watchId);
+  if (!before || before.found || before.checking || before.job_status === 'expired') return before;
+  const claims = await depositWatchRpc('pixel_take_deposit_watches', {
+    p_limit: 1, p_user_id: userId, p_watch_id: watchId
+  });
+  for (const claim of claims || []) startOrReuseDepositCheckJob(claim.user_id, claim.network, claim);
+  return readDepositWatch(userId, network, watchId);
+}
+
+let pollingDepositWatches = false;
+async function pollPersistentDepositWatches() {
+  if (pollingDepositWatches) return;
+  const available = Math.max(0, DEPOSIT_CHECK_JOB_CONCURRENCY - runningDepositCheckJobs - depositCheckQueue.length);
+  if (!available) return;
+  pollingDepositWatches = true;
+  try {
+    const claims = await depositWatchRpc('pixel_take_deposit_watches', { p_limit: available });
+    for (const claim of claims || []) startOrReuseDepositCheckJob(claim.user_id, claim.network, claim);
+  } catch (error) {
+    if (!pollPersistentDepositWatches.lastErrorAt || Date.now() - pollPersistentDepositWatches.lastErrorAt > 60000) {
+      console.error('Deposit monitor polling failed:', error.message);
+      pollPersistentDepositWatches.lastErrorAt = Date.now();
+    }
+  } finally { pollingDepositWatches = false; }
+}
+// PIXEL_DEPOSIT_MONITOR_END
 
 async function verifyAdminUnlock(req, user) {
   const { data, error } = await supabase.rpc('pixel_app_api', {
@@ -2072,6 +2148,11 @@ app.post('/public/deposit/generate', async (req, res) => {
     }
     const syncMs = result.exists ? 0 : Number(process.hrtime.bigint() - syncStarted) / 1e6;
 
+    const watch = await depositWatchRpc('pixel_activate_deposit_watch', {
+      p_user_id: user_id, p_network: network
+    });
+    if (!watch?.watch_id) throw new Error('DEPOSIT_MONITOR_UNAVAILABLE');
+
     runInBackground('public_deposit_generated', () => safeSystemLog('public_deposit_generated', `Public deposit address generated for user ${user_id}`, {
       user_id,
       network,
@@ -2086,6 +2167,7 @@ app.post('/public/deposit/generate', async (req, res) => {
     res.set('X-Response-Time', `${totalMs.toFixed(1)}ms`);
 
     return res.json({
+      ...watch,
       success: true,
       address: result.address,
       wallet: result.wallet,
@@ -2144,6 +2226,14 @@ app.post('/public/deposit/check', userDepositCheckRequestMiddleware, async (req,
       if (!network) {
         return res.status(400).json({ success: false, error: 'Network is required' });
       }
+      const watchId = String(readParam(req, 'watch_id', '') || '').trim();
+      if (watchId) {
+        if (!/^[0-9a-f-]{36}$/i.test(watchId)) return res.status(400).json({ success: false, error: 'REQUEST_INVALID' });
+        const state = await startDueDepositWatch(user_id, network, watchId);
+        if (!state) return res.status(404).json({ success: false, error: 'DEPOSIT_WATCH_NOT_FOUND' });
+        res.set('Cache-Control', 'private, no-store');
+        return res.json(state);
+      }
       const { job, reused } = startOrReuseDepositCheckJob(user_id, network);
       runInBackground('public_deposit_check_started', () => safeSystemLog('public_deposit_check_started', `User started deposit check for ${user_id}`, {
         user_id,
@@ -2201,6 +2291,17 @@ app.post('/public/deposit/check/status', async (req, res) => {
 
     cleanupDepositCheckJobs();
     const jobId = String(readParam(req, 'job_id', '') || '').trim();
+    const watchId = String(readParam(req, 'watch_id', '') || '').trim();
+    const network = String(readParam(req, 'network', '') || '').trim().toLowerCase();
+    if (watchId || network) {
+      if ((watchId && !/^[0-9a-f-]{36}$/i.test(watchId)) || (network && !allowedNetworks.includes(network))) {
+        return res.status(400).json({ success: false, error: 'REQUEST_INVALID' });
+      }
+      const state = await readDepositWatch(bearerUser.id, network || null, watchId || null);
+      if (!state) return res.status(404).json({ success: false, error: 'DEPOSIT_WATCH_NOT_FOUND' });
+      res.set('Cache-Control', 'private, no-store');
+      return res.json(state);
+    }
     const job = /^[0-9a-f-]{36}$/i.test(jobId) ? depositCheckJobs.get(jobId) : null;
     if (!job || job.userId !== bearerUser.id) {
       return res.status(404).json({ success: false, error: 'DEPOSIT_CHECK_JOB_NOT_FOUND' });
@@ -2411,6 +2512,11 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 });
 
 // ========== BACKGROUND TASKS ==========
+const depositWatchTimer = setInterval(() => {
+  pollPersistentDepositWatches().catch(error => console.error('Deposit monitor error:', error.message));
+}, 5000);
+depositWatchTimer.unref?.();
+void pollPersistentDepositWatches();
 let isCheckingBEP20 = false;
 let isCheckingERC20 = false;
 let isCheckingTRC20 = false;
@@ -2455,6 +2561,7 @@ setInterval(async () => {
 }, TRC20_CHECK_INTERVAL);
 
 process.on('SIGTERM', () => {
+  clearInterval(depositWatchTimer);
   console.log('🛑 Received SIGTERM, shutting down gracefully');
   server.close(() => {
     console.log('✅ Server closed');
